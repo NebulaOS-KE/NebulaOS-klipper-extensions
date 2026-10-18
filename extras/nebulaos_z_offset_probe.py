@@ -34,6 +34,7 @@
 import logging
 import math
 from . import hx71x, load_cell, probe, trigger_analog
+from . import nebulaos_raw_contact as raw_contact
 from .load_cell_probe import (LCBestFit, _lookup_z_pos,
                                FIT_MIN_POINTS, ASCENT_DATA_WINDOW_SECONDS)
 
@@ -81,6 +82,23 @@ class ZOffsetProbe:
 
         self._best_fit = LCBestFit(self._printer)
 
+        # G83b (Run 13): weight-free contact detection, stages A/B of
+        # docs/NEBULAOS_RAW_CONTACT_BRIEF.md (firmware repo). Default
+        # calibrated_force is the unchanged behaviour. raw_contact is opt-in
+        # and refuses every nozzle-contact motion until a hardware-qualified
+        # profile exists (nebulaos_raw_contact.QUALIFIED_PROFILES is empty):
+        # only the no-motion diagnostic works.
+        self._contact_mode = config.getchoice(
+            'contact_detection_mode',
+            {m: m for m in raw_contact.MODES}, raw_contact.MODE_CALIBRATED)
+        self._raw_profile_id = config.get('raw_contact_profile_id', None)
+        self._last_contact_rejection_reason = None
+        self._last_raw_peak_delta_counts = None
+        self._raw_diag = None
+        self._printer.lookup_object('gcode').register_command(
+            'NEBULAOS_RAW_CONTACT_DIAGNOSTIC', self.cmd_raw_contact_diagnostic,
+            desc=self.cmd_raw_contact_diagnostic_help)
+
         self._last_raw_trigger_z = None
         self._last_fitted_contact_z = None
         self._last_fit_delta = None
@@ -119,6 +137,17 @@ class ZOffsetProbe:
         return self._load_cell
 
     def _tare_and_arm(self):
+        if self._contact_mode == raw_contact.MODE_RAW:
+            refusal = raw_contact.raw_motion_refusal(self._raw_profile_id)
+            if refusal is None:
+                # A qualified profile exists - but stage B ships without the
+                # count-domain arming (stage C/D evidence decides its values).
+                refusal = ('raw_contact_arming_not_implemented',
+                           "raw_contact arming is not enabled in this "
+                           "version - nozzle contact refused")
+            self._last_contact_rejection_reason = refusal[0]
+            raise self._printer.command_error(
+                "%s: %s" % (self._name, refusal[1]))
         if not self._load_cell.is_calibrated():
             raise self._printer.command_error(
                 "%s: load cell not calibrated — run LOAD_CELL_CALIBRATE"
@@ -221,20 +250,35 @@ class ZOffsetProbe:
         self._last_peak_force_time = None
         self._last_force_at_trigger_g = None
         self._last_tare_counts = None
+        self._last_raw_peak_delta_counts = None
+        raw_mode = self._contact_mode == raw_contact.MODE_RAW
+        polarity = None
+        if raw_mode:
+            profile = raw_contact.lookup_profile(self._raw_profile_id)
+            polarity = profile['polarity'] if profile else None
         if samples:
-            peak_sample = max(samples, key=lambda s: abs(s[1]))
-            self._last_peak_force_g = peak_sample[1]
-            self._last_peak_force_time = peak_sample[0]
             self._last_tare_counts = samples[0][3]
             pre_trigger = [s for s in samples if s[0] <= ascent_start_time]
-            if pre_trigger:
-                self._last_force_at_trigger_g = pre_trigger[-1][1]
+            if raw_mode:
+                # Never grams on an uncalibrated cell: raw count telemetry
+                # only; the gram fields stay None.
+                peak_sample = max(samples, key=lambda s: abs(s[2] - s[3]))
+                self._last_raw_peak_delta_counts = peak_sample[2] - peak_sample[3]
+                self._last_peak_force_time = peak_sample[0]
+            else:
+                peak_sample = max(samples, key=lambda s: abs(s[1]))
+                self._last_peak_force_g = peak_sample[1]
+                self._last_peak_force_time = peak_sample[0]
+                if pre_trigger:
+                    self._last_force_at_trigger_g = pre_trigger[-1][1]
 
         data = []
         for s in samples:
             if s[0] >= ascent_start_time and \
                s[0] <= ascent_start_time + ASCENT_DATA_WINDOW_SECONDS:
-                data.append((s[1], _lookup_z_pos(toolhead, s[0])))
+                data.append((raw_contact.fit_magnitude(
+                                 s, self._contact_mode, polarity),
+                             _lookup_z_pos(toolhead, s[0])))
 
         # Phase 2 hot-reliability investigation (qualification-only diagnostic,
         # not a normal-operation payload): dump the exact ascent-window samples
@@ -338,7 +382,17 @@ class ZOffsetProbe:
 
     def get_status(self, eventtime):
         trig_time = self._mcu_trigger_analog.get_last_trigger_time()
+        calibrated = self._load_cell.is_calibrated()
+        raw_mode = self._contact_mode == raw_contact.MODE_RAW
         return {
+            'contact_detection_mode': self._contact_mode,
+            # Ready for nozzle contact: grams calibration in calibrated mode;
+            # never in raw mode until a qualified profile and arming exist.
+            'contact_qualified': (not raw_mode) and calibrated,
+            'raw_profile_id': self._raw_profile_id,
+            'last_contact_rejection_reason': self._last_contact_rejection_reason,
+            'last_raw_peak_delta_counts': self._last_raw_peak_delta_counts,
+            'raw_diagnostic': self._raw_diag,
             'last_trigger_time': trig_time,
             'is_calibrated': self._load_cell.is_calibrated(),
             'last_raw_trigger_z': self._last_raw_trigger_z,
@@ -352,6 +406,45 @@ class ZOffsetProbe:
             'force_safety_limit': self._force_safety_limit,
             'contact_speed': self._contact_speed,
         }
+
+    cmd_raw_contact_diagnostic_help = (
+        "No-motion load cell health check (G83b): idle noise, drift, sample "
+        "rate, saturation and stuck-signal checks on raw ADC counts")
+
+    def cmd_raw_contact_diagnostic(self, gcmd):
+        """NO MOTION: collects SECONDS of idle samples and reports raw-count
+        statistics. Never moves, never tares, never changes config."""
+        seconds = gcmd.get_float('SECONDS', 2., minval=0.5, maxval=10.)
+        print_stats = self._printer.lookup_object('print_stats', None)
+        if print_stats is not None:
+            state = print_stats.get_status(
+                self._printer.get_reactor().monotonic()).get('state')
+            if state in ('printing', 'paused'):
+                raise gcmd.error("NEBULAOS_RAW_CONTACT_DIAGNOSTIC: not while "
+                                 "a print is %s" % (state,))
+        reactor = self._printer.get_reactor()
+        collector = self._load_cell.get_collector()
+        collector.start_collecting()
+        reactor.pause(reactor.monotonic() + seconds)
+        samples, errors = collector.stop_collecting()
+        stats, reasons = raw_contact.validate_idle(
+            samples, errors, self._load_cell.saturation_range(),
+            self._sensor.get_samples_per_second())
+        self._raw_diag = dict(stats)
+        self._raw_diag['reasons'] = list(reasons)
+        self._raw_diag['seconds'] = seconds
+        if stats['n']:
+            gcmd.respond_info(
+                "raw contact diagnostic: %d samples, %.1f SPS (configured %.1f),"
+                " median %d counts, noise sigma %.1f counts, peak-to-peak %d,"
+                " drift %.1f counts/s, %d distinct values"
+                % (stats['n'], stats['sps'] or 0.,
+                   self._sensor.get_samples_per_second(), stats['median'],
+                   stats['sigma'], stats['p2p'], stats['drift_per_s'] or 0.,
+                   stats['unique']))
+        gcmd.respond_info("raw contact diagnostic: %s"
+                          % ("healthy" if not reasons
+                             else "NOT healthy: " + ", ".join(reasons)))
 
 
 def load_config(config):

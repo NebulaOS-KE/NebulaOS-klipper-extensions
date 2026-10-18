@@ -167,7 +167,10 @@ class HostKlipperPristineTest(unittest.TestCase):
 
     def test_upstream_imports_only(self):
         source = _module_source()
-        allowed_package = ('hx71x', 'load_cell', 'probe', 'trigger_analog')
+        # plus NebulaOS's own pure, Klipper-free helper (G83b): it wraps or
+        # patches no upstream code
+        allowed_package = ('hx71x', 'load_cell', 'probe', 'trigger_analog',
+                           'nebulaos_raw_contact')
         allowed_from = {'load_cell_probe'}
         for line in source.splitlines():
             stripped = line.strip()
@@ -175,6 +178,7 @@ class HostKlipperPristineTest(unittest.TestCase):
                 modules = [m.strip() for m in
                            stripped.split('from . import')[1].split(',')]
                 for mod in modules:
+                    mod = mod.split(' as ')[0].strip()
                     self.assertIn(mod, allowed_package,
                                   "unexpected import: %s" % mod)
             elif stripped.startswith('from .') and ' import ' in stripped:

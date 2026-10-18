@@ -300,8 +300,11 @@ class ArchitectureInvariantsTest(unittest.TestCase):
 
     def test_upstream_only_imports(self):
         source = _module_source()
+        # Upstream modules, plus NebulaOS's own pure, Klipper-free helper
+        # for weight-free contact detection (G83b) - no upstream core is
+        # wrapped or patched through it.
         allowed_package_imports = ('hx71x', 'load_cell', 'probe',
-                                   'trigger_analog')
+                                   'trigger_analog', 'nebulaos_raw_contact')
         allowed_from_imports = {
             'load_cell_probe': ('LCBestFit', '_lookup_z_pos',
                                 'FIT_MIN_POINTS',
@@ -313,6 +316,7 @@ class ArchitectureInvariantsTest(unittest.TestCase):
                 modules = [m.strip() for m in
                            stripped.split('from . import')[1].split(',')]
                 for mod in modules:
+                    mod = mod.split(' as ')[0].strip()
                     self.assertIn(mod, allowed_package_imports,
                                   "unexpected import: %s" % mod)
             elif stripped.startswith('from .') and ' import ' in stripped:
