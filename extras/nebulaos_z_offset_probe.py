@@ -113,6 +113,11 @@ class ZOffsetProbe:
                 % self._name)
         return 1. / counts_per_gram
 
+    def get_load_cell(self):
+        """The upstream LoadCell this probe owns (G83a: the guided
+        NEBULAOS_LOAD_CELL_CALIBRATE flow uses its public calibration API)."""
+        return self._load_cell
+
     def _tare_and_arm(self):
         if not self._load_cell.is_calibrated():
             raise self._printer.command_error(
