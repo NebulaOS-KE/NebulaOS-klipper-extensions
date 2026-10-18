@@ -37,6 +37,22 @@
 import logging
 import math
 
+
+def wipe_bed_temp(bed_target, bed_add_temp, bed_max_temp=None):
+    """Bed temperature for the nozzle wipe.
+
+    Run 13 (2026-10-18, ke-dev): NEBULAOS_AUTO_CALIBRATE heats the bed to
+    65 C first, and the wipe then asked for 65 + bed_add_temp (60) = 125 C -
+    above [heater_bed] max_temp 120, so Klipper refused and the calibration
+    failed. Creality's own comment on bed_add_temp: 60 is "bed temperature
+    during leveling" - a temperature, not an amount to add. So: the higher of
+    the bed's current target and bed_add_temp (a cold bed is heated to 60, a
+    bed already at 65 stays at 65), never above the bed's max_temp."""
+    temp = max(float(bed_target or 0.), float(bed_add_temp or 0.))
+    if bed_max_temp is not None:
+        temp = min(temp, float(bed_max_temp))
+    return temp
+
 from . import nozzle_clear
 
 
@@ -98,9 +114,10 @@ class ZCompensate:
         # prtouch_nozzle.clear_nozzle()'s hot_end_temp param.
         self.hot_end_temp = config.getfloat('hot_end_temp', default=None,
                                              minval=80, maxval=300)
-        # bed_add_temp (real key): additive delta applied to the bed's current target
-        # temperature for the duration of the nozzle-wipe (bed_target + bed_add_temp, see
-        # cmd_nozzle_clear() below). Virgin-Baseline Fix + Rebuild mission (2026-08-08):
+        # bed_add_temp (real key): the bed temperature for the nozzle-wipe - the wipe
+        # heats the bed to the higher of its current target and this value, clamped to
+        # [heater_bed] max_temp (wipe_bed_temp() above; it used to be added to the
+        # target, which asked for 125 C after a 65 C PID target). Virgin-Baseline Fix + Rebuild mission (2026-08-08):
         # maxval=100 is not an arbitrary widening - Creality's own real, factory-shipped
         # default for this exact printer model is bed_add_temp: 60 (confirmed via
         # artifacts/reference/stock-printer.cfg, the genuine tracked OEM config, cross-
@@ -364,11 +381,13 @@ class ZCompensate:
         bed_add_temp = gcmd.get_float('BED_ADDTEMP', self.bed_add_temp)
         heater_bed = self.printer.lookup_object('heater_bed')
         bed_target = heater_bed.get_status(self.printer.get_reactor().monotonic())['target']
+        bed_max = getattr(getattr(heater_bed, 'heater', None), 'max_temp', None)
         toolhead = self.printer.lookup_object('toolhead')
         nozzle_clear.clear_nozzle(
             self.z_offset_probe, toolhead, self.gcode, self.printer,
             self.native_clear_nozzle_config,
-            hot_start_temp, hot_rub_temp, bed_target + bed_add_temp,
+            hot_start_temp, hot_rub_temp,
+            wipe_bed_temp(bed_target, bed_add_temp, bed_max),
             hot_end_temp=hot_end_temp)
 
     cmd_z_offset_calibration_help = (
