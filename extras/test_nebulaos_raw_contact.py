@@ -190,6 +190,41 @@ class UpstreamFitEquivalenceTest(unittest.TestCase):
         self.assertLess(max(zs) - min(zs), 0.002)
 
 
+REAL_TRACES = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'testdata',
+                           'ke-dev-contact-traces-20261019.log')
+
+
+@unittest.skipIf(_klipper_dir() is None, "pinned Klipper source not found")
+class RealTraceReplayTest(unittest.TestCase):
+    """Stage A on real data: the 9 contacts of a ke-dev Z-offset run
+    (2026-10-19). The fit on sign-normalised raw counts must give the same
+    contact Z as the calibrated grams fit on the same samples."""
+
+    def setUp(self):
+        self.fit = _upstream_lcbestfit()(printer=None)
+        with open(REAL_TRACES) as handle:
+            self.traces = rc.parse_contact_traces(handle.read())
+
+    def test_all_contacts_parsed(self):
+        self.assertEqual(len(self.traces), 9)
+
+    def test_compression_raises_the_counts_on_ke_dev(self):
+        # grams > 0 is compression; on this printer the raw count delta has
+        # the same sign (polarity +1). Measured, not assumed.
+        for trace in self.traces:
+            pressed = [s for s in trace['samples'] if s[1] is not None and s[1] > 3.]
+            self.assertTrue(pressed)
+            self.assertTrue(all(s[2] - s[3] > 0 for s in pressed))
+
+    def test_raw_counts_give_the_same_contact_z_as_grams(self):
+        for trace in self.traces:
+            grams_pairs, count_pairs = rc.replay_fit_pairs(trace, 1)
+            z_g, below_g, above_g, _ = self.fit.find_best_fit(grams_pairs)
+            z_c, below_c, above_c, _ = self.fit.find_best_fit(count_pairs)
+            self.assertAlmostEqual(z_g, z_c, delta=0.0005)
+            self.assertEqual((below_g, above_g), (below_c, above_c))
+
+
 class QualifiedProfileGateTest(unittest.TestCase):
     def test_no_profile_is_qualified_yet(self):
         self.assertEqual(rc.QUALIFIED_PROFILES, {})
