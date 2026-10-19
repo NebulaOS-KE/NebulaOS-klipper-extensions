@@ -208,17 +208,23 @@ class RealTraceReplayTest(unittest.TestCase):
     def test_all_contacts_parsed(self):
         self.assertEqual(len(self.traces), 9)
 
-    def test_compression_raises_the_counts_on_ke_dev(self):
-        # grams > 0 is compression; on this printer the raw count delta has
-        # the same sign (polarity +1). Measured, not assumed.
+    def test_compression_lowers_the_counts_on_ke_dev(self):
+        # Nozzle contact presses the bed down on the front-left load cell:
+        # the raw counts FALL (polarity -1), by 15000-25000 counts (about
+        # 180-290 g with this unit's calibration) at the peak of each touch.
+        # A known weight on the front-left screw also reads negative
+        # (Tim, 2026-10-19: 1531 g bottle -> -1695 g). The small positive
+        # deltas in these traces are rebound/noise, not the contact.
+        # Measured, not assumed.
         for trace in self.traces:
-            pressed = [s for s in trace['samples'] if s[1] is not None and s[1] > 3.]
-            self.assertTrue(pressed)
-            self.assertTrue(all(s[2] - s[3] > 0 for s in pressed))
+            deltas = [s[2] - s[3] for s in trace['samples']]
+            self.assertLess(min(deltas), -15000)
+            self.assertLess(max(deltas), 1500)
+            self.assertGreater(-min(deltas), 10 * max(deltas))
 
     def test_raw_counts_give_the_same_contact_z_as_grams(self):
         for trace in self.traces:
-            grams_pairs, count_pairs = rc.replay_fit_pairs(trace, 1)
+            grams_pairs, count_pairs = rc.replay_fit_pairs(trace, -1)
             z_g, below_g, above_g, _ = self.fit.find_best_fit(grams_pairs)
             z_c, below_c, above_c, _ = self.fit.find_best_fit(count_pairs)
             self.assertAlmostEqual(z_g, z_c, delta=0.0005)
