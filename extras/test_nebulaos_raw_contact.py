@@ -232,6 +232,34 @@ class RealTraceReplayTest(unittest.TestCase):
             self.assertEqual((below_g, above_g), (below_c, above_c))
 
 
+class RealTraceTriggerReplayTest(unittest.TestCase):
+    """G83b-auto step 3: the 9 ke-dev contacts through the raw trigger rule
+    (abs_ge on tare-relative counts, 6400 = 75 g at this unit's 85.72 c/g).
+    Evidence for stage C only - it qualifies nothing."""
+    TRIGGER = 6400
+
+    def setUp(self):
+        with open(REAL_TRACES) as handle:
+            self.traces = rc.parse_contact_traces(handle.read())
+
+    def test_every_contact_crosses_the_trigger_before_its_peak(self):
+        for trace in self.traces:
+            deltas = [s[2] - s[3] for s in trace['samples']]
+            cross = next(i for i, d in enumerate(deltas)
+                         if abs(d) >= self.TRIGGER)
+            peak = max(range(len(deltas)), key=lambda i: abs(deltas[i]))
+            self.assertLess(cross, peak)
+
+    def test_idle_before_contact_stays_far_below_the_trigger(self):
+        # first 0.5 s of every trace (before the nozzle reaches the bed):
+        # measured max 472 counts - more than 10x below the trigger
+        for trace in self.traces:
+            t0 = trace['samples'][0][0]
+            idle = [abs(s[2] - s[3]) for s in trace['samples']
+                    if s[0] - t0 < 0.5]
+            self.assertLess(max(idle) * 10, self.TRIGGER)
+
+
 class QualifiedProfileGateTest(unittest.TestCase):
     def test_no_profile_is_qualified_yet(self):
         self.assertEqual(rc.QUALIFIED_PROFILES, {})
