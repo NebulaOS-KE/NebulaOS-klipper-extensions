@@ -69,6 +69,7 @@ import math
 import time
 
 from . import nebulaos_probe_pair
+from . import nebulaos_raw_contact as raw_contact
 from . import nebulaos_calibration_journal as calibration_journal
 
 _MAX_ERROR_LEN = 200
@@ -386,6 +387,11 @@ class NebulaOSCalibration:
         # simulation result must never be mistakable for (or accidentally
         # overwrite the display of) a real applied/staged calibration.
         self.bootstrap_sim_id = 0
+        # NEBULAOS_RAW_CONTACT_COMPARE (G83b-auto stage C, supervised)
+        self.raw_compare_id = 0
+        self.raw_compare_state = 'idle'
+        self.raw_compare_error = None
+        self.raw_compare_result = None
         self.bootstrap_sim_state = 'idle'
         self.bootstrap_sim_result = None
         self.bootstrap_sim_error = None
@@ -441,6 +447,12 @@ class NebulaOSCalibration:
         self.gcode.register_command(
             '_NEBULAOS_Z_OFFSET_CALIBRATE', self.cmd_z_offset_calibrate,
             desc=self.cmd_z_offset_calibrate_help)
+        # Console-only on purpose: no macro, no UI (architecture review Run
+        # 14). SUPERVISED=1 is only a typed flag - Klipper cannot enforce who
+        # sends it, so the command logs loudly and never saves anything.
+        self.gcode.register_command(
+            'NEBULAOS_RAW_CONTACT_COMPARE', self.cmd_raw_contact_compare,
+            desc=self.cmd_raw_contact_compare_help)
         self.gcode.register_command(
             'NEBULAOS_CALIBRATION_STATUS', self.cmd_calibration_status,
             desc=self.cmd_calibration_status_help)
@@ -526,6 +538,10 @@ class NebulaOSCalibration:
             'z_offset_range': self.z_offset_range,
             'z_offset_stddev': self.z_offset_stddev,
             'bootstrap_sim_id': self.bootstrap_sim_id,
+            'raw_compare_id': self.raw_compare_id,
+            'raw_compare_state': self.raw_compare_state,
+            'raw_compare_error': self.raw_compare_error,
+            'raw_compare_result': self.raw_compare_result,
             'bootstrap_sim_state': self.bootstrap_sim_state,
             'bootstrap_sim_result': self.bootstrap_sim_result,
             'bootstrap_sim_error': self.bootstrap_sim_error,
@@ -619,7 +635,8 @@ class NebulaOSCalibration:
                 max_abs_fit_delta=self.max_abs_fit_delta,
                 min_accepted_samples=self.min_accepted_samples,
                 max_repeatability_range=self.max_repeatability_range,
-                max_repeatability_stddev=self.max_repeatability_stddev)
+                max_repeatability_stddev=self.max_repeatability_stddev,
+                **self._z_offset_arming_kwargs(z_offset_probe))
 
             self.z_offset_contact_mode = measurement.contact_mode
             self.z_offset_predicted_nozzle_contact_z = measurement.predicted_nozzle_contact_z
@@ -727,6 +744,142 @@ class NebulaOSCalibration:
                 "NEBULAOS_Z_OFFSET_CALIBRATE: committing with SAVE_CONFIG, "
                 "printer will restart")
             self.gcode.run_script_from_command('SAVE_CONFIG')
+
+    def _z_offset_arming_kwargs(self, z_offset_probe):
+        """{'arming': plan} for THIS canonical paired path - the only caller
+        that may ever resolve to raw contact (G83b-auto); {} for a probe
+        without plan_arming (calibrated force, as before)."""
+        plan = getattr(z_offset_probe, 'plan_arming', None)
+        if plan is None:
+            return {}
+        return {'arming': plan(raw_contact.CALLER_Z_OFFSET_PAIR)}
+
+    # ------------------------------------------------------------------
+    # NEBULAOS_RAW_CONTACT_COMPARE (G83b-auto stage C): supervised
+    # manual-vs-automatic comparison on a CALIBRATED unit. Same paired
+    # Z-offset path, same fixed reference XY, bounded floor and speeds;
+    # first the calibrated touches, then the raw candidate touches. Nothing
+    # is ever applied, staged or saved.
+    # ------------------------------------------------------------------
+    cmd_raw_contact_compare_help = (
+        "SUPERVISED stage-C comparison: Z-offset touches with the calibrated "
+        "load cell, then with a raw-count candidate - SUPERVISED=1 "
+        "TRIGGER_COUNTS=<n> POLARITY=<1|-1> [SAMPLES=<1-5>]. Never saves.")
+
+    RAW_COMPARE_MAX_SAMPLES = 5
+
+    def cmd_raw_contact_compare(self, gcmd):
+        if gcmd.get_int('SUPERVISED', 0) != 1:
+            raise gcmd.error(
+                "NEBULAOS_RAW_CONTACT_COMPARE moves the nozzle onto the bed "
+                "with an UNQUALIFIED raw-count trigger: only with someone at "
+                "the printer, and only with SUPERVISED=1")
+        if gcmd.get('X', None) is not None or gcmd.get('Y', None) is not None:
+            raise gcmd.error("NEBULAOS_RAW_CONTACT_COMPARE: X/Y are not "
+                             "allowed - it uses the fixed reference point")
+        samples = gcmd.get_int('SAMPLES', 3, minval=1,
+                               maxval=self.RAW_COMPARE_MAX_SAMPLES)
+        trigger_counts = gcmd.get_int('TRIGGER_COUNTS', None)
+        polarity = gcmd.get_int('POLARITY', None)
+        if trigger_counts is None or polarity not in (1, -1):
+            raise gcmd.error("NEBULAOS_RAW_CONTACT_COMPARE: TRIGGER_COUNTS= "
+                             "and POLARITY=1|-1 are required")
+        print_stats = self.printer.lookup_object('print_stats', None)
+        if print_stats is not None:
+            state = print_stats.get_status(self.reactor.monotonic()).get('state')
+            if state in ('printing', 'paused'):
+                raise gcmd.error("NEBULAOS_RAW_CONTACT_COMPARE: not while a "
+                                 "print is %s" % (state,))
+        toolhead = self.printer.lookup_object('toolhead')
+        homed = toolhead.get_status(self.reactor.monotonic()).get('homed_axes', '')
+        if not all(a in homed for a in 'xyz'):
+            raise gcmd.error("NEBULAOS_RAW_CONTACT_COMPARE: home all axes first")
+        z_offset_probe = self.printer.lookup_object('nebulaos_z_offset_probe', None)
+        if z_offset_probe is None or not hasattr(z_offset_probe, 'plan_arming'):
+            raise gcmd.error("NEBULAOS_RAW_CONTACT_COMPARE: no load cell probe")
+        pstat = z_offset_probe.get_status(self.reactor.monotonic())
+        if not pstat['is_calibrated']:
+            raise gcmd.error("NEBULAOS_RAW_CONTACT_COMPARE: calibrate the load "
+                             "cell first - manual is the reference")
+        lc = z_offset_probe.get_load_cell()
+        candidate, problems = raw_contact.candidate_profile(
+            trigger_counts, polarity, lc.get_counts_per_gram(),
+            pstat['trigger_force'], pstat['force_safety_limit'],
+            lc.get_sensor().get_samples_per_second())
+        if candidate is None:
+            raise gcmd.error("NEBULAOS_RAW_CONTACT_COMPARE: candidate refused: "
+                             "%s" % ("; ".join(problems),))
+        x, y = self._resolve_reference_xy(gcmd)   # X/Y refused above
+        probe_obj = self.printer.lookup_object('probe')
+        probe_x_offset, probe_y_offset, probe_z_offset = probe_obj.get_offsets()
+        if not nebulaos_probe_pair._is_credible_probe_z_offset(probe_z_offset):
+            raise gcmd.error("NEBULAOS_RAW_CONTACT_COMPARE: needs an "
+                             "established probe Z offset (bounded floor)")
+        self.gcode.respond_info(
+            "!! NEBULAOS_RAW_CONTACT_COMPARE (SUPERVISED): %d calibrated then "
+            "%d raw touches at X=%.1f Y=%.1f, candidate trigger %d counts "
+            "(%.0f g on this unit), polarity %+d - nothing is saved"
+            % (samples, samples, x, y, trigger_counts,
+               trigger_counts / lc.get_counts_per_gram(), polarity))
+        self.raw_compare_id += 1
+        self.raw_compare_state = 'running'
+        self.raw_compare_error = None
+        self.raw_compare_result = None
+        results = {}
+        try:
+            for label, arming in (
+                    ('calibrated', None),
+                    ('raw', z_offset_probe.plan_arming(
+                        raw_contact.CALLER_Z_OFFSET_PAIR, profile=candidate))):
+                m = nebulaos_probe_pair.measure_probe_nozzle_pair(
+                    self.printer, x, y, probe_x_offset, probe_y_offset,
+                    probe_z_offset,
+                    self.horizontal_move_z, z_offset_probe, self.down_min_z,
+                    pro_cnt=samples, travel_speed=self.travel_speed,
+                    probe_lift_speed=self.probe_lift_speed,
+                    established_contact_margin_mm=self.established_contact_margin_mm,
+                    bootstrap_contact_envelope_mm=self.bootstrap_contact_envelope_mm,
+                    max_abs_fit_delta=self.max_abs_fit_delta,
+                    min_accepted_samples=self.min_accepted_samples,
+                    max_repeatability_range=self.max_repeatability_range,
+                    max_repeatability_stddev=self.max_repeatability_stddev,
+                    arming=arming)
+                st = z_offset_probe.get_status(self.reactor.monotonic())
+                results[label] = {
+                    'accepted': m.accepted,
+                    'rejection_reason': m.rejection_reason,
+                    'probe_z_offset': m.probe_z_offset,
+                    'range': m.repeatability.range,
+                    'stddev': m.repeatability.stddev,
+                    'effective_contact_mode': st.get('effective_contact_mode'),
+                    'last_peak_force_g': st.get('last_peak_force_g'),
+                    'last_force_at_trigger_g': st.get('last_force_at_trigger_g'),
+                    'last_raw_peak_delta_counts':
+                        st.get('last_raw_peak_delta_counts'),
+                }
+                self.gcode.respond_info(
+                    "RAW_CONTACT_COMPARE %s: accepted=%s z_offset=%s range=%s "
+                    "stddev=%s peak=%s g at_trigger=%s g"
+                    % (label, m.accepted, m.probe_z_offset,
+                       m.repeatability.range, m.repeatability.stddev,
+                       st.get('last_peak_force_g'),
+                       st.get('last_force_at_trigger_g')))
+        except Exception as e:
+            self.raw_compare_state = 'error'
+            self.raw_compare_error = _sanitize_error(e)
+            self.raw_compare_result = results
+            raise
+        cal, raw = results['calibrated'], results['raw']
+        diff = None
+        if cal['probe_z_offset'] is not None and raw['probe_z_offset'] is not None:
+            diff = raw['probe_z_offset'] - cal['probe_z_offset']
+        results['z_offset_difference'] = diff
+        self.raw_compare_state = 'complete'
+        self.raw_compare_result = results
+        self.gcode.respond_info(
+            "RAW_CONTACT_COMPARE: raw - calibrated Z offset = %s mm "
+            "(NOT applied, NOT saved)" % ("%.4f" % diff if diff is not None
+                                          else "n/a",))
 
     # ------------------------------------------------------------------
     # NEBULAOS_Z_OFFSET_CALIBRATE SIMULATE_BOOTSTRAP=1 (mission §8: a

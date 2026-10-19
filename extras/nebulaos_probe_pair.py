@@ -194,7 +194,8 @@ def measure_probe_nozzle_pair(printer, x, y, probe_x_offset, probe_y_offset,
                                max_abs_fit_delta=None,
                                min_accepted_samples=None,
                                max_repeatability_range=None,
-                               max_repeatability_stddev=None):
+                               max_repeatability_stddev=None,
+                               arming=None):
     """Take one bounded, quality-gated, optionally-repeated (probe, nozzle)
     measurement at bed point (x, y). Returns a PairedMeasurement whose
     `accepted` flag is the single authoritative answer to "may a caller
@@ -299,8 +300,12 @@ def measure_probe_nozzle_pair(printer, x, y, probe_x_offset, probe_y_offset,
         fit_valid = motion_safe = accepted = False
         rejection_reason = None
         try:
+            # arming (G83b-auto, Run 14): the probe's plan for this
+            # canonical paired path; None keeps the calibrated default.
+            touch_kwargs = {} if arming is None else {'arming': arming}
             fitted_z = z_offset_probe.touch_probe(
-                down_min_z, pro_cnt=1, minimum_allowed_z=commanded_floor_z)
+                down_min_z, pro_cnt=1, minimum_allowed_z=commanded_floor_z,
+                **touch_kwargs)
         except Exception as e:
             samples.append(ContactSample(
                 sample_index=i, starting_z=starting_z,

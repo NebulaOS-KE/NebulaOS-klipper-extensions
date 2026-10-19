@@ -66,11 +66,12 @@ class CalibrationGateSourceTest(unittest.TestCase):
         self.assertIn('is_calibrated()', tare_method,
                       "calibration gate must be in _tare_and_arm")
         touch_method = _extract_method(source, 'touch_probe')
-        self.assertIn('_tare_and_arm()', touch_method,
+        # Run 14: called with the touch's arming plan (None = calibrated)
+        self.assertIn('_tare_and_arm(arming)', touch_method,
                       "_tare_and_arm must be called from touch_probe")
         self.assertIn('probing_move(', touch_method,
                       "probing_move must be called from touch_probe")
-        tare_pos = touch_method.find('_tare_and_arm()')
+        tare_pos = touch_method.find('_tare_and_arm(arming)')
         probe_pos = touch_method.find('probing_move(')
         self.assertGreater(probe_pos, tare_pos,
                            "_tare_and_arm must run BEFORE probing_move")

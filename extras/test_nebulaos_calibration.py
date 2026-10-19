@@ -622,6 +622,7 @@ class UpstreamFirstCleanupTest(unittest.TestCase):
         self.assertEqual(
             sorted(gcode.commands.keys()),
             ['NEBULAOS_CALIBRATION_STATUS',
+             'NEBULAOS_RAW_CONTACT_COMPARE',
              '_NEBULAOS_AUTO_CALIBRATE',
              '_NEBULAOS_CALIBRATION_CANCEL',
              '_NEBULAOS_ESTEPS_CALIBRATE',
@@ -2086,6 +2087,140 @@ class LoadCellGuardTest(unittest.TestCase):
         coord._offer_load_cell_calibration()   # direct call still works
         prompts.clear()
         self.assertTrue(coord.get_status(0.)['load_cell_calibrated'])
+
+
+# ----------------------------------------------------------------------
+# G83b-auto (Run 14): NEBULAOS_RAW_CONTACT_COMPARE - supervised stage C
+# ----------------------------------------------------------------------
+from . import nebulaos_raw_contact as raw_contact
+
+
+class FakeCompareProbe(FakeZOffsetProbe):
+    """A calibrated ke-dev-like probe exposing the plan_arming contract."""
+    def __init__(self, calibrated=True, cpg=94.9):
+        super().__init__(is_calibrated=calibrated)
+        self.cpg = cpg
+        self.plans = []
+        sensor = type('S', (), {'get_samples_per_second': lambda s: 80.})()
+        self.lc = type('LC', (), {
+            'get_counts_per_gram': lambda s: cpg,
+            'get_sensor': lambda s: sensor})()
+
+    def get_load_cell(self):
+        return self.lc
+
+    def plan_arming(self, caller, profile=None):
+        self.plans.append((caller, profile))
+        if profile is not None:
+            return raw_contact.ARM_RAW, profile
+        return raw_contact.ARM_CALIBRATED, None
+
+    def get_status(self, eventtime):
+        return {'is_calibrated': self._is_calibrated, 'trigger_force': 75.,
+                'force_safety_limit': 2000.,
+                'effective_contact_mode': 'calibrated_force',
+                'last_peak_force_g': -200., 'last_force_at_trigger_g': -80.,
+                'last_raw_peak_delta_counts': -19000}
+
+
+class _Toolhead:
+    def __init__(self, homed='xyz'):
+        self.homed = homed
+
+    def get_status(self, eventtime):
+        return {'homed_axes': self.homed}
+
+
+class _Stats:
+    def __init__(self, state):
+        self.state = state
+
+    def get_status(self, eventtime):
+        return {'state': self.state}
+
+
+class RawContactCompareTest(unittest.TestCase):
+    PARAMS = {'SUPERVISED': '1', 'TRIGGER_COUNTS': '6400', 'POLARITY': '-1'}
+
+    def _build(self, probe=None, homed='xyz', print_state='standby'):
+        probe = probe or FakeCompareProbe()
+        printer, gcode, coord = _build(probe, FakeProbeObj(),
+                                       FakeZCompensate(20., 25.))
+        printer.add_object('toolhead', _Toolhead(homed))
+        printer.add_object('print_stats', _Stats(print_state))
+        self.calls = []
+
+        def fake_measure(*args, **kw):
+            self.calls.append(kw)
+            return _accepted_measurement(20., 25., 2.5, 0.831)
+        orig = nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair
+        nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = \
+            fake_measure
+        self.addCleanup(setattr, nebulaos_calibration.nebulaos_probe_pair,
+                        'measure_probe_nozzle_pair', orig)
+        return printer, gcode, coord, probe
+
+    def _run(self, coord, **over):
+        params = dict(self.PARAMS)
+        params.update({k: str(v) for k, v in over.items()})
+        params = {k: v for k, v in params.items() if v != 'None'}
+        coord.cmd_raw_contact_compare(fake.FakeGCmd(params))
+
+    def test_calibrated_then_raw_candidate_nothing_saved(self):
+        printer, gcode, coord, probe = self._build()
+        self._run(coord)
+        self.assertEqual(len(self.calls), 2)
+        self.assertIsNone(self.calls[0]['arming'])
+        kind, profile = self.calls[1]['arming']
+        self.assertEqual(kind, raw_contact.ARM_RAW)
+        self.assertEqual(profile['trigger_counts'], 6400)
+        self.assertEqual(profile['polarity'], -1)
+        self.assertEqual(self.calls[1]['pro_cnt'], 3)
+        self.assertEqual(coord.raw_compare_state, 'complete')
+        self.assertAlmostEqual(coord.raw_compare_result['z_offset_difference'],
+                               0.0)
+        self.assertNotIn('SAVE_CONFIG', gcode.scripts_run)
+        self.assertEqual(printer.lookup_object('configfile').set_calls, [])
+
+    def test_needs_supervised(self):
+        printer, gcode, coord, probe = self._build()
+        with self.assertRaises(fake.CommandError):
+            self._run(coord, SUPERVISED=None)
+        self.assertEqual(self.calls, [])
+
+    def test_fixed_reference_point_only(self):
+        printer, gcode, coord, probe = self._build()
+        with self.assertRaises(fake.CommandError):
+            self._run(coord, X=100)
+        self.assertEqual(self.calls, [])
+
+    def test_sample_count_is_capped(self):
+        printer, gcode, coord, probe = self._build()
+        with self.assertRaises(fake.CommandError):
+            self._run(coord, SAMPLES=6)
+
+    def test_refused_unhomed_printing_or_uncalibrated(self):
+        for kw in ({'homed': ''}, {'print_state': 'printing'},
+                   {'probe': FakeCompareProbe(calibrated=False)}):
+            printer, gcode, coord, probe = self._build(**kw)
+            with self.assertRaises(fake.CommandError):
+                self._run(coord)
+            self.assertEqual(self.calls, [])
+
+    def test_candidate_above_the_calibrated_trigger_force_is_refused(self):
+        printer, gcode, coord, probe = self._build()
+        with self.assertRaises(fake.CommandError) as ctx:
+            self._run(coord, TRIGGER_COUNTS=9500)       # 100 g on 94.9 c/g
+        self.assertIn('above trigger_force', str(ctx.exception))
+        self.assertEqual(self.calls, [])
+
+    def test_normal_z_offset_uses_the_probe_plan_for_the_pair_caller(self):
+        printer, gcode, coord, probe = self._build()
+        coord.cmd_z_offset_calibrate(fake.FakeGCmd({}))
+        self.assertEqual(probe.plans[0],
+                         (raw_contact.CALLER_Z_OFFSET_PAIR, None))
+        self.assertEqual(self.calls[0]['arming'],
+                         (raw_contact.ARM_CALIBRATED, None))
 
 
 if __name__ == '__main__':

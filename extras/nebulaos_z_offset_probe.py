@@ -82,15 +82,25 @@ class ZOffsetProbe:
 
         self._best_fit = LCBestFit(self._printer)
 
-        # G83b (Run 13): weight-free contact detection, stages A/B of
-        # docs/NEBULAOS_RAW_CONTACT_BRIEF.md (firmware repo). Default
-        # calibrated_force is the unchanged behaviour. raw_contact is opt-in
-        # and refuses every nozzle-contact motion until a hardware-qualified
-        # profile exists (nebulaos_raw_contact.QUALIFIED_PROFILES is empty):
-        # only the no-motion diagnostic works.
+        # G83b weight-free contact (docs/NEBULAOS_RAW_CONTACT_BRIEF.md in the
+        # firmware repo). Run 14 (G83b-auto): the default is 'auto' -
+        # resolved per caller by raw_contact.resolve_arming(): the unit's own
+        # grams calibration first, a QUALIFIED raw profile only for the
+        # canonical paired Z-offset path, otherwise a refusal. With
+        # QUALIFIED_PROFILES empty this is today's calibrated behaviour.
+        # Never write this option into the image-owned z_offset_probe.cfg:
+        # configfile refuses an autosaved option that an include also sets.
         self._contact_mode = config.getchoice(
             'contact_detection_mode',
-            {m: m for m in raw_contact.MODES}, raw_contact.MODE_CALIBRATED)
+            {m: m for m in raw_contact.MODES}, raw_contact.MODE_AUTO)
+        # Raw arming in use for the current touch (an explicit plan from the
+        # caller; None = calibrated force) and the last resolved mode.
+        self._active_profile = None
+        self._effective_mode = None
+        # Idle window before a raw touch: long enough for validate_idle()
+        # (>= 20 samples) and a meaningful noise/drift estimate.
+        self._raw_health_time = config.getfloat(
+            'raw_health_time', default=0.75, minval=0.3, maxval=5.)
         self._raw_profile_id = config.get('raw_contact_profile_id', None)
         self._last_contact_rejection_reason = None
         self._last_raw_peak_delta_counts = None
@@ -136,8 +146,103 @@ class ZOffsetProbe:
         NEBULAOS_LOAD_CELL_CALIBRATE flow uses its public calibration API)."""
         return self._load_cell
 
-    def _tare_and_arm(self):
-        if self._contact_mode == raw_contact.MODE_RAW:
+    def plan_arming(self, caller, profile=None):
+        """The arming for a touch by `caller`: (ARM_CALIBRATED, None),
+        (ARM_RAW, profile) or a refusal (None, (code, message)). profile=
+        is an explicit stage-C candidate (supervised comparison only); it
+        never comes from a registry lookup and needs the calibration."""
+        if profile is not None:
+            problems = raw_contact.validate_profile(profile)
+            if problems:
+                return None, (raw_contact.RAW_BAD_PROFILE, "; ".join(problems))
+            if not self._load_cell.is_calibrated():
+                return None, (raw_contact.NOT_CALIBRATED,
+                              "the comparison needs the calibrated load cell")
+            return raw_contact.ARM_RAW, profile
+        # A persisted unloaded reference for uncalibrated units does not
+        # exist yet (brief 5.1.5): auto/raw cannot resolve to raw without one.
+        return raw_contact.resolve_arming(
+            self._contact_mode, caller, self._load_cell.is_calibrated(),
+            self._raw_profile_id, reference_counts=None)
+
+    def _raw_reference_counts(self):
+        """The independent unloaded reference the raw safety window is
+        anchored to (never the fresh tare): the calibration's zero."""
+        if self._load_cell.is_calibrated():
+            return self._load_cell.get_reference_tare_counts()
+        return None
+
+    def _refuse(self, code, message):
+        self._last_contact_rejection_reason = code
+        raise self._printer.command_error("%s: %s" % (self._name, message))
+
+    def _arm_raw(self, profile):
+        """Raw-count arming (G83b-auto, architecture review Run 14):
+        1. dedicated idle window -> health check against the profile, the
+           median is the tare; a failed check REFUSES (no fallback);
+        2. the fresh tare must be within max_reference_drift_counts of the
+           independent reference R;
+        3. MCU raw window R +- safety_counts, strictly inside the sensor;
+        4. offset -tare, scale 1 (integer: no fixed-point bits), trigger
+           abs_ge trigger_counts. abs_ge rather than gt with
+           scale=polarity: an opposite-sign event can only stop early."""
+        reference = self._raw_reference_counts()
+        if reference is None:
+            self._refuse(raw_contact.RAW_NO_REFERENCE,
+                         "raw contact has no unloaded reference - nozzle "
+                         "contact refused")
+        reactor = self._printer.get_reactor()
+        collector = self._load_cell.get_collector()
+        collector.start_collecting()
+        reactor.pause(reactor.monotonic() + self._raw_health_time)
+        samples, errors = collector.stop_collecting()
+        stats, reasons = raw_contact.validate_idle(
+            samples, errors, self._load_cell.saturation_range(),
+            profile['expected_sps'], profile['sps_tolerance'])
+        if not reasons and stats['sigma'] > profile['max_idle_sigma']:
+            reasons.append('noise_above_profile')
+        if not reasons and stats['drift_per_s'] is not None and \
+                abs(stats['drift_per_s']) > profile['max_idle_drift_per_s']:
+            reasons.append('drift_above_profile')
+        self._raw_diag = dict(stats)
+        self._raw_diag['reasons'] = list(reasons)
+        if reasons:
+            self._refuse(raw_contact.RAW_UNHEALTHY,
+                         "load cell not healthy before contact (%s) - nozzle "
+                         "contact refused" % (", ".join(reasons),))
+        tare = int(stats['median'])
+        if abs(tare - reference) > profile['max_reference_drift_counts']:
+            self._refuse(raw_contact.RAW_REFERENCE_DRIFT,
+                         "the empty reading moved %d counts from the reference "
+                         "(limit %d) - something presses on the bed? nozzle "
+                         "contact refused" % (tare - reference,
+                                              profile['max_reference_drift_counts']))
+        safety_min = int(reference - profile['safety_counts'])
+        safety_max = int(reference + profile['safety_counts'])
+        sensor_min, sensor_max = self._sensor.get_range()
+        if safety_min <= sensor_min or safety_max >= sensor_max:
+            self._refuse(raw_contact.RAW_BAD_PROFILE,
+                         "raw safety window exceeds the sensor range")
+        self._load_cell.tare(tare)
+        self._mcu_trigger_analog.set_raw_range(safety_min, safety_max)
+        sos_filter = self._mcu_trigger_analog.get_sos_filter()
+        sos_filter.set_offset_scale(-tare, 1)
+        self._mcu_trigger_analog.set_trigger("abs_ge",
+                                             int(profile['trigger_counts']))
+        self._active_profile = profile
+        self._effective_mode = raw_contact.MODE_RAW
+
+    def _tare_and_arm(self, arming=None):
+        """arming: None (every existing caller: calibrated force, as before)
+        or a plan from plan_arming()."""
+        self._active_profile = None
+        if arming is not None:
+            kind, detail = arming
+            if kind is None:
+                self._refuse(detail[0], detail[1])
+            if kind == raw_contact.ARM_RAW:
+                return self._arm_raw(detail)
+        elif self._contact_mode == raw_contact.MODE_RAW:
             refusal = raw_contact.raw_motion_refusal(self._raw_profile_id)
             if refusal is None:
                 # A qualified profile exists - but stage B ships without the
@@ -184,6 +289,7 @@ class ZOffsetProbe:
 
         trigger_frac_grams = int(self._trigger_force * FRAC_GRAMS_CONV)
         self._mcu_trigger_analog.set_trigger("abs_ge", trigger_frac_grams)
+        self._effective_mode = raw_contact.MODE_CALIBRATED
 
     def _start_fit_collector(self):
         toolhead = self._printer.lookup_object('toolhead')
@@ -251,20 +357,24 @@ class ZOffsetProbe:
         self._last_force_at_trigger_g = None
         self._last_tare_counts = None
         self._last_raw_peak_delta_counts = None
-        raw_mode = self._contact_mode == raw_contact.MODE_RAW
-        polarity = None
-        if raw_mode:
-            profile = raw_contact.lookup_profile(self._raw_profile_id)
-            polarity = profile['polarity'] if profile else None
+        # Raw arming in use: polarity from the plan's profile (never a
+        # registry lookup - a candidate is not in any registry).
+        raw_mode = self._active_profile is not None
+        polarity = self._active_profile['polarity'] if raw_mode else None
+        fit_mode = raw_contact.MODE_RAW if raw_mode else raw_contact.MODE_CALIBRATED
         if samples:
             self._last_tare_counts = samples[0][3]
             pre_trigger = [s for s in samples if s[0] <= ascent_start_time]
             if raw_mode:
-                # Never grams on an uncalibrated cell: raw count telemetry
-                # only; the gram fields stay None.
+                # Raw count telemetry; grams too when the cell happens to be
+                # calibrated (the supervised comparison), never invented.
                 peak_sample = max(samples, key=lambda s: abs(s[2] - s[3]))
                 self._last_raw_peak_delta_counts = peak_sample[2] - peak_sample[3]
                 self._last_peak_force_time = peak_sample[0]
+                if peak_sample[1] is not None:
+                    self._last_peak_force_g = peak_sample[1]
+                if pre_trigger and pre_trigger[-1][1] is not None:
+                    self._last_force_at_trigger_g = pre_trigger[-1][1]
             else:
                 peak_sample = max(samples, key=lambda s: abs(s[1]))
                 self._last_peak_force_g = peak_sample[1]
@@ -277,7 +387,7 @@ class ZOffsetProbe:
             if s[0] >= ascent_start_time and \
                s[0] <= ascent_start_time + ASCENT_DATA_WINDOW_SECONDS:
                 data.append((raw_contact.fit_magnitude(
-                                 s, self._contact_mode, polarity),
+                                 s, fit_mode, polarity),
                              _lookup_z_pos(toolhead, s[0])))
 
         # Phase 2 hot-reliability investigation (qualification-only diagnostic,
@@ -321,7 +431,8 @@ class ZOffsetProbe:
 
         return z_contact
 
-    def touch_probe(self, down_min_z, pro_cnt=1, minimum_allowed_z=None):
+    def touch_probe(self, down_min_z, pro_cnt=1, minimum_allowed_z=None,
+                    arming=None):
         # down_min_z: positive depth below Z=0 (e.g. 10 means Z=-10).
         # Negate to get the target Z coordinate, then clamp to stepper limit.
         #
@@ -348,8 +459,10 @@ class ZOffsetProbe:
         z_floor = max(self._z_min_position, -down_min_z)
         results = []
 
+        # A raw plan is used only for this call: every touch re-arms and
+        # clears the previous arming first, so nothing leaks into a later call.
         for i in range(pro_cnt):
-            self._tare_and_arm()
+            self._tare_and_arm(arming)
 
             collector = self._start_fit_collector()
 
@@ -383,12 +496,13 @@ class ZOffsetProbe:
     def get_status(self, eventtime):
         trig_time = self._mcu_trigger_analog.get_last_trigger_time()
         calibrated = self._load_cell.is_calibrated()
-        raw_mode = self._contact_mode == raw_contact.MODE_RAW
+        kind, _ = self.plan_arming(raw_contact.CALLER_Z_OFFSET_PAIR)
         return {
             'contact_detection_mode': self._contact_mode,
-            # Ready for nozzle contact: grams calibration in calibrated mode;
-            # never in raw mode until a qualified profile and arming exist.
-            'contact_qualified': (not raw_mode) and calibrated,
+            # The arming the last touch actually used.
+            'effective_contact_mode': self._effective_mode,
+            # Ready for nozzle contact on the canonical Z-offset path.
+            'contact_qualified': kind is not None,
             'raw_profile_id': self._raw_profile_id,
             'last_contact_rejection_reason': self._last_contact_rejection_reason,
             'last_raw_peak_delta_counts': self._last_raw_peak_delta_counts,

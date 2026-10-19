@@ -11,6 +11,7 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import ast
+import types
 import math
 import os
 import random
@@ -265,19 +266,20 @@ class ProbeIntegrationSourceTest(unittest.TestCase):
         self.assertIn('validate_idle', code)
 
     def test_raw_mode_refuses_before_anything_is_armed(self):
+        # Config raw_contact without an explicit plan refuses before the MCU
+        # is armed; an explicit raw plan goes to _arm_raw (tested below).
         code, fn, _ = _probe_function('_tare_and_arm')
-        first = fn.body[0]
-        self.assertIsInstance(first, ast.If)
-        self.assertIn('MODE_RAW', ast.unparse(first.test))
-        # the refusal raises; nothing below it runs in raw mode
-        self.assertTrue(any(isinstance(n, ast.Raise) for n in ast.walk(first)))
+        self.assertIn('MODE_RAW', code)
         self.assertLess(code.index('raw_motion_refusal'),
                         code.index('set_raw_range'))
+        self.assertLess(code.index('_arm_raw('), code.index('set_raw_range'))
 
-    def test_default_mode_is_calibrated_force(self):
+    def test_default_mode_is_auto(self):
+        # G83b-auto (Run 14): 'auto' - with QUALIFIED_PROFILES empty it is
+        # the calibrated behaviour (see ResolveArmingTest).
         _, _, src = _probe_function('__init__')
         self.assertIn("'contact_detection_mode'", src)
-        self.assertIn("raw_contact.MODE_CALIBRATED)", src)
+        self.assertIn("raw_contact.MODE_AUTO)", src)
 
     def test_fit_uses_mode_aware_magnitude_and_no_fake_grams(self):
         code, _, _ = _probe_function('_fit_contact_z')
@@ -288,7 +290,237 @@ class ProbeIntegrationSourceTest(unittest.TestCase):
     def test_status_keeps_is_calibrated_for_grams_only(self):
         code, _, _ = _probe_function('get_status')
         self.assertIn("'is_calibrated': self._load_cell.is_calibrated()", code)
-        self.assertIn("'contact_qualified': (not raw_mode) and calibrated", code)
+        self.assertIn("'contact_qualified': kind is not None", code)
+        self.assertIn("'effective_contact_mode'", code)
+
+
+def _profile(**kw):
+    p = {'id': 'test', 'polarity': -1, 'trigger_counts': 6400,
+         'safety_counts': 170000, 'max_reference_drift_counts': 6400,
+         'expected_sps': 80., 'sps_tolerance': 0.25, 'max_idle_sigma': 640.,
+         'max_idle_drift_per_s': 800., 'evidence': 'test'}
+    p.update(kw)
+    return p
+
+
+class ProfileTest(unittest.TestCase):
+    def test_complete_profile_is_valid(self):
+        self.assertEqual(rc.validate_profile(_profile()), [])
+
+    def test_missing_polarity_is_refused(self):
+        p = _profile()
+        del p['polarity']
+        self.assertIn('missing polarity', rc.validate_profile(p))
+        self.assertTrue(rc.validate_profile(_profile(polarity=0)))
+
+    def test_trigger_must_be_below_safety(self):
+        self.assertTrue(rc.validate_profile(_profile(trigger_counts=200000)))
+
+
+class CandidateTest(unittest.TestCase):
+    def test_candidate_within_the_calibrated_envelope(self):
+        p, problems = rc.candidate_profile(6400, -1, 85.72, 75., 2000., 80.)
+        self.assertEqual(problems, [])
+        self.assertEqual(p['safety_counts'], int(85.72 * 2000))
+        self.assertEqual(p['polarity'], -1)
+
+    def test_candidate_above_trigger_force_is_refused(self):
+        # 9000 counts = 105 g on ke-dev > 75 g + 10%
+        p, problems = rc.candidate_profile(9000, -1, 85.72, 75., 2000., 80.)
+        self.assertIsNone(p)
+        self.assertIn('above trigger_force', problems[0])
+
+    def test_candidate_needs_a_calibration(self):
+        p, problems = rc.candidate_profile(6400, -1, None, 75., 2000., 80.)
+        self.assertIsNone(p)
+
+    def test_candidate_is_never_reachable_by_lookup(self):
+        p, _ = rc.candidate_profile(6400, -1, 85.72, 75., 2000., 80.)
+        self.assertIsNone(rc.lookup_profile(p['id']))
+
+
+class ResolveArmingTest(unittest.TestCase):
+    def tearDown(self):
+        rc.QUALIFIED_PROFILES.clear()
+
+    def test_auto_today_is_the_calibrated_behaviour(self):
+        for caller in (rc.CALLER_Z_OFFSET_PAIR, 'nozzle_clear', 'legacy'):
+            self.assertEqual(rc.resolve_arming('auto', caller, True),
+                             (rc.ARM_CALIBRATED, None))
+            kind, refusal = rc.resolve_arming('auto', caller, False)
+            self.assertIsNone(kind)
+            self.assertEqual(refusal[0], rc.NOT_CALIBRATED)
+
+    def test_other_callers_never_get_raw_even_with_a_qualified_profile(self):
+        rc.QUALIFIED_PROFILES['ke-test'] = _profile(id='ke-test')
+        for mode in rc.MODES:
+            for caller in ('nozzle_clear', 'legacy_z_offset', 'auto_calibrate'):
+                kind, _ = rc.resolve_arming(mode, caller, False, 'ke-test', 0)
+                self.assertNotEqual(kind, rc.ARM_RAW)
+
+    def test_calibration_beats_a_model_profile(self):
+        rc.QUALIFIED_PROFILES['ke-test'] = _profile(id='ke-test')
+        self.assertEqual(rc.resolve_arming('auto', rc.CALLER_Z_OFFSET_PAIR,
+                                           True, 'ke-test', 0)[0],
+                         rc.ARM_CALIBRATED)
+
+    def test_raw_needs_a_reference(self):
+        rc.QUALIFIED_PROFILES['ke-test'] = _profile(id='ke-test')
+        kind, refusal = rc.resolve_arming('auto', rc.CALLER_Z_OFFSET_PAIR,
+                                          False, 'ke-test', None)
+        self.assertEqual(refusal[0], rc.RAW_NO_REFERENCE)
+        kind, profile = rc.resolve_arming('auto', rc.CALLER_Z_OFFSET_PAIR,
+                                          False, 'ke-test', -240000)
+        self.assertEqual(kind, rc.ARM_RAW)
+
+def _bound_probe_methods(names):
+    """Methods of ZOffsetProbe executed on a fake (no MCU stack needed)."""
+    ns = {'raw_contact': rc, 'math': __import__('math')}
+    for name in names:
+        code, fn, _ = _probe_function(name)
+        exec(compile(ast.Module(body=[fn], type_ignores=[]), 'probe', 'exec'),
+             ns)
+    return {n: ns[n] for n in names}
+
+
+class _Err(Exception):
+    pass
+
+
+class _Printer:
+    def __init__(self):
+        self.reactor = types.SimpleNamespace(monotonic=lambda: 0.,
+                                             pause=lambda t: t)
+
+    def get_reactor(self):
+        return self.reactor
+
+    def command_error(self, msg):
+        return _Err(msg)
+
+
+class _Collector:
+    def __init__(self, samples):
+        self.samples = samples
+
+    def start_collecting(self, min_time=None):
+        pass
+
+    def stop_collecting(self):
+        return self.samples, 0
+
+
+class _LoadCell:
+    def __init__(self, samples, reference, calibrated=True):
+        self.samples, self.reference = samples, reference
+        self.calibrated = calibrated
+        self.tared = None
+
+    def is_calibrated(self):
+        return self.calibrated
+
+    def get_reference_tare_counts(self):
+        return self.reference
+
+    def get_collector(self):
+        return _Collector(self.samples)
+
+    def saturation_range(self):
+        return -0x800000, 0x7FFFFF
+
+    def tare(self, counts):
+        self.tared = counts
+
+
+class _Trigger:
+    def __init__(self):
+        self.calls = []
+        sos = types.SimpleNamespace(
+            set_offset_scale=lambda o, sc: self.calls.append(('offset_scale', o, sc)))
+        self.get_sos_filter = lambda: sos
+
+    def set_raw_range(self, lo, hi):
+        self.calls.append(('raw_range', lo, hi))
+
+    def set_trigger(self, kind, value):
+        self.calls.append(('trigger', kind, value))
+
+
+def _idle(median, n=70, sps=90.6, noise=110):
+    out, seed = [], 7
+    for i in range(n):
+        seed = (seed * 1103515245 + 12345) & 0x7fffffff
+        out.append((i / sps, None, median + (seed % (2 * noise + 1)) - noise,
+                    None))
+    return out
+
+
+class RawArmingTest(unittest.TestCase):
+    """_arm_raw() per the Run 14 architecture review."""
+    REF = -240426
+
+    def _probe(self, samples, reference=REF, calibrated=True):
+        m = _bound_probe_methods(['_arm_raw', '_raw_reference_counts',
+                                  '_refuse'])
+        probe = types.SimpleNamespace()
+        probe._printer = _Printer()
+        probe._name = 'nebulaos_z_offset_probe'
+        probe._load_cell = _LoadCell(samples, reference, calibrated)
+        probe._sensor = types.SimpleNamespace(
+            get_range=lambda: (-0x800000, 0x7FFFFF))
+        probe._mcu_trigger_analog = _Trigger()
+        probe._raw_health_time = 0.75
+        probe._raw_diag = None
+        probe._last_contact_rejection_reason = None
+        probe._active_profile = None
+        probe._effective_mode = None
+        for name, fn in m.items():
+            setattr(probe, name, types.MethodType(fn, probe))
+        return probe
+
+    def test_arms_on_the_fresh_tare_with_the_window_on_the_reference(self):
+        probe = self._probe(_idle(self.REF - 1000))
+        probe._arm_raw(_profile())
+        calls = probe._mcu_trigger_analog.calls
+        self.assertEqual(calls[0], ('raw_range', self.REF - 170000,
+                                    self.REF + 170000))
+        self.assertEqual(calls[1][0], 'offset_scale')
+        self.assertAlmostEqual(-calls[1][1], self.REF - 1000, delta=60)
+        self.assertEqual(calls[1][2], 1)
+        self.assertEqual(calls[2], ('trigger', 'abs_ge', 6400))
+        self.assertEqual(probe._effective_mode, rc.MODE_RAW)
+        self.assertEqual(probe._active_profile['polarity'], -1)
+
+    def test_residual_preload_is_refused_not_re_tared(self):
+        # Something presses on the bed: the empty reading is 20000 counts
+        # off the reference. Re-taring would move the safety window.
+        probe = self._probe(_idle(self.REF - 20000))
+        with self.assertRaises(_Err):
+            probe._arm_raw(_profile())
+        self.assertEqual(probe._last_contact_rejection_reason,
+                         rc.RAW_REFERENCE_DRIFT)
+        self.assertEqual(probe._mcu_trigger_analog.calls, [])
+
+    def test_short_window_is_refused(self):
+        probe = self._probe(_idle(self.REF, n=6))      # the old touch tare
+        with self.assertRaises(_Err):
+            probe._arm_raw(_profile())
+        self.assertEqual(probe._last_contact_rejection_reason, rc.RAW_UNHEALTHY)
+        self.assertEqual(probe._mcu_trigger_analog.calls, [])
+
+    def test_noisy_sensor_is_refused(self):
+        probe = self._probe(_idle(self.REF, noise=3000))
+        with self.assertRaises(_Err):
+            probe._arm_raw(_profile())
+        self.assertIn('noise_above_profile', probe._raw_diag['reasons'])
+
+    def test_no_reference_no_raw(self):
+        probe = self._probe(_idle(self.REF), reference=None, calibrated=False)
+        with self.assertRaises(_Err):
+            probe._arm_raw(_profile())
+        self.assertEqual(probe._last_contact_rejection_reason,
+                         rc.RAW_NO_REFERENCE)
+
 
 if __name__ == '__main__':
     unittest.main()

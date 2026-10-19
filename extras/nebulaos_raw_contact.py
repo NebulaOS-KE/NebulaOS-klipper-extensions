@@ -24,7 +24,26 @@ import re
 
 MODE_CALIBRATED = 'calibrated_force'
 MODE_RAW = 'raw_contact'
-MODES = (MODE_CALIBRATED, MODE_RAW)
+# G83b-auto (Run 14): the default. Per caller: the unit's own grams
+# calibration when there is one (per-unit evidence beats a model profile),
+# otherwise a QUALIFIED raw profile - only for the canonical paired Z-offset
+# path - otherwise a refusal (the bottle calibration popup).
+MODE_AUTO = 'auto'
+MODES = (MODE_AUTO, MODE_CALIBRATED, MODE_RAW)
+
+# The only caller that may ever resolve to raw contact: the canonical
+# NEBULAOS_Z_OFFSET_CALIBRATE paired path (fixed reference XY, bounded
+# floor). Nozzle cleaning, the legacy Z_OFFSET_CALIBRATION and
+# NEBULAOS_AUTO_CALIBRATE stay on calibrated force (brief E.2-E.4).
+CALLER_Z_OFFSET_PAIR = 'z_offset_pair'
+ARM_CALIBRATED = 'calibrated'
+ARM_RAW = 'raw'
+
+# A raw-contact profile (brief section 5). Every field is required.
+PROFILE_FIELDS = ('id', 'polarity', 'trigger_counts', 'safety_counts',
+                  'max_reference_drift_counts', 'expected_sps',
+                  'sps_tolerance', 'max_idle_sigma', 'max_idle_drift_per_s',
+                  'evidence')
 
 # Rejection codes for a no-motion idle check (stable strings for status/UI).
 NO_SAMPLES = 'no_samples'
@@ -39,12 +58,104 @@ TIME_NOT_MONOTONIC = 'time_not_monotonic'
 # Rejection codes for raw-contact motion (stage B gate).
 RAW_NO_PROFILE = 'raw_contact_no_qualified_profile'
 RAW_UNKNOWN_PROFILE = 'raw_contact_unknown_profile'
+RAW_NO_REFERENCE = 'raw_contact_no_reference'
+RAW_REFERENCE_DRIFT = 'raw_contact_reference_drift'
+RAW_UNHEALTHY = 'raw_contact_sensor_unhealthy'
+RAW_BAD_PROFILE = 'raw_contact_invalid_profile'
+NOT_CALIBRATED = 'load_cell_not_calibrated'
 
 # Versioned, hardware-qualified raw-contact profiles, keyed by id. Each entry
 # must come from a documented supervised force qualification (brief, PR C/D):
 # polarity, trigger band, reference drift window, ADC safety window, noise /
 # drift / sample-rate bounds, fit-quality limits. None exist yet.
 QUALIFIED_PROFILES = {}
+
+
+def validate_profile(profile):
+    """[] for a usable profile, else the problems. A profile without
+    polarity is refused: the raw fit needs it (compression_signal)."""
+    if not isinstance(profile, dict):
+        return ["profile is not a dict"]
+    problems = ["missing %s" % (f,) for f in PROFILE_FIELDS
+                if profile.get(f) is None]
+    if problems:
+        return problems
+    if profile['polarity'] not in (1, -1):
+        problems.append("polarity must be +1 or -1")
+    for f in ('trigger_counts', 'safety_counts', 'max_reference_drift_counts',
+              'max_idle_sigma', 'max_idle_drift_per_s', 'expected_sps'):
+        v = profile[f]
+        if not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0:
+            problems.append("%s must be a positive number" % (f,))
+    if not problems and profile['trigger_counts'] >= profile['safety_counts']:
+        problems.append("trigger_counts must be below safety_counts")
+    return problems
+
+
+def candidate_profile(trigger_counts, polarity, counts_per_gram,
+                      trigger_force, force_safety_limit, expected_sps,
+                      force_tolerance=0.10):
+    """A stage-C CANDIDATE for the supervised comparison on a CALIBRATED unit
+    (brief PR C). Never shipped as constants and never reachable through
+    lookup_profile(): built at run time and cross-checked against this
+    unit's calibrated force envelope. Returns (profile, problems).
+
+    - trigger_counts / counts_per_gram may not exceed trigger_force (+10%);
+    - safety_counts = force_safety_limit in counts (the calibrated window);
+    - the reference may have moved at most trigger_force since calibration;
+    - idle noise must be 10x below the trigger and drift over a ~2 s
+      descent below a quarter of it (relative rules, candidate only)."""
+    problems = []
+    if counts_per_gram is None or counts_per_gram <= 0:
+        return None, ["the load cell must be calibrated (manual is the "
+                      "reference for the comparison)"]
+    if not isinstance(trigger_counts, int) or trigger_counts <= 0:
+        problems.append("TRIGGER_COUNTS must be a positive whole number")
+    elif trigger_counts / counts_per_gram > trigger_force * (1. + force_tolerance):
+        problems.append(
+            "TRIGGER_COUNTS %d is %.0f g on this unit, above trigger_force "
+            "%.0f g - refused" % (trigger_counts,
+                                  trigger_counts / counts_per_gram,
+                                  trigger_force))
+    if problems:
+        return None, problems
+    profile = {
+        'id': 'candidate-%d' % (trigger_counts,),
+        'polarity': polarity,
+        'trigger_counts': trigger_counts,
+        'safety_counts': int(counts_per_gram * force_safety_limit),
+        'max_reference_drift_counts': int(counts_per_gram * trigger_force),
+        'expected_sps': expected_sps,
+        'sps_tolerance': 0.25,
+        'max_idle_sigma': trigger_counts / 10.,
+        'max_idle_drift_per_s': trigger_counts / 8.,
+        'evidence': "run-time stage-C candidate on a calibrated unit; "
+                    "abs_ge trigger (an opposite-sign event can only stop "
+                    "a touch early)",
+    }
+    problems = validate_profile(profile)
+    return (None if problems else profile), problems
+
+
+def resolve_arming(mode, caller, calibrated, profile_id=None,
+                   reference_counts=None):
+    """How a touch is armed: (ARM_CALIBRATED, None), (ARM_RAW, profile) or
+    (None, (code, message)) for a refusal. Pure - see MODE_AUTO above."""
+    if caller != CALLER_Z_OFFSET_PAIR or mode == MODE_CALIBRATED:
+        if calibrated:
+            return ARM_CALIBRATED, None
+        return None, (NOT_CALIBRATED, "the load cell is not calibrated")
+    if mode == MODE_AUTO and calibrated:
+        return ARM_CALIBRATED, None
+    refusal = raw_motion_refusal(profile_id)
+    if refusal is not None:
+        if mode == MODE_AUTO:
+            return None, (NOT_CALIBRATED, "the load cell is not calibrated")
+        return None, refusal
+    if reference_counts is None:
+        return None, (RAW_NO_REFERENCE, "raw contact has no unloaded "
+                      "reference for this unit - nozzle contact refused")
+    return ARM_RAW, lookup_profile(profile_id)
 
 
 def lookup_profile(profile_id):
