@@ -392,6 +392,19 @@ class ResolveArmingTest(unittest.TestCase):
                                            True, 'ke-test', 0)[0],
                          rc.ARM_CALIBRATED)
 
+    def test_every_qualified_profile_passes_the_schema(self):
+        for pid, profile in rc.QUALIFIED_PROFILES.items():
+            self.assertEqual(rc.validate_profile(profile), [], pid)
+
+    def test_an_invalid_registry_profile_is_refused(self):
+        bad = _profile(id='ke-bad')
+        del bad['polarity']
+        rc.QUALIFIED_PROFILES['ke-bad'] = bad
+        kind, refusal = rc.resolve_arming('raw_contact', rc.CALLER_Z_OFFSET_PAIR,
+                                          False, 'ke-bad', 0)
+        self.assertIsNone(kind)
+        self.assertEqual(refusal[0], rc.RAW_BAD_PROFILE)
+
     def test_raw_needs_a_reference(self):
         rc.QUALIFIED_PROFILES['ke-test'] = _profile(id='ke-test')
         kind, refusal = rc.resolve_arming('auto', rc.CALLER_Z_OFFSET_PAIR,
@@ -419,22 +432,27 @@ class _Printer:
     def __init__(self):
         self.reactor = types.SimpleNamespace(monotonic=lambda: 0.,
                                              pause=lambda t: t)
+        self.toolhead = types.SimpleNamespace(get_last_move_time=lambda: 42.)
 
     def get_reactor(self):
         return self.reactor
+
+    def lookup_object(self, name):
+        return {'toolhead': self.toolhead}[name]
 
     def command_error(self, msg):
         return _Err(msg)
 
 
 class _Collector:
-    def __init__(self, samples):
-        self.samples = samples
+    def __init__(self, samples, log):
+        self.samples, self.log = samples, log
 
     def start_collecting(self, min_time=None):
-        pass
+        self.log.append(('start', min_time))
 
-    def stop_collecting(self):
+    def collect_until(self, print_time=None):
+        self.log.append(('until', print_time))
         return self.samples, 0
 
 
@@ -443,6 +461,7 @@ class _LoadCell:
         self.samples, self.reference = samples, reference
         self.calibrated = calibrated
         self.tared = None
+        self.collect_log = []
 
     def is_calibrated(self):
         return self.calibrated
@@ -451,7 +470,7 @@ class _LoadCell:
         return self.reference
 
     def get_collector(self):
-        return _Collector(self.samples)
+        return _Collector(self.samples, self.collect_log)
 
     def saturation_range(self):
         return -0x800000, 0x7FFFFF
@@ -519,6 +538,12 @@ class RawArmingTest(unittest.TestCase):
         self.assertEqual(probe._effective_mode, rc.MODE_RAW)
         self.assertEqual(probe._active_profile['polarity'], -1)
 
+    def test_health_window_starts_after_queued_moves(self):
+        probe = self._probe(_idle(self.REF))
+        probe._arm_raw(_profile())
+        self.assertEqual(probe._load_cell.collect_log,
+                         [('start', 42.), ('until', 42.75)])
+
     def test_residual_preload_is_refused_not_re_tared(self):
         # Something presses on the bed: the empty reading is 20000 counts
         # off the reference. Re-taring would move the safety window.
@@ -540,7 +565,8 @@ class RawArmingTest(unittest.TestCase):
         probe = self._probe(_idle(self.REF, noise=3000))
         with self.assertRaises(_Err):
             probe._arm_raw(_profile())
-        self.assertIn('noise_above_profile', probe._raw_diag['reasons'])
+        self.assertTrue(probe._raw_diag['reasons'][0].startswith(
+            'noise_above_profile'))
 
     def test_no_reference_no_raw(self):
         probe = self._probe(_idle(self.REF), reference=None, calibrated=False)

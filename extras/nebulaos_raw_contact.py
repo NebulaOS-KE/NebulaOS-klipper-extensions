@@ -155,7 +155,11 @@ def resolve_arming(mode, caller, calibrated, profile_id=None,
     if reference_counts is None:
         return None, (RAW_NO_REFERENCE, "raw contact has no unloaded "
                       "reference for this unit - nozzle contact refused")
-    return ARM_RAW, lookup_profile(profile_id)
+    profile = lookup_profile(profile_id)
+    problems = validate_profile(profile)
+    if problems:
+        return None, (RAW_BAD_PROFILE, "; ".join(problems))
+    return ARM_RAW, profile
 
 
 def lookup_profile(profile_id):

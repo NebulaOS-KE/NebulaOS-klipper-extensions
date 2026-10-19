@@ -191,16 +191,21 @@ class ZOffsetProbe:
             self._refuse(raw_contact.RAW_NO_REFERENCE,
                          "raw contact has no unloaded reference - nozzle "
                          "contact refused")
-        reactor = self._printer.get_reactor()
+        # Only samples after every queued move (travel, previous retract):
+        # a bed still settling must not become the zero (review note 1).
+        toolhead = self._printer.lookup_object('toolhead')
+        start = toolhead.get_last_move_time()
         collector = self._load_cell.get_collector()
-        collector.start_collecting()
-        reactor.pause(reactor.monotonic() + self._raw_health_time)
-        samples, errors = collector.stop_collecting()
+        collector.start_collecting(min_time=start)
+        samples, errors = collector.collect_until(start + self._raw_health_time)
         stats, reasons = raw_contact.validate_idle(
             samples, errors, self._load_cell.saturation_range(),
             profile['expected_sps'], profile['sps_tolerance'])
         if not reasons and stats['sigma'] > profile['max_idle_sigma']:
-            reasons.append('noise_above_profile')
+            # the trigger must sit 10x above the idle noise: a lower
+            # TRIGGER_COUNTS is refused here (review note 4)
+            reasons.append('noise_above_profile (sigma %.0f counts, the '
+                           'trigger needs 10x that)' % (stats['sigma'],))
         if not reasons and stats['drift_per_s'] is not None and \
                 abs(stats['drift_per_s']) > profile['max_idle_drift_per_s']:
             reasons.append('drift_above_profile')
@@ -236,6 +241,7 @@ class ZOffsetProbe:
         """arming: None (every existing caller: calibrated force, as before)
         or a plan from plan_arming()."""
         self._active_profile = None
+        self._effective_mode = None
         if arming is not None:
             kind, detail = arming
             if kind is None:
