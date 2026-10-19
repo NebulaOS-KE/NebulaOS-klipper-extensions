@@ -60,6 +60,7 @@
     {"path": "extras/nebulaos_probe_pair.py", "role": "runtime"},
     {"path": "extras/nebulaos_raw_contact.py", "role": "runtime"},
     {"path": "extras/nebulaos_load_cell_calibration.py", "role": "runtime"},
+    {"path": "extras/nebulaos_bed_tram.py", "role": "runtime"},
     {"path": "extras/nebulaos_calibration.py", "role": "runtime"},
     {"path": "extras/nebulaos_calibration_journal.py", "role": "runtime"},
     {"path": "extras/nebulaos_memory.py", "role": "runtime"},
@@ -84,6 +85,7 @@
     {"path": "extras/test_z_compensate_wipe_bed_temp.py", "role": "test"},
     {"path": "extras/test_nebulaos_extensions_version.py", "role": "test"},
     {"path": "extras/test_nebulaos_load_cell_calibration.py", "role": "test"},
+    {"path": "extras/test_nebulaos_bed_tram.py", "role": "test"},
     {"path": "extras/test_nebulaos_calibration.py", "role": "test"},
     {"path": "extras/test_nebulaos_calibration_journal.py", "role": "test"},
     {"path": "extras/test_nebulaos_memory.py", "role": "test"}
