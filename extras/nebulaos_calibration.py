@@ -421,20 +421,6 @@ class NebulaOSCalibration:
         self.esteps_old_rotation_distance = None
         self.esteps_new_rotation_distance = None
 
-        # NEBULAOS_LOAD_CELL_CALIBRATE state (G83a, Run 13) - guided
-        # known-weight load-cell calibration: start -> TARE=1 -> GRAMS=<g>
-        # -> ACCEPT=1 (SAVE_CONFIG). Built on upstream LoadCell's public
-        # calibration API (avg_counts / saturation_range / set_calibration),
-        # with the same checks as upstream's console LOAD_CELL_CALIBRATE tool.
-        self.load_cell_id = 0
-        self.load_cell_state = 'idle'
-        self.load_cell_error = None
-        self.load_cell_tare_counts = None
-        self.load_cell_grams = None
-        self.load_cell_counts_per_gram = None
-        self.load_cell_capacity_kg = None
-        self.load_cell_old_counts_per_gram = None
-
         # NEBULAOS_INPUT_SHAPER_CALIBRATE state (mission §13) - its own
         # status namespace, same reasoning as bootstrap_sim_*/esteps_*
         # above.
@@ -483,14 +469,6 @@ class NebulaOSCalibration:
             '_NEBULAOS_ESTEPS_CONFIRM',
             self.cmd_esteps_confirm,
             desc="Confirm and persist a pending E-Steps result")
-        self.gcode.register_command(
-            '_NEBULAOS_LOAD_CELL_CALIBRATE',
-            self.cmd_load_cell_calibrate,
-            desc=self.cmd_load_cell_calibrate_help)
-        self.gcode.register_command(
-            '_NEBULAOS_LOAD_CELL_CANCEL',
-            self.cmd_load_cell_cancel,
-            desc="Cancel an in-progress load cell calibration")
         self.printer.register_event_handler(
             "klippy:ready", self._handle_ready)
 
@@ -567,15 +545,7 @@ class NebulaOSCalibration:
             'esteps_measured_length': self.esteps_measured_length,
             'esteps_old_rotation_distance': self.esteps_old_rotation_distance,
             'esteps_new_rotation_distance': self.esteps_new_rotation_distance,
-            'load_cell_id': self.load_cell_id,
-            'load_cell_state': self.load_cell_state,
-            'load_cell_error': self.load_cell_error,
             'load_cell_calibrated': self._load_cell_calibrated(),
-            'load_cell_tare_counts': self.load_cell_tare_counts,
-            'load_cell_grams': self.load_cell_grams,
-            'load_cell_counts_per_gram': self.load_cell_counts_per_gram,
-            'load_cell_capacity_kg': self.load_cell_capacity_kg,
-            'load_cell_old_counts_per_gram': self.load_cell_old_counts_per_gram,
             'input_shaper_id': self.input_shaper_id,
             'input_shaper_state': self.input_shaper_state,
             'input_shaper_stage': self.input_shaper_stage,
@@ -1495,24 +1465,9 @@ class NebulaOSCalibration:
         self.gcode.run_script_from_command('SAVE_CONFIG')
 
     # ------------------------------------------------------------------
-    # NEBULAOS_LOAD_CELL_CALIBRATE (G83a)
+    # Load cell guard (G83a). The guided calibration itself lives in
+    # nebulaos_load_cell_calibration.py (G86).
     # ------------------------------------------------------------------
-    cmd_load_cell_calibrate_help = (
-        "Guided load cell calibration with a known weight - call with no "
-        "params to start; TARE=1 with nothing on the bed; GRAMS=<g> with the "
-        "weight on the front-left measuring point; ACCEPT=1 to save")
-
-    LOAD_CELL_MIN_GRAMS = 50.
-    LOAD_CELL_MAX_GRAMS = 25000.
-
-    def _load_cell_obj(self):
-        probe = self.printer.lookup_object('nebulaos_z_offset_probe', None)
-        if probe is None or not hasattr(probe, 'get_load_cell'):
-            raise self.printer.command_error(
-                "NEBULAOS_LOAD_CELL_CALIBRATE: no [nebulaos_z_offset_probe] "
-                "load cell is configured on this printer")
-        return probe.get_load_cell()
-
     def _load_cell_calibrated(self):
         probe = self.printer.lookup_object('nebulaos_z_offset_probe', None)
         if probe is None or not hasattr(probe, 'get_load_cell'):
@@ -1523,203 +1478,16 @@ class NebulaOSCalibration:
             return None
 
     def _offer_load_cell_calibration(self):
-        """Guard popup (G83a): the screen and Mainsail show it as a prompt
-        with a button that starts the guided calibration."""
+        """Guard popup: the screen and Mainsail show it as a prompt with a
+        button that starts the guided bottle calibration."""
         self._send_action_prompt(
             "Load cell not calibrated",
             ["The nozzle touch sensor (load cell) has not been calibrated,",
              "so the Z offset cannot be measured safely yet.",
-             "Calibrate it now? You need a known weight of about 1 kg",
-             "or more (for example a full 1.5 L bottle, weighed on a",
-             "kitchen scale)."],
+             "Calibrate it now? It takes about 2 minutes. You need a 1.5 L",
+             "bottle of water and a kitchen scale. Nothing moves or heats."],
             [("Calibrate load cell", "NEBULAOS_LOAD_CELL_CALIBRATE"),
              ("Close", "RESPOND TYPE=command MSG=action:prompt_end")])
-
-    def _load_cell_refuse_if_printing(self):
-        print_stats = self.printer.lookup_object('print_stats', None)
-        if print_stats is not None:
-            state = print_stats.get_status(
-                self.reactor.monotonic()).get('state')
-            if state in ('printing', 'paused'):
-                raise self.printer.command_error(
-                    "NEBULAOS_LOAD_CELL_CALIBRATE: not possible while a "
-                    "print is %s" % (state,))
-
-    def cmd_load_cell_calibrate(self, gcmd):
-        grams = gcmd.get_float('GRAMS', None)
-        if gcmd.get_int('ACCEPT', 0):
-            self._load_cell_accept(gcmd)
-        elif grams is not None:
-            self._load_cell_weigh(gcmd, grams)
-        elif gcmd.get_int('TARE', 0):
-            self._load_cell_tare(gcmd)
-        else:
-            self._load_cell_start(gcmd)
-
-    def _load_cell_fail(self, exc):
-        self.load_cell_state = 'error'
-        self.load_cell_error = _sanitize_error(exc)
-        self._dismiss_action_prompt()
-
-    def _load_cell_start(self, gcmd):
-        self._load_cell_refuse_if_printing()
-        if self.load_cell_state in ('awaiting_tare', 'awaiting_weight',
-                                    'awaiting_confirmation'):
-            raise self.printer.command_error(
-                "NEBULAOS_LOAD_CELL_CALIBRATE: a calibration is already in "
-                "progress (state=%s) - continue it or cancel it"
-                % (self.load_cell_state,))
-        lc = self._load_cell_obj()
-        self.load_cell_id += 1
-        self.load_cell_state = 'awaiting_tare'
-        self.load_cell_error = None
-        self.load_cell_tare_counts = None
-        self.load_cell_grams = None
-        self.load_cell_counts_per_gram = None
-        self.load_cell_capacity_kg = None
-        self.load_cell_old_counts_per_gram = (
-            lc.get_counts_per_gram() if lc.is_calibrated() else None)
-        self._send_action_prompt(
-            "Load Cell Calibration",
-            ["Step 1 of 3: remove everything from the bed.",
-             "The nozzle must not touch the bed.",
-             "Then tap Tare."],
-            [("Tare", "NEBULAOS_LOAD_CELL_CALIBRATE TARE=1"),
-             ("Cancel", "_NEBULAOS_LOAD_CELL_CANCEL")])
-
-    def _load_cell_tare(self, gcmd):
-        if self.load_cell_state not in ('awaiting_tare', 'awaiting_weight'):
-            raise self.printer.command_error(
-                "NEBULAOS_LOAD_CELL_CALIBRATE TARE=1: no calibration is "
-                "waiting for a tare (state=%s) - start one first"
-                % (self.load_cell_state,))
-        lc = self._load_cell_obj()
-        try:
-            counts = lc.avg_counts()
-            range_min, range_max = lc.saturation_range()
-            if counts >= range_max or counts <= range_min:
-                raise self.printer.command_error(
-                    "the sensor is saturated with nothing on the bed - "
-                    "check that nothing presses on the bed and the wiring")
-        except Exception as e:
-            self._load_cell_fail(e)
-            raise
-        self.load_cell_tare_counts = int(counts)
-        self.load_cell_counts_per_gram = None
-        self.load_cell_state = 'awaiting_weight'
-        percent = lc.counts_to_percent(counts)
-        lines = ["Step 2 of 3: put a known weight of about 1 kg or more on the",
-                 "front-left of the bed, about 2 cm from the left and front",
-                 "edges - where the nozzle touches when it measures.",
-                 "Then enter its weight in grams on the screen",
-                 "(Load Cell panel) or in the console:",
-                 "NEBULAOS_LOAD_CELL_CALIBRATE GRAMS=<g>"]
-        if abs(percent) > 2.:
-            lines.insert(0, "Warning: the empty reading is %.1f%% off zero -"
-                            " is something pressing on the bed?" % (percent,))
-        self._send_action_prompt(
-            "Load Cell Calibration", lines,
-            [("Enter weight", "RESPOND TYPE=command MSG=action:prompt_end"),
-             ("Tare again", "NEBULAOS_LOAD_CELL_CALIBRATE TARE=1"),
-             ("Cancel", "_NEBULAOS_LOAD_CELL_CANCEL")])
-
-    def _load_cell_weigh(self, gcmd, grams):
-        if self.load_cell_state not in ('awaiting_weight',
-                                        'awaiting_confirmation'):
-            raise self.printer.command_error(
-                "NEBULAOS_LOAD_CELL_CALIBRATE GRAMS=: no calibration is "
-                "waiting for a weight (state=%s) - tare first"
-                % (self.load_cell_state,))
-        if not (self.LOAD_CELL_MIN_GRAMS <= grams <= self.LOAD_CELL_MAX_GRAMS):
-            raise self.printer.command_error(
-                "NEBULAOS_LOAD_CELL_CALIBRATE: GRAMS must be between %.0f "
-                "and %.0f" % (self.LOAD_CELL_MIN_GRAMS,
-                              self.LOAD_CELL_MAX_GRAMS))
-        lc = self._load_cell_obj()
-        tare = self.load_cell_tare_counts
-        try:
-            counts = lc.avg_counts()
-            range_min, range_max = lc.saturation_range()
-            if counts >= range_max or counts <= range_min:
-                raise self.printer.command_error(
-                    "the sensor is saturated - use a lighter weight")
-            if int(counts) == tare:
-                raise self.printer.command_error(
-                    "the reading did not change with the weight - check "
-                    "that it rests on the bed, and the sensor wiring")
-            # Upstream's own rule (LOAD_CELL_CALIBRATE): the weight must
-            # move the reading by at least 1% of full scale. On the KE
-            # (~86 counts per gram) that is roughly 1 kg - say so with the
-            # number this sensor actually needs.
-            change = abs(lc.counts_to_percent(counts)
-                         - lc.counts_to_percent(tare))
-            if change < 1.:
-                need = grams / change if change > 0 else None
-                raise self.printer.command_error(
-                    "the weight changed the reading by only %.2f%% (1%% is "
-                    "needed) - use a heavier weight%s"
-                    % (change, " (at least about %.0f g)" % (need * 1.1,)
-                       if need else ""))
-        except Exception as e:
-            self._load_cell_fail(e)
-            raise
-        cpg = float(abs(int(tare - counts))) / grams
-        capacity_kg = int((range_max - abs(tare)) / cpg) / 1000.
-        self.load_cell_grams = grams
-        self.load_cell_counts_per_gram = cpg
-        self.load_cell_capacity_kg = capacity_kg
-        self.load_cell_state = 'awaiting_confirmation'
-        lines = ["Step 3 of 3: check the result.",
-                 "Weight: %.0f g, sensitivity %.3f counts per gram,"
-                 % (grams, cpg),
-                 "range +/- %.1f kg." % (capacity_kg,)]
-        if self.load_cell_old_counts_per_gram:
-            change = (cpg / self.load_cell_old_counts_per_gram - 1.) * 100.
-            lines.append("Previous calibration: %.3f counts per gram (%+.0f%%)."
-                         % (self.load_cell_old_counts_per_gram, change))
-        lines.append("Apply & Save restarts Klipper.")
-        self._send_action_prompt(
-            "Load Cell Calibration", lines,
-            [("Apply & Save", "NEBULAOS_LOAD_CELL_CALIBRATE ACCEPT=1"),
-             ("Cancel", "_NEBULAOS_LOAD_CELL_CANCEL")])
-
-    def _load_cell_accept(self, gcmd):
-        if self.load_cell_state != 'awaiting_confirmation':
-            raise self.printer.command_error(
-                "NEBULAOS_LOAD_CELL_CALIBRATE ACCEPT=1: no result is waiting "
-                "for confirmation (state=%s)" % (self.load_cell_state,))
-        self._load_cell_refuse_if_printing()
-        lc = self._load_cell_obj()
-        try:
-            # Upstream's own persistence: sets the values live and stages
-            # counts_per_gram / reference_tare_counts in the SAVE_CONFIG
-            # autosave block of [nebulaos_z_offset_probe].
-            lc.set_calibration(self.load_cell_counts_per_gram,
-                               self.load_cell_tare_counts)
-            lc.tare(self.load_cell_tare_counts)
-        except Exception as e:
-            self._load_cell_fail(e)
-            raise
-        self.load_cell_state = 'complete'
-        self.load_cell_error = None
-        self._dismiss_action_prompt()
-        self.gcode.respond_info(
-            "NEBULAOS_LOAD_CELL_CALIBRATE: counts_per_gram %.5f, "
-            "reference_tare_counts %d applied and staged - committing with "
-            "SAVE_CONFIG, Klipper will restart"
-            % (self.load_cell_counts_per_gram, self.load_cell_tare_counts))
-        self.gcode.run_script_from_command('SAVE_CONFIG')
-
-    def cmd_load_cell_cancel(self, gcmd):
-        if self.load_cell_state not in ('awaiting_tare', 'awaiting_weight',
-                                        'awaiting_confirmation'):
-            raise self.printer.command_error(
-                "No load cell calibration is in progress to cancel")
-        self.load_cell_state = 'cancelled'
-        self.load_cell_error = None
-        self._dismiss_action_prompt()
-        self.gcode.respond_info(
-            "Load cell calibration cancelled - nothing was changed.")
 
     def _verify_expected_values(self, expected):
         """Checks a journal's expected_values dict against the real,

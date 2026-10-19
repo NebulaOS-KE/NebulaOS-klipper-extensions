@@ -629,8 +629,6 @@ class UpstreamFirstCleanupTest(unittest.TestCase):
              '_NEBULAOS_ESTEPS_CONFIRM',
              '_NEBULAOS_INPUT_SHAPER_CALIBRATE',
              '_NEBULAOS_INPUT_SHAPER_CANCEL',
-             '_NEBULAOS_LOAD_CELL_CALIBRATE',
-             '_NEBULAOS_LOAD_CELL_CANCEL',
              '_NEBULAOS_Z_OFFSET_CALIBRATE'])
 
     def test_no_axis_twist_calibrate_command_or_state(self):
@@ -2010,7 +2008,8 @@ class EStepsConfirmTest(unittest.TestCase):
 
 
 # ----------------------------------------------------------------------
-# G83a (Run 13): guided known-weight load-cell calibration + guard popup
+# G83a (Run 13): load-cell guard popup. The guided calibration itself is
+# tested in test_nebulaos_load_cell_calibration.py (G86).
 # ----------------------------------------------------------------------
 class FakeLoadCell:
     """Upstream LoadCell's public calibration API, with scripted readings."""
@@ -2069,113 +2068,6 @@ def _build_load_cell(readings, print_state='standby', **kw):
     coord._send_action_prompt = lambda title, lines, buttons=None: \
         prompts.append((title, list(lines), list(buttons or [])))
     return printer, gcode, coord, lc, prompts
-
-
-class LoadCellCalibrateTest(unittest.TestCase):
-    def test_happy_path_tare_weigh_accept_saves(self):
-        # tare -250000; 1200 g at ke-dev's 85.72 counts/g = 102864 counts
-        printer, gcode, coord, lc, prompts = _build_load_cell(
-            [-250000, -352864])
-        coord.cmd_load_cell_calibrate(fake.FakeGCmd({}))
-        self.assertEqual(coord.load_cell_state, 'awaiting_tare')
-        self.assertIn('TARE=1', prompts[-1][2][0][1])
-        coord.cmd_load_cell_calibrate(fake.FakeGCmd({'TARE': '1'}))
-        self.assertEqual(coord.load_cell_state, 'awaiting_weight')
-        self.assertEqual(coord.load_cell_tare_counts, -250000)
-        self.assertTrue(any('front-left' in l for l in prompts[-1][1]))
-        coord.cmd_load_cell_calibrate(fake.FakeGCmd({'GRAMS': '1200'}))
-        self.assertEqual(coord.load_cell_state, 'awaiting_confirmation')
-        self.assertAlmostEqual(coord.load_cell_counts_per_gram, 85.72)
-        self.assertEqual(lc.set_calls, [])           # nothing saved yet
-        coord.cmd_load_cell_calibrate(fake.FakeGCmd({'ACCEPT': '1'}))
-        self.assertEqual(coord.load_cell_state, 'complete')
-        self.assertEqual(len(lc.set_calls), 1)
-        self.assertAlmostEqual(lc.set_calls[0][0], 85.72)
-        self.assertEqual(lc.set_calls[0][1], -250000)
-        self.assertEqual(gcode.scripts_run[-1], 'SAVE_CONFIG')
-
-    def test_status_reports_progress_and_calibration(self):
-        printer, gcode, coord, lc, prompts = _build_load_cell([-250000])
-        st = coord.get_status(0.)
-        self.assertEqual(st['load_cell_state'], 'idle')
-        self.assertIs(st['load_cell_calibrated'], False)
-        coord.cmd_load_cell_calibrate(fake.FakeGCmd({}))
-        self.assertEqual(coord.get_status(0.)['load_cell_state'], 'awaiting_tare')
-
-    def test_previous_calibration_shown_for_comparison(self):
-        printer, gcode, coord, lc, prompts = _build_load_cell(
-            [-250000, -352864], calibrated=True, counts_per_gram=80.0)
-        coord.cmd_load_cell_calibrate(fake.FakeGCmd({}))
-        coord.cmd_load_cell_calibrate(fake.FakeGCmd({'TARE': '1'}))
-        coord.cmd_load_cell_calibrate(fake.FakeGCmd({'GRAMS': '1200'}))
-        self.assertTrue(any('Previous calibration' in l for l in prompts[-1][1]))
-
-    def test_refused_while_printing(self):
-        printer, gcode, coord, lc, prompts = _build_load_cell(
-            [-250000], print_state='printing')
-        with self.assertRaises(fake.CommandError):
-            coord.cmd_load_cell_calibrate(fake.FakeGCmd({}))
-        self.assertEqual(coord.load_cell_state, 'idle')
-
-    def test_weight_that_does_not_change_the_reading_is_rejected(self):
-        printer, gcode, coord, lc, prompts = _build_load_cell(
-            [-250000, -250000])
-        coord.cmd_load_cell_calibrate(fake.FakeGCmd({}))
-        coord.cmd_load_cell_calibrate(fake.FakeGCmd({'TARE': '1'}))
-        with self.assertRaises(fake.CommandError):
-            coord.cmd_load_cell_calibrate(fake.FakeGCmd({'GRAMS': '500'}))
-        self.assertEqual(coord.load_cell_state, 'error')
-        self.assertEqual(lc.set_calls, [])
-
-    def test_too_small_change_is_rejected_with_the_needed_weight(self):
-        # 500 g on ke-dev's sensor: 42860 counts = 0.51% < upstream's 1%
-        printer, gcode, coord, lc, prompts = _build_load_cell(
-            [-250000, -292860])
-        coord.cmd_load_cell_calibrate(fake.FakeGCmd({}))
-        coord.cmd_load_cell_calibrate(fake.FakeGCmd({'TARE': '1'}))
-        with self.assertRaises(fake.CommandError) as ctx:
-            coord.cmd_load_cell_calibrate(fake.FakeGCmd({'GRAMS': '500'}))
-        self.assertIn('heavier', str(ctx.exception))
-        self.assertIn('at least about', str(ctx.exception))
-        self.assertEqual(lc.set_calls, [])
-
-    def test_saturated_reading_is_rejected(self):
-        printer, gcode, coord, lc, prompts = _build_load_cell(
-            [-250000, 0x7FFFFF])
-        coord.cmd_load_cell_calibrate(fake.FakeGCmd({}))
-        coord.cmd_load_cell_calibrate(fake.FakeGCmd({'TARE': '1'}))
-        with self.assertRaises(fake.CommandError):
-            coord.cmd_load_cell_calibrate(fake.FakeGCmd({'GRAMS': '500'}))
-        self.assertEqual(lc.set_calls, [])
-
-    def test_grams_out_of_range_is_refused_without_reading(self):
-        printer, gcode, coord, lc, prompts = _build_load_cell([-250000])
-        coord.cmd_load_cell_calibrate(fake.FakeGCmd({}))
-        coord.cmd_load_cell_calibrate(fake.FakeGCmd({'TARE': '1'}))
-        with self.assertRaises(fake.CommandError):
-            coord.cmd_load_cell_calibrate(fake.FakeGCmd({'GRAMS': '10'}))
-        self.assertEqual(coord.load_cell_state, 'awaiting_weight')
-
-    def test_steps_out_of_order_are_refused(self):
-        printer, gcode, coord, lc, prompts = _build_load_cell([-250000])
-        with self.assertRaises(fake.CommandError):
-            coord.cmd_load_cell_calibrate(fake.FakeGCmd({'TARE': '1'}))
-        with self.assertRaises(fake.CommandError):
-            coord.cmd_load_cell_calibrate(fake.FakeGCmd({'GRAMS': '500'}))
-        with self.assertRaises(fake.CommandError):
-            coord.cmd_load_cell_calibrate(fake.FakeGCmd({'ACCEPT': '1'}))
-        self.assertEqual(lc.set_calls, [])
-
-    def test_cancel_changes_nothing(self):
-        printer, gcode, coord, lc, prompts = _build_load_cell(
-            [-250000, -352864])
-        coord.cmd_load_cell_calibrate(fake.FakeGCmd({}))
-        coord.cmd_load_cell_calibrate(fake.FakeGCmd({'TARE': '1'}))
-        coord.cmd_load_cell_calibrate(fake.FakeGCmd({'GRAMS': '1200'}))
-        coord.cmd_load_cell_cancel(fake.FakeGCmd({}))
-        self.assertEqual(coord.load_cell_state, 'cancelled')
-        self.assertEqual(lc.set_calls, [])
-        self.assertNotIn('SAVE_CONFIG', gcode.scripts_run)
 
 
 class LoadCellGuardTest(unittest.TestCase):
