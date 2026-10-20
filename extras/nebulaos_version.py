@@ -92,6 +92,10 @@ class NebulaOSVersion:
             'firmware_tag': version.get('firmware_tag', 'unknown'),
             'firmware_sha': version.get('firmware_sha', 'unknown'),
             'kernel_sha': version.get('kernel_sha', 'unknown'),
+            # G82 (Run 15): the screen is NebulaScreen. Images from before the
+            # rename only record guppyscreen_sha; both keys stay reported.
+            'nebulascreen_sha': version.get(
+                'nebulascreen_sha', version.get('guppyscreen_sha', 'unknown')),
             'guppyscreen_sha': version.get('guppyscreen_sha', 'unknown'),
             'build_date': version.get('build_date', 'unknown'),
             'klipper_sha': klipper_sha,

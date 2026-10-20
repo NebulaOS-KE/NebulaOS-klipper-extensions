@@ -103,6 +103,8 @@ class VersionCollectionTest(unittest.TestCase):
         self.assertEqual(status['firmware_tag'], 'nebulaos-canonical-baseline-2026-08-07-5-gdc241c8')
         self.assertEqual(status['kernel_sha'], '295b7101d751fd888ae39e6f1746a4a940664a5f')
         self.assertEqual(status['guppyscreen_sha'], 'be5d372c0d0c693adff3c23adf2655584bb2961e')
+        # An image from before the G82 rename: nebulascreen_sha falls back.
+        self.assertEqual(status['nebulascreen_sha'], 'be5d372c0d0c693adff3c23adf2655584bb2961e')
         self.assertEqual(status['app_generation'], 'abc1234567890def')
         self.assertEqual(status['klipper_sha'], expected_sha)
         self.assertFalse(status['klipper_dirty'])
@@ -158,6 +160,18 @@ class VersionCollectionTest(unittest.TestCase):
         self.assertEqual(status['app_generation'], 'unknown')
         self.assertEqual(status['klipper_sha'], 'unknown')
         self.assertIsNone(status['klipper_dirty'])
+        self.assertEqual(status['nebulascreen_sha'], 'unknown')
+
+    def test_renamed_image_reports_nebulascreen_sha(self):
+        repo_root = os.path.join(self.work, 'not-a-repo-either')
+        os.makedirs(repo_root)
+        nv = self._instantiate_against(repo_root, version_data={
+            'nebulascreen_sha': 'c50c60952b481c44f18db2a9c1cee98ac74b2278',
+            'guppyscreen_sha': 'c50c60952b481c44f18db2a9c1cee98ac74b2278',
+        })
+        status = nv.get_status(0)
+        self.assertEqual(status['nebulascreen_sha'], 'c50c60952b481c44f18db2a9c1cee98ac74b2278')
+        self.assertEqual(status['guppyscreen_sha'], 'c50c60952b481c44f18db2a9c1cee98ac74b2278')
 
 
 if __name__ == '__main__':
