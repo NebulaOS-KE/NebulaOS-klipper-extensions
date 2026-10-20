@@ -159,6 +159,9 @@ class NebulaOSLoadCellCalibration:
             'finger_grams': self.finger_grams,
             'old_counts_per_gram': self.old_counts_per_gram,
             'change_percent': self.change_percent,
+            # The screen shows the same warning as the prompt (G90).
+            'change_warning': (self.change_percent is not None
+                               and abs(self.change_percent) > self.previous_change),
         }
 
     # ------------------------------------------------------------------

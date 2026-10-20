@@ -351,6 +351,7 @@ class MistakesTest(unittest.TestCase):
         _cmd(obj, NEXT=1)
         lines, buttons = gcode.last_prompt()
         self.assertTrue(any('very different' in l for l in lines))
+        self.assertTrue(obj.get_status(0.)['change_warning'])
         self.assertIn(('Apply & Save', lcc.CMD + ' ACCEPT=1'), buttons)
 
 
