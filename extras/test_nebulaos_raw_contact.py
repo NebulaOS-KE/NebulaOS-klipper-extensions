@@ -191,7 +191,9 @@ class UpstreamFitEquivalenceTest(unittest.TestCase):
         self.assertLess(max(zs) - min(zs), 0.002)
 
 
-REAL_TRACES = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'testdata',
+# realpath: on a printer this test is a symlink in klippy/extras (Run 14
+# verifier note 3); the trace file stays next to the real source.
+REAL_TRACES = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'testdata',
                            'ke-dev-contact-traces-20261019.log')
 
 

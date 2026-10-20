@@ -36,6 +36,10 @@ MODES = (MODE_AUTO, MODE_CALIBRATED, MODE_RAW)
 # floor). Nozzle cleaning, the legacy Z_OFFSET_CALIBRATION and
 # NEBULAOS_AUTO_CALIBRATE stay on calibrated force (brief E.2-E.4).
 CALLER_Z_OFFSET_PAIR = 'z_offset_pair'
+# The same paired Z-offset step run INSIDE NEBULAOS_AUTO_CALIBRATE: stays
+# on calibrated force until nozzle cleaning is separately qualified (brief
+# E.2; Run 14 verifier note 5).
+CALLER_AUTO_CALIBRATE = 'auto_calibrate'
 ARM_CALIBRATED = 'calibrated'
 ARM_RAW = 'raw'
 

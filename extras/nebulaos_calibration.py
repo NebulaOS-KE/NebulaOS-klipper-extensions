@@ -752,7 +752,12 @@ class NebulaOSCalibration:
         plan = getattr(z_offset_probe, 'plan_arming', None)
         if plan is None:
             return {}
-        return {'arming': plan(raw_contact.CALLER_Z_OFFSET_PAIR)}
+        # Inside NEBULAOS_AUTO_CALIBRATE the same step is a different
+        # caller: it never resolves to raw contact.
+        caller = (raw_contact.CALLER_AUTO_CALIBRATE
+                  if self.auto_calibrate_state == 'running'
+                  else raw_contact.CALLER_Z_OFFSET_PAIR)
+        return {'arming': plan(caller)}
 
     # ------------------------------------------------------------------
     # NEBULAOS_RAW_CONTACT_COMPARE (G83b-auto stage C): supervised

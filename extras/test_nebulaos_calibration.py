@@ -2214,6 +2214,15 @@ class RawContactCompareTest(unittest.TestCase):
         self.assertIn('above trigger_force', str(ctx.exception))
         self.assertEqual(self.calls, [])
 
+    def test_z_offset_inside_auto_calibrate_is_its_own_caller(self):
+        printer, gcode, coord, probe = self._build()
+        coord.auto_calibrate_state = 'running'
+        coord.cmd_z_offset_calibrate(fake.FakeGCmd({}))
+        self.assertEqual(probe.plans[0][0], raw_contact.CALLER_AUTO_CALIBRATE)
+        self.assertEqual(raw_contact.resolve_arming(
+            'raw_contact', raw_contact.CALLER_AUTO_CALIBRATE, False, 'x', 0)[0],
+            None)
+
     def test_normal_z_offset_uses_the_probe_plan_for_the_pair_caller(self):
         printer, gcode, coord, probe = self._build()
         coord.cmd_z_offset_calibrate(fake.FakeGCmd({}))
