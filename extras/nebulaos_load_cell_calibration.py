@@ -24,9 +24,11 @@
 # - A weight on the bed LOWERS the raw counts on the KE; every number shown
 #   to the user is a magnitude.
 #
-# The tolerances marked PROVISIONAL are config options: they get their final
-# values from a no-motion measurement session on ke-dev (bottle + kitchen
-# scale), never from a guess in code review.
+# The tolerances are config options. They were set provisionally and then
+# confirmed by the no-motion measurement on ke-dev, 2026-10-20 (a 1537 g
+# bottle on a kitchen scale): exactly above the screw 9x 1637-1672 g
+# (+-1.1%), a careless placement -4.5%, a rough one -22%, back to zero 2-8 g
+# (7x); two full calibrations 90.34 and 87.91 counts/g (3% apart).
 #
 # Nothing here moves or heats the printer. Nothing is saved before step 6.
 #
@@ -91,23 +93,26 @@ class NebulaOSLoadCellCalibration:
             maxval=self.max_grams)
         self.window_seconds = config.getfloat('window_seconds', 2.,
                                               minval=0.5, maxval=10.)
-        # PROVISIONAL (ke-dev idle drift was 24 counts/s; a bottle still
-        # settling moves far more): above this the reading is "not stable".
+        # Above this the reading is "not stable" (ke-dev idle drift 24
+        # counts/s; no false alarm in the 2026-10-20 calibrations).
         self.stable_drift = config.getfloat(
             'stable_drift_counts_per_s', 300., above=0.)
-        # PROVISIONAL: lift-and-put-back must agree within this percent.
+        # Lift-and-put-back must agree within this percent (measured: +-1.1%
+        # careful, -4.5% careless; a clearly wrong placement is >10%).
         self.replace_tolerance = config.getfloat(
             'replace_tolerance_percent', 10., above=0., maxval=50.)
-        # PROVISIONAL (ke-dev: 7.9 g left after removing 1531 g): grams the
-        # empty bed may differ from the zero after the bottle is removed.
+        # Grams the empty bed may differ from the zero after the bottle is
+        # removed (measured: 2-8 g on ke-dev).
         self.zero_tolerance = config.getfloat(
             'zero_tolerance_grams', 30., above=0.)
-        # PROVISIONAL: a result this far from the previous calibration is
-        # shown as a warning before Apply & Save.
+        # A result this far from the previous calibration is shown as a
+        # warning before Apply & Save (measured: rough vs exact placement
+        # differs 22%; two careful runs 3%).
         self.previous_change = config.getfloat(
             'previous_change_percent', 25., above=0.)
-        # PROVISIONAL: an empty bed this far (grams, previous calibration)
-        # from the saved zero gets a "something on the bed?" note.
+        # An empty bed this far (grams, previous calibration) from the saved
+        # zero gets a "something on the bed?" note (no false alarm on
+        # 2026-10-20; a tramming shim shifted the zero ~50 g).
         self.empty_shift = config.getfloat('empty_shift_grams', 100., above=0.)
 
         self.run_id = 0

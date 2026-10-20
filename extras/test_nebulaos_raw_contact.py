@@ -447,15 +447,19 @@ class _Printer:
 
 
 class _Collector:
-    def __init__(self, samples, log):
-        self.samples, self.log = samples, log
+    def __init__(self, lc):
+        self.lc = lc
 
     def start_collecting(self, min_time=None):
-        self.log.append(('start', min_time))
+        self.lc.collect_log.append(('start', min_time))
 
     def collect_until(self, print_time=None):
-        self.log.append(('until', print_time))
-        return self.samples, 0
+        self.lc.collect_log.append(('until', print_time))
+        # one fixed window, or successive windows (the last one repeats)
+        w = self.lc.samples
+        if w and isinstance(w[0], list):
+            return (w.pop(0) if len(w) > 1 else w[0]), 0
+        return w, 0
 
 
 class _LoadCell:
@@ -472,7 +476,7 @@ class _LoadCell:
         return self.reference
 
     def get_collector(self):
-        return _Collector(self.samples, self.collect_log)
+        return _Collector(self)
 
     def saturation_range(self):
         return -0x800000, 0x7FFFFF
@@ -511,7 +515,8 @@ class RawArmingTest(unittest.TestCase):
     def _probe(self, samples, reference=REF, calibrated=True,
                persisted=None, mode='auto', profile_id=None):
         m = _bound_probe_methods(['_arm_raw', '_raw_reference_counts',
-                                  '_refuse', 'plan_arming', 'contact_ready'])
+                                  '_refuse', 'plan_arming', 'contact_ready',
+                                  '_raw_health_window'])
         probe = types.SimpleNamespace()
         probe._printer = _Printer()
         probe._name = 'nebulaos_z_offset_probe'
@@ -520,6 +525,7 @@ class RawArmingTest(unittest.TestCase):
             get_range=lambda: (-0x800000, 0x7FFFFF))
         probe._mcu_trigger_analog = _Trigger()
         probe._raw_health_time = 0.75
+        probe._raw_settle_time = 5.
         probe._raw_reference = persisted
         probe._contact_mode = mode
         probe._raw_profile_id = profile_id
@@ -543,6 +549,36 @@ class RawArmingTest(unittest.TestCase):
         self.assertEqual(calls[2], ('trigger', 'abs_ge', 6400))
         self.assertEqual(probe._effective_mode, rc.MODE_RAW)
         self.assertEqual(probe._active_profile['polarity'], -1)
+
+    def _drifting(self, n=70):
+        # the ke-dev compare window: the bed still settling (-865 counts/s)
+        return [(i / 90.6, None, self.REF - int(865 * i / 90.6), None)
+                for i in range(n)]
+
+    def test_settling_bed_is_measured_again_until_calm(self):
+        probe = self._probe([self._drifting(), self._drifting(), _idle(self.REF)])
+        probe._arm_raw(_profile())
+        self.assertEqual(probe._raw_diag['settle_windows'], 3)
+        self.assertAlmostEqual(probe._raw_diag['settle_seconds'], 2.25)
+        self.assertEqual(probe._mcu_trigger_analog.calls[2], ('trigger', 'abs_ge', 6400))
+        starts = [t for k, t in probe._load_cell.collect_log if k == 'start']
+        self.assertEqual(starts, [42., 42.75, 43.5])      # consecutive windows
+
+    def test_never_calm_is_refused_after_the_settle_time(self):
+        probe = self._probe([self._drifting()])
+        with self.assertRaises(_Err) as ctx:
+            probe._arm_raw(_profile())
+        self.assertEqual(probe._raw_diag['settle_windows'], 7)    # 5 s / 0.75 s
+        self.assertIn('drift_above_profile', str(ctx.exception))
+        self.assertEqual(probe._mcu_trigger_analog.calls, [])
+
+    def test_a_sensor_fault_is_not_waited_out(self):
+        stuck = [(i / 90.6, None, self.REF, None) for i in range(70)]
+        probe = self._probe([stuck, _idle(self.REF)])
+        with self.assertRaises(_Err):
+            probe._arm_raw(_profile())
+        self.assertEqual(probe._raw_diag['settle_windows'], 1)
+        self.assertEqual(probe._mcu_trigger_analog.calls, [])
 
     def test_health_window_starts_after_queued_moves(self):
         probe = self._probe(_idle(self.REF))

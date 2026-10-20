@@ -101,6 +101,13 @@ class ZOffsetProbe:
         # (>= 20 samples) and a meaningful noise/drift estimate.
         self._raw_health_time = config.getfloat(
             'raw_health_time', default=0.75, minval=0.3, maxval=5.)
+        # Run 15 (ke-dev compare, 2026-10-20): right after earlier touches
+        # (~270 g each) and travel moves, the bed is still settling - drift
+        # -865 counts/s, p2p 4445 for the first window. Settling (drift or
+        # noise above the profile) is measured again in consecutive windows
+        # for up to raw_settle_time; real sensor faults still refuse at once.
+        self._raw_settle_time = config.getfloat(
+            'raw_settle_time', default=5., minval=0.3, maxval=30.)
         self._raw_profile_id = config.get('raw_contact_profile_id', None)
         # Run 15: the persisted unloaded reference R for a unit WITHOUT a
         # grams calibration (brief 5.1.5), captured by
@@ -197,7 +204,9 @@ class ZOffsetProbe:
     def _arm_raw(self, profile):
         """Raw-count arming (G83b-auto, architecture review Run 14):
         1. dedicated idle window -> health check against the profile, the
-           median is the tare; a failed check REFUSES (no fallback);
+           median is the tare; drift/noise (still settling) is measured
+           again in consecutive windows up to raw_settle_time; a check that
+           still fails, or any real sensor fault, REFUSES (no fallback);
         2. the fresh tare must be within max_reference_drift_counts of the
            independent reference R;
         3. MCU raw window R +- safety_counts, strictly inside the sensor;
@@ -213,26 +222,23 @@ class ZOffsetProbe:
         # a bed still settling must not become the zero (review note 1).
         toolhead = self._printer.lookup_object('toolhead')
         start = toolhead.get_last_move_time()
-        collector = self._load_cell.get_collector()
-        collector.start_collecting(min_time=start)
-        samples, errors = collector.collect_until(start + self._raw_health_time)
-        stats, reasons = raw_contact.validate_idle(
-            samples, errors, self._load_cell.saturation_range(),
-            profile['expected_sps'], profile['sps_tolerance'])
-        if not reasons and stats['sigma'] > profile['max_idle_sigma']:
-            # the trigger must sit 10x above the idle noise: a lower
-            # TRIGGER_COUNTS is refused here (review note 4)
-            reasons.append('noise_above_profile (sigma %.0f counts, the '
-                           'trigger needs 10x that)' % (stats['sigma'],))
-        if not reasons and stats['drift_per_s'] is not None and \
-                abs(stats['drift_per_s']) > profile['max_idle_drift_per_s']:
-            reasons.append('drift_above_profile')
+        windows = max(1, int(round(self._raw_settle_time / self._raw_health_time)))
+        for window in range(windows):
+            stats, reasons = self._raw_health_window(profile, start)
+            start += self._raw_health_time
+            settling = [r for r in reasons
+                        if r.startswith(('drift_above_profile', 'noise_above_profile'))]
+            if not reasons or len(settling) != len(reasons):
+                break                      # calm, or a real sensor fault
         self._raw_diag = dict(stats)
         self._raw_diag['reasons'] = list(reasons)
+        self._raw_diag['settle_windows'] = window + 1
+        self._raw_diag['settle_seconds'] = (window + 1) * self._raw_health_time
         if reasons:
             self._refuse(raw_contact.RAW_UNHEALTHY,
-                         "load cell not healthy before contact (%s) - nozzle "
-                         "contact refused" % (", ".join(reasons),))
+                         "load cell not healthy before contact (%s) after %.1f s"
+                         " - nozzle contact refused"
+                         % (", ".join(reasons), (window + 1) * self._raw_health_time))
         tare = int(stats['median'])
         if abs(tare - reference) > profile['max_reference_drift_counts']:
             self._refuse(raw_contact.RAW_REFERENCE_DRIFT,
@@ -254,6 +260,24 @@ class ZOffsetProbe:
                                              int(profile['trigger_counts']))
         self._active_profile = profile
         self._effective_mode = raw_contact.MODE_RAW
+
+    def _raw_health_window(self, profile, start):
+        """One idle window from `start` (print time): (stats, reasons)."""
+        collector = self._load_cell.get_collector()
+        collector.start_collecting(min_time=start)
+        samples, errors = collector.collect_until(start + self._raw_health_time)
+        stats, reasons = raw_contact.validate_idle(
+            samples, errors, self._load_cell.saturation_range(),
+            profile['expected_sps'], profile['sps_tolerance'])
+        if not reasons and stats['sigma'] > profile['max_idle_sigma']:
+            # the trigger must sit 10x above the idle noise: a lower
+            # TRIGGER_COUNTS is refused here (review note 4)
+            reasons.append('noise_above_profile (sigma %.0f counts, the '
+                           'trigger needs 10x that)' % (stats['sigma'],))
+        if not reasons and stats['drift_per_s'] is not None and \
+                abs(stats['drift_per_s']) > profile['max_idle_drift_per_s']:
+            reasons.append('drift_above_profile')
+        return stats, reasons
 
     def _tare_and_arm(self, arming=None):
         """arming: None (every existing caller: calibrated force, as before)
