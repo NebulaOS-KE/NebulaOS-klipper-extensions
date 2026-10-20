@@ -102,12 +102,21 @@ class ZOffsetProbe:
         self._raw_health_time = config.getfloat(
             'raw_health_time', default=0.75, minval=0.3, maxval=5.)
         self._raw_profile_id = config.get('raw_contact_profile_id', None)
+        # Run 15: the persisted unloaded reference R for a unit WITHOUT a
+        # grams calibration (brief 5.1.5), captured by
+        # NEBULAOS_RAW_CONTACT_REFERENCE into the SAVE_CONFIG autosave
+        # block. Never in an image-owned cfg (configfile include conflict).
+        self._raw_reference = config.getint('raw_reference_counts', None)
         self._last_contact_rejection_reason = None
         self._last_raw_peak_delta_counts = None
         self._raw_diag = None
-        self._printer.lookup_object('gcode').register_command(
+        gcode = self._printer.lookup_object('gcode')
+        gcode.register_command(
             'NEBULAOS_RAW_CONTACT_DIAGNOSTIC', self.cmd_raw_contact_diagnostic,
             desc=self.cmd_raw_contact_diagnostic_help)
+        gcode.register_command(
+            'NEBULAOS_RAW_CONTACT_REFERENCE', self.cmd_raw_contact_reference,
+            desc=self.cmd_raw_contact_reference_help)
 
         self._last_raw_trigger_z = None
         self._last_fitted_contact_z = None
@@ -163,14 +172,23 @@ class ZOffsetProbe:
         # exist yet (brief 5.1.5): auto/raw cannot resolve to raw without one.
         return raw_contact.resolve_arming(
             self._contact_mode, caller, self._load_cell.is_calibrated(),
-            self._raw_profile_id, reference_counts=None)
+            self._raw_profile_id,
+            reference_counts=self._raw_reference_counts())
+
+    def contact_ready(self, caller):
+        """The guard's predicate (brief E.1): may `caller` touch the bed?
+        True for the unit's grams calibration, or a qualified raw profile
+        plus a reference on the paired path. Never fakes is_calibrated."""
+        kind, _ = self.plan_arming(caller)
+        return kind is not None
 
     def _raw_reference_counts(self):
         """The independent unloaded reference the raw safety window is
-        anchored to (never the fresh tare): the calibration's zero."""
+        anchored to (never the fresh tare): the calibration's zero, else the
+        persisted reference of an uncalibrated unit, else None (no raw)."""
         if self._load_cell.is_calibrated():
             return self._load_cell.get_reference_tare_counts()
-        return None
+        return self._raw_reference
 
     def _refuse(self, code, message):
         self._last_contact_rejection_reason = code
@@ -565,6 +583,48 @@ class ZOffsetProbe:
         gcmd.respond_info("raw contact diagnostic: %s"
                           % ("healthy" if not reasons
                              else "NOT healthy: " + ", ".join(reasons)))
+
+
+# appended to ZOffsetProbe below (keeps the class body readable)
+def _cmd_raw_contact_reference(self, gcmd):
+    """NO MOTION: capture the unloaded reference R from an idle window on an
+    empty bed and stage it in the SAVE_CONFIG autosave block (Klipper
+    restarts). Refused on an unhealthy sensor."""
+    print_stats = self._printer.lookup_object('print_stats', None)
+    if print_stats is not None:
+        state = print_stats.get_status(
+            self._printer.get_reactor().monotonic()).get('state')
+        if state in ('printing', 'paused'):
+            raise gcmd.error("NEBULAOS_RAW_CONTACT_REFERENCE: not while a "
+                             "print is %s" % (state,))
+    seconds = gcmd.get_float('SECONDS', 2., minval=1., maxval=10.)
+    toolhead = self._printer.lookup_object('toolhead')
+    start = toolhead.get_last_move_time()
+    collector = self._load_cell.get_collector()
+    collector.start_collecting(min_time=start)
+    samples, errors = collector.collect_until(start + seconds)
+    stats, reasons = raw_contact.validate_idle(
+        samples, errors, self._load_cell.saturation_range(),
+        self._sensor.get_samples_per_second())
+    if reasons:
+        raise gcmd.error("NEBULAOS_RAW_CONTACT_REFERENCE: the load cell is "
+                         "not healthy (%s) - nothing saved"
+                         % (", ".join(reasons),))
+    reference = int(stats['median'])
+    configfile = self._printer.lookup_object('configfile')
+    configfile.set(self._name, 'raw_reference_counts', reference)
+    self._raw_reference = reference
+    gcmd.respond_info("NEBULAOS_RAW_CONTACT_REFERENCE: empty-bed reference "
+                      "%d counts (noise sigma %.0f, drift %.1f counts/s) - "
+                      "saving, Klipper restarts"
+                      % (reference, stats['sigma'], stats['drift_per_s'] or 0.))
+    self._printer.lookup_object('gcode').run_script_from_command('SAVE_CONFIG')
+
+
+ZOffsetProbe.cmd_raw_contact_reference = _cmd_raw_contact_reference
+ZOffsetProbe.cmd_raw_contact_reference_help = (
+    "No-motion: capture the empty-bed load cell reference for weight-free "
+    "contact (G83b) and save it (SAVE_CONFIG). The bed must be empty.")
 
 
 def load_config(config):

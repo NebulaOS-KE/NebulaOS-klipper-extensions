@@ -508,9 +508,10 @@ class RawArmingTest(unittest.TestCase):
     """_arm_raw() per the Run 14 architecture review."""
     REF = -240426
 
-    def _probe(self, samples, reference=REF, calibrated=True):
+    def _probe(self, samples, reference=REF, calibrated=True,
+               persisted=None, mode='auto', profile_id=None):
         m = _bound_probe_methods(['_arm_raw', '_raw_reference_counts',
-                                  '_refuse'])
+                                  '_refuse', 'plan_arming', 'contact_ready'])
         probe = types.SimpleNamespace()
         probe._printer = _Printer()
         probe._name = 'nebulaos_z_offset_probe'
@@ -519,6 +520,9 @@ class RawArmingTest(unittest.TestCase):
             get_range=lambda: (-0x800000, 0x7FFFFF))
         probe._mcu_trigger_analog = _Trigger()
         probe._raw_health_time = 0.75
+        probe._raw_reference = persisted
+        probe._contact_mode = mode
+        probe._raw_profile_id = profile_id
         probe._raw_diag = None
         probe._last_contact_rejection_reason = None
         probe._active_profile = None
@@ -569,6 +573,79 @@ class RawArmingTest(unittest.TestCase):
             probe._arm_raw(_profile())
         self.assertTrue(probe._raw_diag['reasons'][0].startswith(
             'noise_above_profile'))
+
+    def test_uncalibrated_unit_arms_around_its_persisted_reference(self):
+        probe = self._probe(_idle(self.REF + 500), reference=None,
+                            calibrated=False, persisted=self.REF)
+        probe._arm_raw(_profile())
+        self.assertEqual(probe._mcu_trigger_analog.calls[0],
+                         ('raw_range', self.REF - 170000, self.REF + 170000))
+
+    def test_contact_ready_stays_false_without_a_qualified_profile(self):
+        probe = self._probe([], reference=None, calibrated=False,
+                            persisted=self.REF)
+        for caller in (rc.CALLER_Z_OFFSET_PAIR, rc.CALLER_AUTO_CALIBRATE):
+            self.assertFalse(probe.contact_ready(caller))
+
+    def test_contact_ready_with_a_qualified_profile_only_on_the_pair_path(self):
+        rc.QUALIFIED_PROFILES['ke-test'] = _profile(id='ke-test')
+        self.addCleanup(rc.QUALIFIED_PROFILES.clear)
+        probe = self._probe([], reference=None, calibrated=False,
+                            persisted=self.REF, profile_id='ke-test')
+        self.assertTrue(probe.contact_ready(rc.CALLER_Z_OFFSET_PAIR))
+        self.assertFalse(probe.contact_ready(rc.CALLER_AUTO_CALIBRATE))
+        no_ref = self._probe([], reference=None, calibrated=False,
+                             persisted=None, profile_id='ke-test')
+        self.assertFalse(no_ref.contact_ready(rc.CALLER_Z_OFFSET_PAIR))
+
+    def test_calibrated_unit_is_ready_as_before(self):
+        probe = self._probe([])
+        self.assertTrue(probe.contact_ready(rc.CALLER_Z_OFFSET_PAIR))
+        self.assertTrue(probe.contact_ready(rc.CALLER_AUTO_CALIBRATE))
+
+    def _capture_cmd(self):
+        with open(os.path.join(HERE, 'nebulaos_z_offset_probe.py')) as fh:
+            src = fh.read()
+        fn = next(n for n in ast.parse(src).body
+                  if isinstance(n, ast.FunctionDef)
+                  and n.name == '_cmd_raw_contact_reference')
+        ns = {'raw_contact': rc}
+        exec(compile(ast.Module(body=[fn], type_ignores=[]), 'p', 'exec'), ns)
+        return ns['_cmd_raw_contact_reference']
+
+    def _capture_probe(self, samples):
+        probe = self._probe(samples, reference=None, calibrated=False)
+        staged, scripts = [], []
+        objs = {'toolhead': probe._printer.toolhead,
+                'configfile': types.SimpleNamespace(
+                    set=lambda sec, opt, val: staged.append((sec, opt, val))),
+                'gcode': types.SimpleNamespace(
+                    run_script_from_command=scripts.append)}
+        probe._printer.lookup_object = lambda name, default=None: \
+            objs.get(name, default)
+        probe._sensor.get_samples_per_second = lambda: 80.
+        return probe, staged, scripts
+
+    def test_reference_capture_saves_the_median(self):
+        probe, staged, scripts = self._capture_probe(_idle(self.REF, n=180))
+        gcmd = types.SimpleNamespace(get_float=lambda n, d, **k: d,
+                                     respond_info=lambda m: None,
+                                     error=_Err)
+        self._capture_cmd()(probe, gcmd)
+        self.assertEqual(staged[0][:2], ('nebulaos_z_offset_probe',
+                                         'raw_reference_counts'))
+        self.assertAlmostEqual(staged[0][2], self.REF, delta=60)
+        self.assertEqual(scripts, ['SAVE_CONFIG'])
+
+    def test_reference_capture_refuses_a_stuck_sensor(self):
+        stuck = [(i / 90., None, self.REF, None) for i in range(180)]
+        probe, staged, scripts = self._capture_probe(stuck)
+        gcmd = types.SimpleNamespace(get_float=lambda n, d, **k: d,
+                                     respond_info=lambda m: None,
+                                     error=_Err)
+        with self.assertRaises(_Err):
+            self._capture_cmd()(probe, gcmd)
+        self.assertEqual((staged, scripts), ([], []))
 
     def test_no_reference_no_raw(self):
         probe = self._probe(_idle(self.REF), reference=None, calibrated=False)

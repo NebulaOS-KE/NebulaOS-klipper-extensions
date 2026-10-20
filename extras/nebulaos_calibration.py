@@ -590,7 +590,7 @@ class NebulaOSCalibration:
                 "NEBULAOS_Z_OFFSET_CALIBRATE: no [nebulaos_z_offset_probe] "
                 "is configured on this printer - use stock PROBE_CALIBRATE "
                 "instead, or add [nebulaos_z_offset_probe] to printer.cfg")
-        if not z_offset_probe.get_status(self.reactor.monotonic())['is_calibrated']:
+        if not self._contact_ready(z_offset_probe):
             self._offer_load_cell_calibration()
             raise self.printer.command_error(
                 "NEBULAOS_Z_OFFSET_CALIBRATE: the load cell has not been "
@@ -745,6 +745,20 @@ class NebulaOSCalibration:
                 "printer will restart")
             self.gcode.run_script_from_command('SAVE_CONFIG')
 
+    def _contact_caller(self):
+        return (raw_contact.CALLER_AUTO_CALIBRATE
+                if self.auto_calibrate_state == 'running'
+                else raw_contact.CALLER_Z_OFFSET_PAIR)
+
+    def _contact_ready(self, z_offset_probe):
+        """The guard (brief E.1): the probe's contact_ready() for this
+        caller; is_calibrated for a probe without it (unchanged)."""
+        ready = getattr(z_offset_probe, 'contact_ready', None)
+        if ready is None:
+            return z_offset_probe.get_status(
+                self.reactor.monotonic())['is_calibrated']
+        return ready(self._contact_caller())
+
     def _z_offset_arming_kwargs(self, z_offset_probe):
         """{'arming': plan} for THIS canonical paired path - the only caller
         that may ever resolve to raw contact (G83b-auto); {} for a probe
@@ -754,10 +768,7 @@ class NebulaOSCalibration:
             return {}
         # Inside NEBULAOS_AUTO_CALIBRATE the same step is a different
         # caller: it never resolves to raw contact.
-        caller = (raw_contact.CALLER_AUTO_CALIBRATE
-                  if self.auto_calibrate_state == 'running'
-                  else raw_contact.CALLER_Z_OFFSET_PAIR)
-        return {'arming': plan(caller)}
+        return {'arming': plan(self._contact_caller())}
 
     # ------------------------------------------------------------------
     # NEBULAOS_RAW_CONTACT_COMPARE (G83b-auto stage C): supervised
@@ -1051,8 +1062,7 @@ class NebulaOSCalibration:
                 raise self.printer.command_error(
                     "NEBULAOS_AUTO_CALIBRATE: no [nebulaos_z_offset_probe] "
                     "is configured on this printer")
-            if not z_offset_probe.get_status(
-                    self.reactor.monotonic())['is_calibrated']:
+            if not self._contact_ready(z_offset_probe):
                 self._offer_load_cell_calibration()
                 raise self.printer.command_error(
                     "NEBULAOS_AUTO_CALIBRATE: the load cell has not been "
