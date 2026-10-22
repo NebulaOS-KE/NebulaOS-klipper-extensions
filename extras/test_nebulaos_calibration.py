@@ -2348,5 +2348,74 @@ class ZAdjustResetTest(unittest.TestCase):
         self.assertEqual(gcode.scripts_run[-1], '<z_adjust apply>')
 
 
+class RecordingProbeOffsets(FakeProbeOffsets):
+    """Logs every live z_offset write next to the gcode run so far."""
+    def __init__(self, gcode, z_offset):
+        self.__dict__['log'] = []
+        self.__dict__['gcode'] = gcode
+        FakeProbeOffsets.__init__(self, 0., 27., z_offset)
+
+    def __setattr__(self, name, value):
+        if name == 'z_offset' and 'z_offset' in self.__dict__:
+            self.log.append((value, list(self.gcode.scripts_run)))
+        self.__dict__[name] = value
+
+
+class AutoCalibrateMeshBeforeLiveOffsetTest(unittest.TestCase):
+    """C2: the axes are homed with the OLD z_offset; the mesh must be probed
+    with that same value, and the new one goes live only after the mesh."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        orig = nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair
+        nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = \
+            _stub_pair(probe_trigger_z=2.5, nozzle_contact_z=0.831)
+        self.addCleanup(
+            setattr, nebulaos_calibration.nebulaos_probe_pair,
+            'measure_probe_nozzle_pair', orig)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_mesh_runs_with_the_old_offset_then_the_new_one_goes_live(self):
+        probe_obj = FakeProbeObj(z_offset=1.795)
+        printer, gcode, coord = _build_auto_calibrate(
+            FakeZOffsetProbe(is_calibrated=True), probe_obj,
+            config_overrides={'journal_path':
+                              os.path.join(self.tmpdir, 'j.json')})
+        probe_obj.probe_offsets = RecordingProbeOffsets(gcode, 1.795)
+        seen = {}
+        gcode.commands['_NEBULAOS_NOZZLE_CLEAN'] = lambda gcmd: None
+        gcode.commands['BED_MESH_CALIBRATE'] = lambda gcmd: seen.setdefault(
+            'z_offset_during_mesh', probe_obj.probe_offsets.z_offset)
+        with self.assertRaises(RestartTriggered):
+            coord.cmd_auto_calibrate(fake.FakeGCmd({}))
+        self.assertAlmostEqual(seen['z_offset_during_mesh'], 1.795)
+        log = probe_obj.probe_offsets.log
+        self.assertEqual(len(log), 1)
+        value, before = log[0]
+        self.assertAlmostEqual(value, 1.669, places=9)
+        self.assertEqual(before[-1].split()[0], 'BED_MESH_CALIBRATE')
+        self.assertNotIn('SAVE_CONFIG', before)
+        # Staged for SAVE_CONFIG by the Z-offset step, as before.
+        staged = printer.lookup_object('configfile').set_calls
+        self.assertEqual([c[:2] for c in staged], [('bltouch', 'z_offset')])
+
+    def test_failed_mesh_never_applies_the_new_offset_live(self):
+        probe_obj = FakeProbeObj(z_offset=1.795)
+        printer, gcode, coord = _build_auto_calibrate(
+            FakeZOffsetProbe(is_calibrated=True), probe_obj,
+            config_overrides={'journal_path':
+                              os.path.join(self.tmpdir, 'j.json')})
+        gcode.commands['_NEBULAOS_NOZZLE_CLEAN'] = lambda gcmd: None
+
+        def mesh_fails(gcmd):
+            raise fake.CommandError("BED_MESH_CALIBRATE: probe failed")
+        gcode.commands['BED_MESH_CALIBRATE'] = mesh_fails
+        with self.assertRaises(fake.CommandError):
+            coord.cmd_auto_calibrate(fake.FakeGCmd({}))
+        self.assertAlmostEqual(probe_obj.probe_offsets.z_offset, 1.795)
+
+
 if __name__ == '__main__':
     unittest.main()

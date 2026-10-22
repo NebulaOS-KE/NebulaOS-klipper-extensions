@@ -709,7 +709,13 @@ class NebulaOSCalibration:
             # real seam - not an upstream Klipper patch, nothing on disk
             # is touched, and it is undone automatically by the next
             # config (re)load like any other unsaved runtime state.
-            probe_obj.probe_offsets.z_offset = new_offset
+            #
+            # Inside NEBULAOS_AUTO_CALIBRATE the live value is applied by
+            # cmd_auto_calibrate() only AFTER its bed mesh (C2): the axes
+            # were homed with the OLD z_offset, and a mesh probed with the
+            # new one live would be shifted by (old - new).
+            if self.auto_calibrate_state != 'running':
+                probe_obj.probe_offsets.z_offset = new_offset
 
             configfile = self.printer.lookup_object('configfile')
             configfile.set(probe_obj.cmd_helper.name, 'z_offset',
@@ -737,9 +743,11 @@ class NebulaOSCalibration:
         self.z_offset_error = None
         self.gcode.respond_info(
             "NEBULAOS_Z_OFFSET_CALIBRATE: measured %.5f mm (probe trigger "
-            "%.5f, nozzle contact %.5f at X=%.3f Y=%.3f), applied live."
+            "%.5f, nozzle contact %.5f at X=%.3f Y=%.3f), %s."
             % (new_offset, measurement.raw_probe_trigger_z,
-               measurement.raw_nozzle_contact_z, x, y))
+               measurement.raw_nozzle_contact_z, x, y,
+               "applied after the bed mesh"
+               if self.auto_calibrate_state == 'running' else "applied live"))
         if self.auto_calibrate_state != 'running':
             try:
                 self._reset_z_adjust()
@@ -1132,6 +1140,12 @@ class NebulaOSCalibration:
 
             self._auto_calibrate_advance(journal, 'bed_mesh', time.time())
             run('BED_MESH_CALIBRATE PROFILE=%s' % (self.bed_mesh_profile,))
+            # C2: the new z_offset goes live only now, after the mesh was
+            # probed with the same z_offset the axes were homed with (the
+            # value is already staged in configfile; after the SAVE_CONFIG
+            # restart homing uses it).
+            self.printer.lookup_object('probe').probe_offsets.z_offset = \
+                z_offset_result
             self._auto_calibrate_check_cancel(journal, time.time())
 
             self._auto_calibrate_advance(
