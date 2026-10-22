@@ -5,8 +5,10 @@
 # probe:z_virtual_endstop. This module does NOT register as a global probe —
 # no printer.add_object('probe', self), no ProbeCommandHelper, no HomingViaProbeHelper.
 #
-# Consumed exclusively by z_compensate.py's Z_OFFSET_CALIBRATION command, which calls
-# touch_probe(down_min_z, pro_cnt) to get a single averaged Z contact position.
+# Consumed by nebulaos_probe_pair.py (NEBULAOS_Z_OFFSET_CALIBRATE / NEBULAOS_AUTO_CALIBRATE,
+# via nebulaos_calibration.py) and by z_compensate.py's _NEBULAOS_NOZZLE_CLEAN (nozzle_clear),
+# which call touch_probe() for a Z contact position. (z_compensate's old Z_OFFSET_CALIBRATION
+# command is not registered any more - C8.)
 #
 # Architecture: creates its own HX711 sensor and upstream LoadCell, wrapping upstream
 # Klipper's load_cell + trigger_analog primitives. Zero host core patches

@@ -9,17 +9,21 @@
 # reconciling the two readings. Named/config-section-compatible with the existing [z_compensate]
 # printer.cfg section on purpose - see ../DESIGN.md.
 #
-# Real production calls this once per print, before BED_MESH_CALIBRATE (custom_macro.py's
-# CX_PRINT_LEVELING_CALIBRATION, ANALYSIS.md sec 7) - a per-print thermal/wear fine-tune, not a
-# one-time factory calibration. That matters for how the correction gets applied: baking it
-# straight into the saved probe z_offset via stock Klipper's Z_OFFSET_APPLY_PROBE + SAVE_CONFIG
-# would trigger a klippy restart in the middle of a print-start sequence, which is clearly wrong.
-# So by default this only applies the correction as a live SET_GCODE_OFFSET for the current
-# session/print - permanent persistence is opt-in (persist_offset) and needs a real, non-
-# restarting save command for whichever environment this ends up running under (Creality's own
-# stock image has a restart-free CXSAVE_CONFIG for exactly this reason; nothing has confirmed yet
-# whether pellcorp's SimpleAF environment has an equivalent - flagged as a real open question,
-# not silently assumed either way).
+# What is live today (C8, 2026-10-22): ONLY _NEBULAOS_NOZZLE_CLEAN is registered. The
+# Z_OFFSET_CALIBRATION command (cmd_z_offset_calibration below: one load-cell touch applied as
+# a per-print SET_GCODE_OFFSET, with an opt-in persist_offset Z_OFFSET_APPLY_PROBE +
+# SAVE_CONFIG) is NOT registered - nothing on the printer can call it; no NebulaOS print start
+# runs a per-print Z touch. The Z offset is calibrated by nebulaos_calibration.py
+# (NEBULAOS_Z_OFFSET_CALIBRATE / NEBULAOS_AUTO_CALIBRATE: load cell + CR Touch -> bltouch
+# z_offset, SAVE_CONFIG), and the user's Z adjustment is nebulaos_z_adjust.py. The method and
+# its options (persist_offset, save_config_command, tri_expand_mm, max_offset_correction_mm,
+# pr_probe_cnt) are kept only because the real [z_compensate] section sets them and offline
+# tests still exercise the method; they have no effect on a running printer.
+#
+# Historical design note (Creality stock, not NebulaOS behaviour): stock firmware ran a
+# z_compensate touch once per print before BED_MESH_CALIBRATE (custom_macro.py's
+# CX_PRINT_LEVELING_CALIBRATION, ANALYSIS.md sec 7) as a per-print thermal/wear fine-tune and
+# saved it with its restart-free CXSAVE_CONFIG.
 #
 # Config-key reconciliation against the real device's live [z_compensate] section (pulled via
 # SSH 2026-08-05, see project memory): this section has its OWN tri_min_hold/tri_max_hold
@@ -135,8 +139,8 @@ class ZCompensate:
         self.bl_offset_x, self.bl_offset_y = bl_offset
         self.down_min_z = config.getfloat('z_offset_down_min_z', default=10, minval=1, maxval=50)
         # vs_start_z_pos (real key, replaces the old Klipper-only z_offset_hover_height default):
-        # hover height before the Z_OFFSET_CALIBRATION touch, and passed through to
-        # clear_nozzle() for its own two wipe-pad touches.
+        # hover height before the (unregistered, see header) Z_OFFSET_CALIBRATION touch, and
+        # passed through to clear_nozzle() for its own two wipe-pad touches.
         self.hover_height = config.getfloat('vs_start_z_pos', default=5, minval=1, maxval=50)
 
         # tri_min_hold/tri_max_hold/speed (real keys): PRTouch-probe-sensitivity tuning that
@@ -396,6 +400,8 @@ class ZCompensate:
         "guided workflow."
     )
 
+    # NOT registered as a gcode command (see the module header, C8): no printer path reaches
+    # this method; it is kept for the offline tests only.
     def cmd_z_offset_calibration(self, gcmd):
         """Touch-probe at the point BLTouch already homed (self.home_x/self.home_y - see
         _resolve_z_home_xy()'s own docstring for where that really comes from, as of
