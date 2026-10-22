@@ -63,6 +63,24 @@ def deviations(zs, mount, base_index=0):
     return [abs(z - base) for z in zs]
 
 
+def signed_deviations(zs, mount, base_index=0):
+    """(signed mm per corner, index of the reference corner) - what the
+    user sees (Tim 2026-10-21). rigid: relative to the highest corner
+    (0.00, the others negative: how much lower they are); adjustable:
+    relative to the base corner (+ higher, - lower)."""
+    if mount == RIGID:
+        reference = max(range(len(zs)), key=lambda i: zs[i])
+    else:
+        reference = base_index
+    return [z - zs[reference] for z in zs], reference
+
+
+def signed_mm(value):
+    """'-0.23', '+0.15', '0.00' (never '-0.00')."""
+    value = round(value, 2)
+    return "0.00" if value == 0 else "%+.2f" % (value,)
+
+
 def shim_mm(deviation, step, max_shim):
     """Shim thickness for one round: a whole number of `step`, never more
     than the deviation (no overshoot) and never more than `max_shim`."""
@@ -120,6 +138,8 @@ class NebulaOSBedTram:
         self.message = None
         self.zs = None
         self.devs = None
+        self.signed = None
+        self.reference = None
         self.accepted = [False] * 4
         self.tries = [0] * 4
         self.target = None
@@ -152,6 +172,10 @@ class NebulaOSBedTram:
             'mount': self.mount,
             'corners': list(CORNERS),
             'deviations': self.devs,
+            # Signed mm, same corner order; 'reference' is the corner they
+            # are relative to (rigid: the highest, adjustable: the base).
+            'signed_deviations': self.signed,
+            'reference': self.reference,
             'accepted': list(self.accepted),
             'target': (CORNERS[self.target] if self.target is not None
                        else None),
@@ -177,14 +201,16 @@ class NebulaOSBedTram:
         for i, name in enumerate(CORNERS):
             if self.devs is None:
                 break
-            if self.accepted[i]:
+            if i == self.reference:
+                status = "highest" if self.mount == RIGID else "base"
+            elif self.accepted[i]:
                 status = "OK"
             elif i == self.target:
-                status = "adjust now"
+                status = "ADJUST"
             else:
                 status = "later"
-            lines.append("%s: %.2f mm - %s" % (name.capitalize(),
-                                                self.devs[i], status))
+            lines.append("%s: %s mm - %s" % (
+                name.capitalize(), signed_mm(self.signed[i]), status))
         return lines
 
     def _show(self):
@@ -204,14 +230,16 @@ class NebulaOSBedTram:
 
     def action_lines(self):
         name = CORNERS[self.target].capitalize()
+        where = "%s: %s mm." % (name, signed_mm(self.signed[self.target]))
         if self.mount == RIGID:
-            lines = ["%s: add a %.2f mm shim." % (name, self.action['shim']),
+            lines = ["%s Add a %.2f mm shim to raise it."
+                     % (where, self.action['shim']),
                      "Unscrew this corner's bed screw, put the printed shim "
                      "on the spacer, and screw it back firmly.",
                      "Do not touch the other corners."]
         else:
-            lines = ["%s: turn the screw %s %s." % (
-                         name, self.action['words'],
+            lines = ["%s Turn the screw %s %s." % (
+                         where, self.action['words'],
                          "clockwise" if self.action['sign'] == 'CW'
                          else "counter-clockwise"),
                      "Do not touch the other corners."]
@@ -300,6 +328,7 @@ class NebulaOSBedTram:
             raise
         self.zs = [c['z'] for c in corners]
         self.devs = deviations(self.zs, self.mount)
+        self.signed, self.reference = signed_deviations(self.zs, self.mount)
         previous = self.target
         if previous is not None:
             before = self.target_before

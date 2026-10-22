@@ -143,8 +143,13 @@ class RigidFlowTest(TramTestBase):
         self.assertEqual(obj.state, tram.AWAITING_ADJUSTMENT)
         self.assertEqual(obj.target, 0)
         lines, buttons = gcode.last_prompt()
-        self.assertTrue(any('Front left: add a 0.10 mm shim.' in l
-                            for l in lines))
+        self.assertIn('Front left: -0.15 mm. Add a 0.10 mm shim to raise it.',
+                      lines)
+        # Signed, relative to the highest corner (Tim 2026-10-21).
+        self.assertIn('Front left: -0.15 mm - ADJUST', lines)
+        self.assertIn('Front right: 0.00 mm - highest', lines)
+        self.assertIn('Rear right: -0.12 mm - later', lines)
+        self.assertIn('Rear left: -0.03 mm - OK', lines)
         self.assertTrue(any('Do not touch the other corners' in l
                             for l in lines))
         self.assertTrue(any('load cell' in l for l in lines))
@@ -154,9 +159,10 @@ class RigidFlowTest(TramTestBase):
         self.assertEqual(obj.target, 2)                    # rear right next
         self.assertTrue(obj.accepted[0])
         lines, _ = gcode.last_prompt()
-        self.assertTrue(any('Front left: 0.06 mm - OK' in l for l in lines))
-        self.assertTrue(any('Rear right: add a 0.10 mm shim.' in l
-                            for l in lines))
+        self.assertIn('Front left: -0.06 mm - OK', lines)
+        self.assertIn('Rear right: -0.12 mm - ADJUST', lines)
+        self.assertIn('Rear right: -0.12 mm. Add a 0.10 mm shim to raise it.',
+                      lines)
         self.tram_cmd(obj, CONFIRM=1)
         self.assertEqual(obj.state, tram.COMPLETE)
         lines, buttons = gcode.last_prompt()
@@ -222,12 +228,60 @@ class AdjustableFlowTest(TramTestBase):
         self.assertEqual(obj.target, 2)
         lines, _ = gcode.last_prompt()
         # direction and amount are upstream's (fake mirrors its CW-M3 rule)
-        self.assertTrue(any('Rear right: turn the screw a quarter of a turn '
-                            'clockwise.' in l for l in lines))
+        self.assertTrue(any(l.startswith('Rear right: -0.1') and
+                            l.endswith(' mm. Turn the screw a quarter of a '
+                                       'turn clockwise.') for l in lines))
+        self.assertIn('Front left: 0.00 mm - base', lines)
+        self.assertIn('Rear left: +0.02 mm - OK', lines)
         self.assertFalse(any('load cell' in l for l in lines))
         self.tram_cmd(obj, CONFIRM=1)
         self.assertEqual(obj.state, tram.COMPLETE)
         self.assertFalse(obj.load_cell_corner_changed)
+
+
+class SignedDeviationTest(TramTestBase):
+    def test_rigid_signed_against_the_highest_corner(self):
+        signed, ref = tram.signed_deviations([0.0, 0.15, 0.03, 0.12], 'rigid')
+        self.assertEqual(ref, 1)
+        self.assertEqual([round(v, 3) for v in signed],
+                         [-0.15, 0.0, -0.12, -0.03])
+
+    def test_adjustable_signed_against_the_base_corner(self):
+        signed, ref = tram.signed_deviations([0.0, 0.15, -0.2, 0.05],
+                                             'adjustable')
+        self.assertEqual(ref, 0)
+        self.assertEqual([round(v, 3) for v in signed],
+                         [0.0, 0.15, -0.2, 0.05])
+
+    def test_signed_format(self):
+        self.assertEqual(tram.signed_mm(-0.23), '-0.23')
+        self.assertEqual(tram.signed_mm(0.15), '+0.15')
+        self.assertEqual(tram.signed_mm(-0.001), '0.00')
+        self.assertEqual(tram.signed_mm(0.0), '0.00')
+
+    def test_status_has_signed_values_and_keeps_deviations(self):
+        obj, gcode, tilt = self.build([[0.0, 0.25, 0.03, 0.12]],
+                                      mount='rigid')
+        status = obj.get_status(0.)
+        self.assertIsNone(status['signed_deviations'])
+        self.assertIsNone(status['reference'])
+        self.tram_cmd(obj)
+        status = obj.get_status(0.)
+        self.assertEqual(status['reference'], 1)
+        self.assertEqual([round(v, 3) for v in status['signed_deviations']],
+                         [-0.25, 0.0, -0.22, -0.13])
+        # Unchanged for older screens: magnitudes.
+        self.assertEqual([round(v, 3) for v in status['deviations']],
+                         [0.25, 0.0, 0.22, 0.13])
+        self.assertEqual(status['corners'][status['reference']],
+                         'front right')
+
+    def test_instruction_matches_tims_example(self):
+        obj, gcode, tilt = self.build([[0.0, 0.23, 0.2, 0.22]],
+                                      mount='rigid')
+        self.tram_cmd(obj)
+        self.assertTrue(obj.message.startswith(
+            'Front left: -0.23 mm. Add a 0.20 mm shim to raise it.'))
 
 
 class SessionTest(TramTestBase):
