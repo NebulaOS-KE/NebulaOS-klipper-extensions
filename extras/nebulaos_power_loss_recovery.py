@@ -16,10 +16,17 @@
 #     file, atomically renamed, fsync'd parent directory) - see
 #     _perform_checkpoint_blocking() for the exact ordering this enforces.
 #
-# No Klipper core patches. No private Klipper internals - every field this
-# module reads comes from a public get_status() dict; every field it
-# restores is set back through a standard, public gcode command. See
-# docs/ (added alongside this mission) for the full design rationale.
+# No Klipper core patches. Every field this module reads comes from a public
+# get_status() dict and every field it restores is set back through a
+# standard gcode command - with ONE exception, the bed mesh (C3): the print's
+# adaptive mesh is never saved as a profile, so BED_MESH_PROFILE LOAD cannot
+# bring it back. Its probed points and parameters are recorded
+# (BedMesh.get_mesh().get_mesh_params(), not in get_status) and rebuilt on
+# resume exactly as upstream's own profile load does (ZMesh + build_mesh +
+# BedMesh.set_mesh). These symbols are in nebulaos-extensions.json's
+# required_klipper_symbols, so API drift refuses to start instead of
+# breaking a resume. See docs/ (added alongside this mission) for the full
+# design rationale.
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 from __future__ import annotations
@@ -167,9 +174,7 @@ def build_sidecar_state(generation, file_info, file_position,
             "pressure_advance": extruder_status.get("pressure_advance", 0.0),
             "smooth_time": extruder_status.get("smooth_time", 0.0),
         },
-        "bed_mesh": {
-            "profile_name": bed_mesh_status.get("profile_name", ""),
-        },
+        "bed_mesh": mesh_state(bed_mesh_status),
         "exclude_object": {
             "objects": exclude_object_status.get("objects", []),
             "excluded_objects": exclude_object_status.get("excluded_objects", []),
@@ -184,6 +189,49 @@ def build_sidecar_state(generation, file_info, file_position,
             "unretract_speed": firmware_retraction_status.get("unretract_speed", 0.0),
         }
     return state
+
+
+def mesh_state(bed_mesh_status):
+    """The active mesh: its profile name and (when the caller added
+    "mesh_params", see _take_candidate) the mesh itself - probed points +
+    parameters, exactly what a saved profile holds. C3: the print's adaptive
+    mesh ("adaptive") is never saved, and a saved profile of the same name
+    may differ from the one in use (unsaved BED_MESH_CALIBRATE), so the
+    recorded mesh, not the name, is what a resume restores."""
+    state = {"profile_name": bed_mesh_status.get("profile_name", "")}
+    points = bed_mesh_status.get("probed_matrix")
+    params = bed_mesh_status.get("mesh_params")
+    if (state["profile_name"] and params and points
+            and any(len(row) for row in points)):
+        state["points"] = [list(row) for row in points]
+        state["mesh_params"] = dict(params)
+    return state
+
+
+class MeshNotRestorable(Exception):
+    def __init__(self, reason):
+        super(MeshNotRestorable, self).__init__(reason)
+        self.reason = reason
+
+
+def mesh_restore_line(bed_mesh_state, saved_mesh_profiles=None):
+    """The one G-code line that brings the checkpoint's mesh back:
+    no mesh -> BED_MESH_CLEAR; recorded mesh -> _NEBULAOS_PLR_LOAD_MESH (the
+    exact mesh in use); otherwise a saved profile of that name (an older
+    sidecar without the recorded mesh). Never a different mesh in place of
+    the one the print used: raises MeshNotRestorable instead.
+    saved_mesh_profiles None = not checked (pure callers/tests)."""
+    bed_mesh_state = bed_mesh_state or {}
+    name = bed_mesh_state.get("profile_name")
+    if not name:
+        return "BED_MESH_CLEAR"
+    if bed_mesh_state.get("points") and bed_mesh_state.get("mesh_params"):
+        return "_NEBULAOS_PLR_LOAD_MESH"
+    if saved_mesh_profiles is not None and name not in saved_mesh_profiles:
+        raise MeshNotRestorable(
+            "bed mesh '%s' was not saved and was not recorded; it cannot be "
+            "reloaded" % (name,))
+    return "BED_MESH_PROFILE LOAD=%s" % (name,)
 
 
 def hash_file(path, chunk_size=_HASH_CHUNK_SIZE):
@@ -337,7 +385,7 @@ def light_recovery_check(eeprom_record, sidecar_state, resolved_file_path,
     return STATE_RECOVERY_AVAILABLE, ""
 
 
-def build_resume_gcode_lines(state):
+def build_resume_gcode_lines(state, saved_mesh_profiles=None):
     """Builds the standard-command restoration sequence from the mission's
     "Public Klipper Resume Path" section. Pure string assembly - no gcode
     is actually run here, the caller feeds this list to
@@ -392,10 +440,7 @@ def build_resume_gcode_lines(state):
     else:
         lines.append("M107")
 
-    if bed_mesh.get("profile_name"):
-        lines.append("BED_MESH_PROFILE LOAD=%s" % bed_mesh["profile_name"])
-    else:
-        lines.append("BED_MESH_CLEAR")
+    lines.append(mesh_restore_line(bed_mesh, saved_mesh_profiles))
 
     retraction = state.get("firmware_retraction")
     if retraction:
@@ -457,10 +502,10 @@ def build_physical_resume_lines(state, z_lift, prime_length, z_max,
     if lift < 1.0:
         raise PhysicalResumeRefused(
             "no room to lift above the part (Z %.2f of %.2f)" % (kin_z, z_max))
-    mesh = (state.get("bed_mesh") or {}).get("profile_name")
-    if mesh and mesh not in (saved_mesh_profiles or ()):
-        raise PhysicalResumeRefused(
-            "bed mesh '%s' was not saved; it cannot be reloaded" % mesh)
+    try:
+        mesh_restore_line(state.get("bed_mesh"), saved_mesh_profiles or ())
+    except MeshNotRestorable as exc:
+        raise PhysicalResumeRefused(exc.reason)
     thermal = state["thermal"]
     bed = thermal.get("bed_target", 0.0)
     hotend = thermal.get("extruder_target", 0.0)
@@ -484,7 +529,7 @@ def build_physical_resume_lines(state, z_lift, prime_length, z_max,
     # State restore without the parts the procedure sets itself (heaters
     # done above; coordinate modes and E are set after the moves).
     skip = ("G90", "G91", "M82", "M83", "M104 ", "M140 ", "G92 E")
-    for line in build_resume_gcode_lines(state):
+    for line in build_resume_gcode_lines(state, saved_mesh_profiles or ()):
         if line in skip or line.startswith(skip):
             continue
         lines.append(line)
@@ -565,6 +610,7 @@ class NebulaOSPowerLossRecovery:
         self._last_checkpoint_time = 0.0
         self._checkpoint_in_flight = False
         self._resume_in_progress = False
+        self._resume_mesh = {}
         self._have_active_session = False
         self._pending_candidate = None  # a Candidate not yet proven durable
         # Set on the first 'printing' tick of a print (see _check_new_print);
@@ -598,6 +644,9 @@ class NebulaOSPowerLossRecovery:
         self.gcode.register_command(
             "_NEBULAOS_PLR_SET_Z", self.cmd_NEBULAOS_PLR_SET_Z,
             desc="Internal to NEBULAOS_PLR_RESUME PHYSICAL=1")
+        self.gcode.register_command(
+            "_NEBULAOS_PLR_LOAD_MESH", self.cmd_NEBULAOS_PLR_LOAD_MESH,
+            desc="Internal to NEBULAOS_PLR_RESUME")
 
     # -- setup -------------------------------------------------------------
 
@@ -948,6 +997,12 @@ class NebulaOSPowerLossRecovery:
                 eventtime).get('target', 0.0)
         bed_mesh_status = self.bed_mesh.get_status(eventtime) \
             if self.bed_mesh is not None else {}
+        get_mesh = getattr(self.bed_mesh, 'get_mesh', None)
+        mesh = get_mesh() if get_mesh is not None else None
+        if mesh is not None:
+            # Not in get_status; needed to rebuild an unsaved mesh (C3).
+            bed_mesh_status = dict(bed_mesh_status)
+            bed_mesh_status['mesh_params'] = dict(mesh.get_mesh_params())
         exclude_object_status = self.exclude_object.get_status(eventtime) \
             if self.exclude_object is not None else {}
         fan_status = self.fan.get_status(eventtime) if self.fan is not None else {}
@@ -1145,11 +1200,11 @@ class NebulaOSPowerLossRecovery:
             self._refresh_recovery_status()
             raise gcmd.error("NebulaOS PLR: recovery refused: %s" % exc)
 
+        profiles = ((self.bed_mesh.get_status(now).get('profiles') or {})
+                    if self.bed_mesh is not None else {})
         if physical:
             kin = self.toolhead.get_kinematics().get_status(now)
             z_max = kin.get('axis_maximum')[2] if kin.get('axis_maximum') else 0.
-            profiles = ((self.bed_mesh.get_status(now).get('profiles') or {})
-                        if self.bed_mesh is not None else {})
             try:
                 lines = build_physical_resume_lines(
                     validated, self.resume_z_lift, self.prime_length, z_max,
@@ -1158,7 +1213,12 @@ class NebulaOSPowerLossRecovery:
                 raise gcmd.error("NebulaOS PLR: physical resume refused: %s"
                                  % exc.reason)
         else:
-            lines = build_resume_gcode_lines(validated)
+            try:
+                lines = build_resume_gcode_lines(validated, list(profiles))
+            except MeshNotRestorable as exc:
+                raise gcmd.error("NebulaOS PLR: recovery refused: %s"
+                                 % exc.reason)
+        self._resume_mesh = validated.get("bed_mesh") or {}
 
         # Armed before the lines run: a physical resume ends with M24, and the
         # print it starts must keep this record (see _check_new_print).
@@ -1200,6 +1260,35 @@ class NebulaOSPowerLossRecovery:
         pos = self.toolhead.get_position()
         pos[2] = z
         self.toolhead.set_position(pos, homing_axes="z")
+
+    def _make_mesh(self, params, name):
+        """Upstream's own ZMesh, with the parameters typed exactly as
+        ProfileManager does when it loads a saved profile."""
+        from . import bed_mesh as bed_mesh_module
+        typed = {key: kind(params[key])
+                 for key, kind in bed_mesh_module.PROFILE_OPTIONS.items()}
+        return bed_mesh_module.ZMesh(typed, name)
+
+    def cmd_NEBULAOS_PLR_LOAD_MESH(self, gcmd):
+        """Rebuilds the mesh the print used from the checkpoint (C3), the
+        same steps as upstream's BED_MESH_PROFILE LOAD. Only valid inside
+        NEBULAOS_PLR_RESUME."""
+        mesh = self._resume_mesh if self._resume_in_progress else None
+        if not mesh or not mesh.get("points") or not mesh.get("mesh_params"):
+            raise gcmd.error("_NEBULAOS_PLR_LOAD_MESH is internal to "
+                             "NEBULAOS_PLR_RESUME")
+        if self.bed_mesh is None:
+            raise gcmd.error("NebulaOS PLR: no [bed_mesh] to restore the "
+                             "recorded mesh into")
+        try:
+            z_mesh = self._make_mesh(mesh["mesh_params"], mesh["profile_name"])
+            z_mesh.build_mesh([list(row) for row in mesh["points"]])
+        except Exception as exc:
+            raise gcmd.error("NebulaOS PLR: the recorded bed mesh '%s' could "
+                             "not be rebuilt: %s" % (mesh["profile_name"], exc))
+        self.bed_mesh.set_mesh(z_mesh)
+        gcmd.respond_info("NebulaOS PLR: bed mesh '%s' restored from the "
+                          "checkpoint" % (mesh["profile_name"],))
 
     def cmd_NEBULAOS_PLR_DISCARD(self, gcmd):
         self._tombstone_session("manual_discard")

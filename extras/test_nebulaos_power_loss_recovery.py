@@ -26,6 +26,11 @@ import unittest
 from . import nebulaos_plr_journal as journal
 from . import nebulaos_power_loss_recovery as plr
 
+try:
+    from . import bed_mesh as _REAL_BED_MESH
+except ImportError:
+    _REAL_BED_MESH = None
+
 Coord = collections.namedtuple('Coord', ['x', 'y', 'z', 'e'])
 
 
@@ -404,6 +409,74 @@ class ResumeGcodeReconstructionTests(unittest.TestCase):
                 'unretract_extra_length': 0, 'unretract_speed': 30})
         lines = plr.build_resume_gcode_lines(state)
         self.assertTrue(any(l.startswith("SET_RETRACTION") for l in lines))
+
+
+# C3: the print's adaptive mesh ("adaptive") is never saved as a profile.
+ADAPTIVE_PARAMS = {'min_x': 50.0, 'max_x': 150.0, 'min_y': 60.0,
+                   'max_y': 160.0, 'x_count': 3, 'y_count': 3,
+                   'mesh_x_pps': 2, 'mesh_y_pps': 2, 'algo': 'lagrange',
+                   'tension': 0.2}
+ADAPTIVE_POINTS = [[0.01, 0.02, 0.03], [0.0, -0.01, 0.02], [-0.02, 0.0, 0.01]]
+
+
+def _adaptive_mesh_status():
+    return {'profile_name': 'adaptive', 'probed_matrix': ADAPTIVE_POINTS,
+            'mesh_params': dict(ADAPTIVE_PARAMS),
+            'profiles': {'default': {}}}
+
+
+class MeshRecordAndRestoreTests(unittest.TestCase):
+    def _state(self, bed_mesh_status):
+        return plr.build_sidecar_state(
+            1, _file_info(), 0, _gcode_move_status(), _toolhead_status(),
+            {'target': 200.0}, bed_mesh_status, {}, {})
+
+    def test_the_active_mesh_itself_is_recorded(self):
+        state = self._state(_adaptive_mesh_status())
+        self.assertEqual(state['bed_mesh'], {
+            'profile_name': 'adaptive', 'points': ADAPTIVE_POINTS,
+            'mesh_params': ADAPTIVE_PARAMS})
+        self.assertEqual(json.loads(json.dumps(state))['bed_mesh'],
+                         state['bed_mesh'])
+        self.assertNotIn('profiles', state['bed_mesh'])
+
+    def test_no_mesh_records_only_an_empty_name(self):
+        state = self._state({'profile_name': '', 'probed_matrix': [[]]})
+        self.assertEqual(state['bed_mesh'], {'profile_name': ''})
+
+    def test_recorded_mesh_is_rebuilt_not_loaded_by_name(self):
+        lines = plr.build_resume_gcode_lines(
+            self._state(_adaptive_mesh_status()), ['default'])
+        self.assertIn('_NEBULAOS_PLR_LOAD_MESH', lines)
+        joined = '\n'.join(lines)
+        self.assertNotIn('BED_MESH_PROFILE LOAD', joined)
+        self.assertNotIn('BED_MESH_CLEAR', joined)
+
+    def test_saved_profile_without_recorded_points_loads_by_name(self):
+        line = plr.mesh_restore_line({'profile_name': 'default'}, ['default'])
+        self.assertEqual(line, 'BED_MESH_PROFILE LOAD=default')
+
+    def test_unsaved_unrecorded_mesh_is_refused_never_replaced(self):
+        with self.assertRaises(plr.MeshNotRestorable) as ctx:
+            plr.build_resume_gcode_lines(
+                self._state({'profile_name': 'adaptive'}), ['default'])
+        self.assertIn("'adaptive'", ctx.exception.reason)
+
+    def test_physical_resume_accepts_a_recorded_unsaved_mesh(self):
+        state = self._state(_adaptive_mesh_status())
+        state['thermal'] = {'extruder_target': 200.0, 'bed_target': 60.0}
+        lines = plr.build_physical_resume_lines(state, 5.0, 8.0, 250.0,
+                                                ['default'])
+        self.assertIn('_NEBULAOS_PLR_LOAD_MESH', lines)
+        self.assertLess(lines.index('_NEBULAOS_PLR_LOAD_MESH'),
+                        lines.index('M24'))
+
+    def test_physical_resume_refuses_an_unrecorded_unsaved_mesh(self):
+        state = self._state({'profile_name': 'adaptive'})
+        state['thermal'] = {'extruder_target': 200.0, 'bed_target': 60.0}
+        with self.assertRaises(plr.PhysicalResumeRefused):
+            plr.build_physical_resume_lines(state, 5.0, 8.0, 250.0,
+                                            ['default'])
 
 
 # ---------------------------------------------------------------------------
@@ -1133,6 +1206,80 @@ class ConfigIdentityAndPhysicalResumeTests(ExtensionStateMachineTests):
         lifted = plr.build_physical_resume_lines(state, 5.0, 8.0, 14.0, ['default'])
         self.assertIn('G1 Z3.000 F600', lifted)  # lift clamped to the travel left
 
+
+    # -- C3: the adaptive mesh is recorded and restored -------------------
+    def _adaptive_bed_mesh(self):
+        status = _adaptive_mesh_status()
+        del status['mesh_params']
+
+        class BedMesh(_FakeStatusObject):
+            def __init__(self):
+                super(BedMesh, self).__init__(status)
+                self.set_meshes = []
+
+            def get_mesh(self):
+                return type('ZM', (), {
+                    'get_mesh_params': lambda _s: dict(ADAPTIVE_PARAMS)})()
+
+            def set_mesh(self, mesh):
+                self.set_meshes.append(mesh)
+        bed_mesh = BedMesh()
+        self.objects['bed_mesh'] = bed_mesh
+        self.ext._handle_ready()
+        return bed_mesh
+
+    def test_adaptive_mesh_checkpointed_and_rebuilt_on_resume(self):
+        bed_mesh = self._adaptive_bed_mesh()
+        self._checkpoint_then_power_loss()
+        rec = self._eeprom_record()
+        side = plr.read_sidecar(plr.sidecar_path_for_generation(
+            self.sidecar_dir, rec.generation))
+        self.assertEqual(side['bed_mesh']['points'], ADAPTIVE_POINTS)
+        self.assertEqual(side['bed_mesh']['mesh_params'], ADAPTIVE_PARAMS)
+
+        self.ext.cmd_NEBULAOS_PLR_RESUME(_FakeGCmd({'ALLOW_UNSAFE': 1}))
+        lines = self.objects['gcode'].run_lines
+        self.assertIn('_NEBULAOS_PLR_LOAD_MESH', lines)
+        self.assertFalse(any(l.startswith('BED_MESH_PROFILE') for l in lines))
+
+        built = []
+
+        class FakeZMesh(object):
+            def __init__(self, params, name):
+                self.params, self.name = params, name
+
+            def build_mesh(self, points):
+                built.append(points)
+        self.ext._make_mesh = lambda params, name: FakeZMesh(params, name)
+        self.ext._resume_in_progress = True
+        self.ext.cmd_NEBULAOS_PLR_LOAD_MESH(_FakeGCmd({}))
+        self.assertEqual(built, [ADAPTIVE_POINTS])
+        mesh = bed_mesh.set_meshes[0]
+        self.assertEqual((mesh.name, mesh.params), ('adaptive', ADAPTIVE_PARAMS))
+
+    def test_load_mesh_is_internal_to_resume(self):
+        self._adaptive_bed_mesh()
+        with self.assertRaises(Exception):
+            self.ext.cmd_NEBULAOS_PLR_LOAD_MESH(_FakeGCmd({}))
+
+    def test_unrecorded_unsaved_mesh_refuses_the_state_restore(self):
+        self.objects['bed_mesh']._status = {'profile_name': 'adaptive',
+                                            'profiles': {'default': {}}}
+        self._checkpoint_then_power_loss()
+        with self.assertRaises(Exception) as cm:
+            self.ext.cmd_NEBULAOS_PLR_RESUME(_FakeGCmd({'ALLOW_UNSAFE': 1}))
+        self.assertIn("'adaptive'", str(cm.exception))
+        self.assertEqual(self.objects['gcode'].run_lines, [])
+
+    @unittest.skipUnless(_REAL_BED_MESH is not None,
+                         "needs a composed Klipper tree (extras.bed_mesh)")
+    def test_real_upstream_zmesh_rebuilds_the_recorded_mesh(self):
+        mesh = self.ext._make_mesh(
+            json.loads(json.dumps(ADAPTIVE_PARAMS)), 'adaptive')
+        mesh.build_mesh([list(r) for r in ADAPTIVE_POINTS])
+        self.assertEqual(mesh.get_profile_name(), 'adaptive')
+        self.assertEqual(mesh.get_probed_matrix(), ADAPTIVE_POINTS)
+        self.assertAlmostEqual(mesh.calc_z(50.0, 60.0), 0.01, places=6)
 
 class LightRecoveryCheckTests(unittest.TestCase):
     def setUp(self):

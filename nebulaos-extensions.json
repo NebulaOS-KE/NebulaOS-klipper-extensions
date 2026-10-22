@@ -24,7 +24,12 @@
     "extras.aio_executor:Executor.submit",
     "gcode:GCodeDispatch.register_command",
     "gcode:GCodeDispatch.run_script_from_command",
-    "pins:PrinterPins.setup_pin"
+    "pins:PrinterPins.setup_pin",
+    "extras.bed_mesh:PROFILE_OPTIONS",
+    "extras.bed_mesh:ZMesh.build_mesh",
+    "extras.bed_mesh:ZMesh.get_mesh_params",
+    "extras.bed_mesh:BedMesh.get_mesh",
+    "extras.bed_mesh:BedMesh.set_mesh"
   ],
 
   "forbidden_klipper_symbols": [],
