@@ -54,6 +54,12 @@ class OffsetGCode(fake.FakeGCode):
     def respond_info(self, msg):
         self.info.append(msg)
 
+    def register_command(self, name, handler, desc=None):
+        # Klipper semantics: handler None unregisters and returns the old one.
+        if handler is None:
+            return self.commands.pop(name, None)
+        self.commands[name] = handler
+
 
 class FakeToolhead:
     def __init__(self, homed='xyz'):
@@ -287,3 +293,79 @@ class CommandTest(Base):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class PauseResumeTest(Base):
+    """C4 (Run 17 verifier finding 1): RESUME re-adds only what the screen
+    changed while paused; offsets from Mainsail or the print file stay."""
+    def test_mainsail_babystep_survives_a_pause(self):
+        printer, gcode, gm, obj = build(self.path)
+        obj.cmd_z_adjust(fake.FakeGCmd({'DELTA': '0.04'}))     # screen, saved
+        gm.z += 0.02                                            # Mainsail babystep
+        obj.cmd_z_adjust(fake.FakeGCmd({'MARK': '1'}))         # PAUSE
+        before = gm.z                                           # RESUME_BASE restores this
+        obj.cmd_z_adjust(fake.FakeGCmd({'RESUME': '1'}))
+        self.assertAlmostEqual(gm.z, before)
+        self.assertAlmostEqual(gm.z, 0.06)
+
+    def test_screen_change_while_paused_is_added_on_resume(self):
+        printer, gcode, gm, obj = build(self.path)
+        obj.cmd_z_adjust(fake.FakeGCmd({'MARK': '1'}))
+        restored = gm.z
+        obj.cmd_z_adjust(fake.FakeGCmd({'DELTA': '-0.03'}))
+        gm.z = restored                                         # upstream restore undoes it
+        obj.cmd_z_adjust(fake.FakeGCmd({'RESUME': '1'}))
+        self.assertAlmostEqual(gm.z, restored - 0.03)
+        self.assertAlmostEqual(self.saved()['z_adjust_mm'], -0.03)
+
+    def test_resume_without_mark_changes_nothing(self):
+        printer, gcode, gm, obj = build(self.path)
+        gm.z = 0.123
+        obj.cmd_z_adjust(fake.FakeGCmd({'RESUME': '1'}))
+        self.assertAlmostEqual(gm.z, 0.123)
+
+
+class ApplyProbeTest(Base):
+    """C6 (verifier finding 2): Z_OFFSET_APPLY_PROBE folds the adjustment into
+    the probe z_offset, so the saved adjustment must become 0."""
+    def test_apply_probe_folds_and_zeroes_the_saved_value(self):
+        write_raw(self.path_ready(), json.dumps({'z_adjust_mm': 0.05}))
+        printer = fake.FakePrinter()
+        printer.reactor = CallbackReactor()
+        gm = FakeGCodeMove()
+        gcode = OffsetGCode(gm)
+        calls = []
+        gcode.register_command('Z_OFFSET_APPLY_PROBE',
+                               lambda g: calls.append(gm.z))
+        printer.add_object('gcode', gcode)
+        printer.add_object('gcode_move', gm)
+        printer.add_object('toolhead', FakeToolhead())
+        config = fake.FakeConfig({'filename': self.path},
+                                 section='nebulaos_z_adjust', printer=printer)
+        obj = za.NebulaOSZAdjust(config)
+        printer.send_event('klippy:ready')
+        printer.reactor.run_callbacks()
+        gcode.commands['Z_OFFSET_APPLY_PROBE'](fake.FakeGCmd({}))
+        self.assertEqual(calls, [0.05])                 # upstream ran with the live offset
+        self.assertEqual(self.saved()['z_adjust_mm'], 0.)
+        self.assertEqual(obj.value, 0.)
+
+    def test_no_probe_command_is_harmless(self):
+        printer, gcode, gm, obj = build(self.path)
+        self.assertNotIn('Z_OFFSET_APPLY_PROBE', gcode.commands)
+
+    def path_ready(self):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        return self.path
+
+
+class PathologicalFileTest(Base):
+    """Verifier finding 3: no file content may stop Klipper starting."""
+    def test_overflow_and_deep_nesting_give_zero(self):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        for text in ('{"z_adjust_mm": 1' + '0' * 400 + '}',
+                     '[' * 100000 + ']' * 100000):
+            write_raw(self.path, text)
+            value, warning = za.read_value(self.path, 2.0)
+            self.assertEqual(value, 0.)
+            self.assertTrue(warning)

@@ -50,7 +50,15 @@ _MATCH = 1e-5
 def read_value(path, max_adjust):
     """(value_mm, warning). A missing file is 0 without a warning; anything
     unreadable, malformed, non-finite or out of range is 0 WITH a warning.
-    Never raises."""
+    Never raises: the file is user-editable in Mainsail and Klipper must
+    always start (even a pathological edit - huge numbers, deep nesting)."""
+    try:
+        return _read_value(path, max_adjust)
+    except Exception as e:
+        return 0., "%s could not be used (%s)" % (path, e.__class__.__name__)
+
+
+def _read_value(path, max_adjust):
     try:
         with open(path) as handle:
             data = json.load(handle)
@@ -94,6 +102,9 @@ class NebulaOSZAdjust:
         if self.error:
             logging.warning("nebulaos_z_adjust: %s - using 0", self.error)
         self.gcode_move = None
+        # Saved value when the print was paused (MARK=1), None otherwise.
+        self.pause_mark = None
+        self._prev_apply_probe = None
         self.printer.register_event_handler("klippy:ready", self._handle_ready)
         self.gcode.register_command(CMD, self.cmd_z_adjust,
                                     desc=self.cmd_z_adjust_help)
@@ -118,7 +129,37 @@ class NebulaOSZAdjust:
     # --- startup -----------------------------------------------------------
     def _handle_ready(self):
         self.gcode_move = self.printer.lookup_object('gcode_move')
+        self._wrap_apply_probe()
         self.reactor.register_callback(self._apply_at_ready)
+
+    def _wrap_apply_probe(self):
+        """C6: upstream Z_OFFSET_APPLY_PROBE (Mainsail's Z offset "Save")
+        folds the live gcode offset - including this adjustment - into the
+        probe z_offset for SAVE_CONFIG. The adjustment is then part of the
+        z_offset, so the saved one becomes 0 (else it is applied twice)."""
+        if self._prev_apply_probe is not None:
+            return
+        try:
+            prev = self.gcode.register_command('Z_OFFSET_APPLY_PROBE', None)
+        except Exception:
+            logging.exception("nebulaos_z_adjust: Z_OFFSET_APPLY_PROBE lookup")
+            return
+        if prev is None:
+            return
+        self._prev_apply_probe = prev
+        self.gcode.register_command(
+            'Z_OFFSET_APPLY_PROBE', self._cmd_apply_probe,
+            desc="Adjust the probe's z_offset (the saved NebulaOS Z offset "
+                 "adjustment is folded in and set to 0)")
+
+    def _cmd_apply_probe(self, gcmd):
+        self._prev_apply_probe(gcmd)
+        if self.value != 0.:
+            self._save(0.)
+            gcmd.respond_info(
+                "%s: the Z offset adjustment is now part of the probe "
+                "z_offset - saved adjustment set to 0 (run SAVE_CONFIG to "
+                "keep it)" % (CMD,))
 
     def _apply_at_ready(self, eventtime):
         if self.error:
@@ -177,7 +218,8 @@ class NebulaOSZAdjust:
     cmd_z_adjust_help = (
         "Z offset adjustment, saved and applied at every start: DELTA=<mm> "
         "adjusts (Z homed), RESET=1 sets 0, APPLY=1 applies the saved value "
-        "again, no parameter reports it")
+        "again, MARK=1 / RESUME=1 for PAUSE / RESUME, no parameter reports "
+        "it")
 
     def cmd_z_adjust(self, gcmd):
         delta = gcmd.get_float('DELTA', None)
@@ -185,6 +227,10 @@ class NebulaOSZAdjust:
             return self._cmd_delta(gcmd, delta)
         if gcmd.get_int('RESET', 0):
             return self._cmd_reset(gcmd)
+        if gcmd.get_int('MARK', 0):
+            return self._cmd_mark(gcmd)
+        if gcmd.get_int('RESUME', 0):
+            return self._cmd_resume(gcmd)
         if gcmd.get_int('APPLY', 0):
             return self._cmd_apply(gcmd)
         live = self._live_z()
@@ -226,6 +272,28 @@ class NebulaOSZAdjust:
         self.apply_saved(move=bool(move))
         gcmd.respond_info("Z offset adjustment %+.3f mm applied"
                           % (self.value,))
+
+
+    # --- pause / resume (C4) -----------------------------------------------
+    def _cmd_mark(self, gcmd):
+        """PAUSE: remember the saved value. RESUME restores the gcode state
+        saved at PAUSE (upstream) - only the screen adjustments made while
+        paused are then added again, so offsets from Mainsail or the print
+        file are never overwritten."""
+        self.pause_mark = self.value
+
+    def _cmd_resume(self, gcmd):
+        mark, self.pause_mark = self.pause_mark, None
+        if mark is None:
+            return
+        delta = self.value - mark
+        if abs(delta) < _MATCH:
+            return
+        move = 1 if self._z_homed() else 0
+        self.gcode.run_script_from_command(
+            "SET_GCODE_OFFSET Z_ADJUST=%.6f MOVE=%d" % (delta, move))
+        gcmd.respond_info("%s: %+.3f mm adjusted while paused - applied"
+                          % (CMD, delta))
 
 
 def load_config(config):
