@@ -32,6 +32,18 @@
 #
 # Nothing here moves or heats the printer. Nothing is saved before step 6.
 #
+# G99 (Tim 2026-10-22): automatic load-cell contact is the default. This
+# object also owns the user's choice (Calibration > Load Cell):
+#   NEBULAOS_LOAD_CELL_MODE [MODE=auto|manual]  persist the choice (no
+#       restart; no MODE: report). Manual = this bottle calibration, used
+#       until automatic is selected again; saving a bottle calibration
+#       (Apply & Save) selects manual.
+#   NEBULAOS_LOAD_CELL_AUTO_CHECK  no motion, empty bed: sensor health +
+#       the unloaded reference for automatic contact, stored in the same
+#       state file (no SAVE_CONFIG, no restart).
+# Status: mode, auto_check (never|ok|failed), auto_check_reason, auto_ready
+# (see nebulaos_z_offset_probe.auto_status / nebulaos_load_cell_mode).
+#
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
 from . import nebulaos_raw_contact as raw_contact
@@ -54,20 +66,17 @@ ACTIVE = (AWAITING_EMPTY, AWAITING_WEIGHT, AWAITING_REPLACE, AWAITING_REMOVE,
 
 TITLE = "Load Cell Calibration"
 CMD = "NEBULAOS_LOAD_CELL_CALIBRATE"
+MODE_CMD = "NEBULAOS_LOAD_CELL_MODE"
+CHECK_CMD = "NEBULAOS_LOAD_CELL_AUTO_CHECK"
+MANUAL_HINT = "use Calibration > Load Cell > Manual (bottle calibration)"
+_AUTO_FIELDS = ('mode', 'mode_choice', 'auto_check', 'auto_check_reason',
+                'auto_check_time', 'auto_ready', 'auto_profile',
+                'auto_reference_counts', 'mode_warning')
 CANCEL = "_NEBULAOS_LOAD_CELL_CANCEL"
 ADJUST_STEPS = (-100, -10, -1, 1, 10, 100)
 
 # Readable reasons for raw_contact.validate_idle() codes.
-_SENSOR_PROBLEMS = {
-    raw_contact.NO_SAMPLES: "the sensor sent no readings",
-    raw_contact.TOO_FEW_SAMPLES: "the sensor sent too few readings",
-    raw_contact.SENSOR_ERRORS: "the sensor reported read errors",
-    raw_contact.SATURATED: "the sensor reading is at its limit",
-    raw_contact.STUCK: "the sensor reading does not change at all",
-    raw_contact.NON_FINITE: "the sensor sent invalid readings",
-    raw_contact.SAMPLE_RATE_MISMATCH: "the sensor reads at the wrong speed",
-    raw_contact.TIME_NOT_MONOTONIC: "the sensor readings arrive out of order",
-}
+_SENSOR_PROBLEMS = raw_contact.IDLE_REASON_TEXT
 
 
 def _sanitize_error(exc):
@@ -126,6 +135,10 @@ class NebulaOSLoadCellCalibration:
             'NEBULAOS_LOAD_CELL_READ', self.cmd_read,
             desc="Read-only: the force on the front-left corner in grams "
             "(1 s average, current calibration). Never moves anything.")
+        self.gcode.register_command(
+            MODE_CMD, self.cmd_mode, desc=self.cmd_mode_help)
+        self.gcode.register_command(
+            CHECK_CMD, self.cmd_auto_check, desc=self.cmd_auto_check_help)
 
     def _reset(self, state):
         self.state = state
@@ -164,7 +177,24 @@ class NebulaOSLoadCellCalibration:
             # The screen shows the same warning as the prompt (G90).
             'change_warning': (self.change_percent is not None
                                and abs(self.change_percent) > self.previous_change),
+            **self._auto_status(),
         }
+
+    def _probe(self):
+        probe = self.printer.lookup_object('nebulaos_z_offset_probe', None)
+        if probe is None or not hasattr(probe, 'auto_status'):
+            return None
+        return probe
+
+    def _auto_status(self):
+        """G99 fields; all None without a load cell probe."""
+        probe = self._probe()
+        if probe is None:
+            return {k: None for k in _AUTO_FIELDS}
+        try:
+            return probe.auto_status()
+        except Exception:
+            return {k: None for k in _AUTO_FIELDS}
 
     # ------------------------------------------------------------------
     # sensor access
@@ -477,6 +507,13 @@ class NebulaOSLoadCellCalibration:
             # autosave block of [nebulaos_z_offset_probe].
             lc.set_calibration(self.counts_per_gram, self.tare_counts)
             lc.tare(self.tare_counts)
+            # G99: a saved bottle calibration means Manual - "the manual
+            # value is used until automatic is selected again" (Tim).
+            probe = self._probe()
+            if probe is not None:
+                warning = probe.set_load_cell_mode(raw_contact.USER_MANUAL)
+                if warning:
+                    self.gcode.respond_info("%s: %s" % (CMD, warning))
         except Exception as e:
             self.state = ERROR
             self.error = _sanitize_error(e)
@@ -508,6 +545,79 @@ class NebulaOSLoadCellCalibration:
         counts = lc.avg_counts()
         gcmd.respond_info("Load cell: %.0f g on the front-left corner"
                           % (abs(counts - tare) / lc.get_counts_per_gram(),))
+
+
+    # ------------------------------------------------------------------
+    # G99: automatic | manual
+    # ------------------------------------------------------------------
+    cmd_mode_help = (
+        "Load cell contact mode: MODE=auto (automatic, no bottle - the "
+        "default) or MODE=manual (the bottle calibration). No MODE: report. "
+        "Saved at once, no restart.")
+
+    def _require_probe(self, cmd):
+        probe = self._probe()
+        if probe is None:
+            raise self.printer.command_error(
+                "%s: no [nebulaos_z_offset_probe] load cell is configured on "
+                "this printer" % (cmd,))
+        return probe
+
+    def cmd_mode(self, gcmd):
+        probe = self._require_probe(MODE_CMD)
+        mode = gcmd.get('MODE', None)
+        if mode is not None:
+            mode = mode.strip().lower()
+            if mode not in raw_contact.USER_MODES:
+                raise gcmd.error("%s: MODE must be auto or manual" % (MODE_CMD,))
+            warning = probe.set_load_cell_mode(mode)
+            if warning:
+                gcmd.respond_info("%s: %s" % (MODE_CMD, warning))
+        st = probe.auto_status()
+        if st['mode'] == raw_contact.USER_AUTO:
+            if st['auto_ready']:
+                detail = "ready (automatic check passed)"
+            elif st['auto_check'] == 'failed':
+                detail = ("NOT ready - the automatic check failed (%s); run "
+                          "%s again on an empty bed or %s"
+                          % (st['auto_check_reason'], CHECK_CMD, MANUAL_HINT))
+            else:
+                detail = ("the automatic check runs at the next Z-offset "
+                          "calibration (or run %s on an empty bed)"
+                          % (CHECK_CMD,))
+        else:
+            detail = ("bottle calibration %s" % (
+                "present" if self._calibrated() else
+                "MISSING - run %s or select MODE=auto" % (CMD,)))
+        forced = st['mode'] != st['mode_choice']
+        gcmd.respond_info("%s: %s%s - %s" % (
+            MODE_CMD, st['mode'],
+            " (forced by contact_detection_mode in the config)" if forced
+            else "", detail))
+
+    cmd_auto_check_help = (
+        "No motion: automatic load cell check on an EMPTY bed - sensor "
+        "health and the unloaded reference for automatic contact (saved "
+        "at once, no restart)")
+
+    def cmd_auto_check(self, gcmd):
+        probe = self._require_probe(CHECK_CMD)
+        self._refuse_if_printing()
+        if self.state in ACTIVE:
+            raise gcmd.error("%s: the bottle calibration is running - finish "
+                             "or cancel it first" % (CHECK_CMD,))
+        ok, reason = probe.run_auto_check()
+        if not ok:
+            raise gcmd.error("%s: automatic check FAILED - %s. Remove "
+                             "everything from the bed and try again, or %s."
+                             % (CHECK_CMD, reason, MANUAL_HINT))
+        st = probe.auto_status()
+        gcmd.respond_info(
+            "%s: passed - empty-bed reference %d counts saved%s%s"
+            % (CHECK_CMD, st['auto_reference_counts'],
+               "" if st['mode'] == raw_contact.USER_AUTO else
+               " (mode is manual: select automatic to use it)",
+               " - " + st['mode_warning'] if st['mode_warning'] else ""))
 
 
 def load_config(config):

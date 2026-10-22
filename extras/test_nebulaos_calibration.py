@@ -2173,7 +2173,10 @@ class RawContactCompareTest(unittest.TestCase):
         printer, gcode, coord, probe = self._build()
         self._run(coord)
         self.assertEqual(len(self.calls), 2)
-        self.assertIsNone(self.calls[0]['arming'])
+        # G99: the calibrated half is armed explicitly (a touch without a
+        # plan would follow the user's mode, automatic by default)
+        self.assertEqual(self.calls[0]['arming'],
+                         (raw_contact.ARM_CALIBRATED, None))
         kind, profile = self.calls[1]['arming']
         self.assertEqual(kind, raw_contact.ARM_RAW)
         self.assertEqual(profile['trigger_counts'], 6400)
@@ -2222,6 +2225,8 @@ class RawContactCompareTest(unittest.TestCase):
         coord.auto_calibrate_state = 'running'
         coord.cmd_z_offset_calibrate(fake.FakeGCmd({}))
         self.assertEqual(probe.plans[0][0], raw_contact.CALLER_AUTO_CALIBRATE)
+        # G99: the caller no longer decides - an unknown profile still never
+        # resolves to raw, whoever asks
         self.assertEqual(raw_contact.resolve_arming(
             'raw_contact', raw_contact.CALLER_AUTO_CALIBRATE, False, 'x', 0)[0],
             None)
@@ -2233,6 +2238,205 @@ class RawContactCompareTest(unittest.TestCase):
                          (raw_contact.CALLER_Z_OFFSET_PAIR, None))
         self.assertEqual(self.calls[0]['arming'],
                          (raw_contact.ARM_CALIBRATED, None))
+
+
+# ----------------------------------------------------------------------
+# G99 (Tim 2026-10-22): automatic load-cell contact is the default. The
+# coordinator follows the probe's mode: automatic runs the no-motion check
+# first and arms raw; manual needs the bottle calibration (as before).
+# ----------------------------------------------------------------------
+class FakeModeProbe(FakeZOffsetProbe):
+    """The probe's G99 surface, with the real resolve_arming() rule."""
+    def __init__(self, mode='auto', calibrated=False, check_ok=True,
+                 reference=None):
+        super().__init__(is_calibrated=calibrated)
+        self.mode = mode
+        self.check_ok = check_ok
+        self.reference = reference
+        self.failed = False
+        self.checks = 0
+        self.plans = []
+
+    def load_cell_mode(self):
+        return self.mode
+
+    def run_auto_check(self):
+        self.checks += 1
+        if self.check_ok:
+            self.reference, self.failed = -240426, False
+            return True, ''
+        self.reference, self.failed = None, True
+        return False, 'the sensor reading does not change at all'
+
+    def plan_arming(self, caller, profile=None):
+        self.plans.append(caller)
+        return raw_contact.resolve_arming(
+            self.mode, caller, self._is_calibrated,
+            raw_contact.DEFAULT_PROFILE_ID, self.reference,
+            auto_check_failed=self.failed)
+
+    def contact_ready(self, caller):
+        return self.plan_arming(caller)[0] is not None
+
+
+class LoadCellModeTest(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmpdir, True)
+        self.calls = []
+
+        def fake_measure(*args, **kw):
+            self.calls.append(kw)
+            return _accepted_measurement(20., 25., 2.5, 0.831)
+        orig = nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair
+        nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = \
+            fake_measure
+        self.addCleanup(setattr, nebulaos_calibration.nebulaos_probe_pair,
+                        'measure_probe_nozzle_pair', orig)
+
+    def _z_offset(self, probe):
+        printer, gcode, coord = _build(probe, FakeProbeObj(),
+                                       FakeZCompensate(20., 25.))
+        self.prompts = []
+        coord._send_action_prompt = lambda title, lines, buttons=None: \
+            self.prompts.append((title, list(lines), list(buttons or [])))
+        return printer, gcode, coord
+
+    def _auto(self, probe):
+        printer, gcode, coord = _build_auto_calibrate(
+            probe, FakeProbeObj(z_offset=1.795),
+            config_overrides={'journal_path':
+                              os.path.join(self.tmpdir, 'journal.json')})
+        self.prompts = []
+        coord._send_action_prompt = lambda title, lines, buttons=None: \
+            self.prompts.append((title, list(lines), list(buttons or [])))
+        self.cleans = []
+        gcode.commands['_NEBULAOS_NOZZLE_CLEAN'] = self.cleans.append
+        gcode.commands['_NEBULAOS_Z_OFFSET_CALIBRATE'] = \
+            coord.cmd_z_offset_calibrate
+        return printer, gcode, coord
+
+    # --- standalone Z-offset ------------------------------------------
+    def test_z_offset_auto_runs_the_check_then_touches_raw(self):
+        probe = FakeModeProbe('auto')        # no bottle calibration needed
+        printer, gcode, coord = self._z_offset(probe)
+        coord.cmd_z_offset_calibrate(fake.FakeGCmd({}))
+        self.assertEqual(probe.checks, 1)
+        kind, profile = self.calls[0]['arming']
+        self.assertEqual(kind, raw_contact.ARM_RAW)
+        self.assertEqual((profile['id'], profile['trigger_counts'],
+                          profile['polarity']), ('ke-stock-v1', 6400, -1))
+        self.assertEqual(coord.z_offset_state, 'complete')
+        self.assertEqual(gcode.scripts_run[-1], 'SAVE_CONFIG')
+
+    def test_z_offset_auto_check_failure_stops_before_motion(self):
+        probe = FakeModeProbe('auto', check_ok=False)
+        printer, gcode, coord = self._z_offset(probe)
+        with self.assertRaises(fake.CommandError) as ctx:
+            coord.cmd_z_offset_calibrate(fake.FakeGCmd({}))
+        self.assertIn('does not change', str(ctx.exception))
+        self.assertIn('Manual', str(ctx.exception))
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.prompts[-1][0], 'Automatic load cell check failed')
+        self.assertIn(('Manual calibration', 'NEBULAOS_LOAD_CELL_CALIBRATE'),
+                      self.prompts[-1][2])
+        self.assertNotIn('SAVE_CONFIG', gcode.scripts_run)
+
+    def test_z_offset_manual_uses_the_calibration_without_a_check(self):
+        probe = FakeModeProbe('manual', calibrated=True)
+        printer, gcode, coord = self._z_offset(probe)
+        coord.cmd_z_offset_calibrate(fake.FakeGCmd({}))
+        self.assertEqual(probe.checks, 0)
+        self.assertEqual(self.calls[0]['arming'],
+                         (raw_contact.ARM_CALIBRATED, None))
+
+    def test_z_offset_manual_without_bottle_calibration_refuses(self):
+        probe = FakeModeProbe('manual', calibrated=False, reference=-240426)
+        printer, gcode, coord = self._z_offset(probe)
+        with self.assertRaises(fake.CommandError) as ctx:
+            coord.cmd_z_offset_calibrate(fake.FakeGCmd({}))
+        self.assertIn('NEBULAOS_LOAD_CELL_CALIBRATE', str(ctx.exception))
+        self.assertEqual(self.calls, [])
+        self.assertEqual(probe.checks, 0)
+        self.assertEqual(self.prompts[-1][0], 'Load cell not calibrated')
+        self.assertIn(('Use automatic', 'NEBULAOS_LOAD_CELL_MODE MODE=auto'),
+                      self.prompts[-1][2])
+
+    # --- auto-calibrate -------------------------------------------------
+    def test_auto_calibrate_auto_mode_checks_first_then_does_everything(self):
+        probe = FakeModeProbe('auto')
+        printer, gcode, coord = self._auto(probe)
+        with self.assertRaises(RestartTriggered):
+            coord.cmd_auto_calibrate(fake.FakeGCmd({}))
+        self.assertEqual(probe.checks, 1)          # preflight only
+        self.assertEqual(len(self.cleans), 1)
+        # the Z-offset step inside follows the mode: raw (Run 14's
+        # "auto-calibrate never raw" is lifted)
+        self.assertEqual(self.calls[0]['arming'][0], raw_contact.ARM_RAW)
+        self.assertIn(raw_contact.CALLER_AUTO_CALIBRATE, probe.plans)
+        self.assertEqual(gcode.scripts_run[-1], 'SAVE_CONFIG')
+
+    def test_auto_calibrate_stops_cleanly_on_a_failed_check(self):
+        probe = FakeModeProbe('auto', check_ok=False)
+        printer, gcode, coord = self._auto(probe)
+        with self.assertRaises(fake.CommandError) as ctx:
+            coord.cmd_auto_calibrate(fake.FakeGCmd({}))
+        self.assertIn('automatic load cell check failed', str(ctx.exception))
+        self.assertIn('Calibration > Load Cell > Manual', str(ctx.exception))
+        self.assertEqual(gcode.scripts_run, [])           # no motion, no heat
+        self.assertEqual(self.cleans, [])
+        self.assertEqual(coord.auto_calibrate_state, 'error')
+        self.assertIn('does not change', coord.auto_calibrate_error)
+        journal = calibration_journal.read_journal(
+            path=os.path.join(self.tmpdir, 'journal.json'))
+        self.assertEqual(journal['state'], calibration_journal.STATE_ERROR)
+        self.assertFalse(journal['commit_requested'])
+        self.assertEqual(self.prompts[-1][0], 'Automatic load cell check failed')
+
+    def test_auto_calibrate_manual_without_bottle_refuses_as_before(self):
+        probe = FakeModeProbe('manual', calibrated=False)
+        printer, gcode, coord = self._auto(probe)
+        with self.assertRaises(fake.CommandError):
+            coord.cmd_auto_calibrate(fake.FakeGCmd({}))
+        self.assertEqual(probe.checks, 0)
+        self.assertEqual(gcode.scripts_run, [])
+        self.assertEqual(self.prompts[-1][0], 'Load cell not calibrated')
+
+    def test_auto_calibrate_manual_mode_is_calibrated_force(self):
+        probe = FakeModeProbe('manual', calibrated=True)
+        printer, gcode, coord = self._auto(probe)
+        with self.assertRaises(RestartTriggered):
+            coord.cmd_auto_calibrate(fake.FakeGCmd({}))
+        self.assertEqual(probe.checks, 0)
+        self.assertEqual(self.calls[0]['arming'],
+                         (raw_contact.ARM_CALIBRATED, None))
+
+    def test_compare_still_works_in_auto_mode(self):
+        # the supervised tool arms its calibrated half explicitly
+        probe = FakeModeProbe('auto', calibrated=True, reference=-240426)
+        sensor = type('S', (), {'get_samples_per_second': lambda s: 80.})()
+        probe.get_load_cell = lambda: type('LC', (), {
+            'get_counts_per_gram': lambda s: 85.72,
+            'get_sensor': lambda s: sensor})()
+        probe.get_status = lambda e: {
+            'is_calibrated': True, 'trigger_force': 75.,
+            'force_safety_limit': 2000.}
+        printer, gcode, coord = self._z_offset(probe)
+        printer.add_object('toolhead', _Toolhead('xyz'))
+        printer.add_object('print_stats', _Stats('standby'))
+        orig_plan = probe.plan_arming
+
+        def plan(caller, profile=None):
+            if profile is not None:
+                return raw_contact.ARM_RAW, profile
+            return orig_plan(caller)
+        probe.plan_arming = plan
+        coord.cmd_raw_contact_compare(fake.FakeGCmd(
+            {'SUPERVISED': '1', 'TRIGGER_COUNTS': '6400', 'POLARITY': '-1'}))
+        self.assertEqual(self.calls[0]['arming'],
+                         (raw_contact.ARM_CALIBRATED, None))
+        self.assertEqual(self.calls[1]['arming'][1]['id'], 'candidate-6400')
+        self.assertEqual(coord.raw_compare_state, 'complete')
 
 
 class FakeZAdjust:

@@ -7,7 +7,10 @@
 # - upstream LCBestFit (the pinned source, class extracted and run) gives
 #   the same contact Z from raw counts as from grams on the same samples,
 #   and is invariant to the sensor gain
-# - the qualified-profile registry is empty: raw contact refuses to move
+# - the qualified-profile registry (G99: ke-stock-v1, Tim 2026-10-22) and
+#   the per-mode arming rule, the same for every caller
+# - raw arming on the fake probe: health window, settle loop, reference
+#   drift, safety window; the automatic check (G99)
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import ast
@@ -263,9 +266,32 @@ class RealTraceTriggerReplayTest(unittest.TestCase):
 
 
 class QualifiedProfileGateTest(unittest.TestCase):
-    def test_no_profile_is_qualified_yet(self):
-        self.assertEqual(rc.QUALIFIED_PROFILES, {})
+    def test_only_the_ke_stock_profile_is_qualified(self):
+        # G99 (Tim 2026-10-22): ke-stock-v1 is the only registry entry
+        self.assertEqual(sorted(rc.QUALIFIED_PROFILES), ['ke-stock-v1'])
         self.assertIsNone(rc.lookup_profile('ke-v1'))
+        self.assertEqual(rc.DEFAULT_PROFILE_ID, 'ke-stock-v1')
+
+    def test_ke_stock_v1_values(self):
+        p = rc.lookup_profile('ke-stock-v1')
+        self.assertEqual(rc.validate_profile(p), [])
+        self.assertEqual((p['trigger_counts'], p['polarity']), (6400, -1))
+        # the ke-dev compare candidate's windows (cpg 85.72084, 75 g, 2 kg)
+        cand, _ = rc.candidate_profile(6400, -1, 85.72084, 75., 2000., 80.)
+        for key in ('safety_counts', 'max_reference_drift_counts',
+                    'max_idle_sigma', 'max_idle_drift_per_s', 'expected_sps',
+                    'sps_tolerance'):
+            self.assertEqual(p[key], cand[key], key)
+        self.assertIn('Tim', p['evidence'])
+
+    def test_ke_dev_idle_and_contacts_fit_the_profile(self):
+        # measured: idle sigma 110 counts, 90.6 SPS; contact peaks
+        # 15000-25000 counts - far below the 2 kg safety window
+        p = rc.lookup_profile('ke-stock-v1')
+        self.assertLess(110 * 10, p['trigger_counts'])
+        self.assertLess(abs(90.6 - p['expected_sps']),
+                        p['sps_tolerance'] * p['expected_sps'])
+        self.assertLess(25000, p['safety_counts'])
 
     def test_raw_motion_is_refused_without_a_qualified_profile(self):
         self.assertEqual(rc.raw_motion_refusal(None)[0], rc.RAW_NO_PROFILE)
@@ -295,21 +321,25 @@ class ProbeIntegrationSourceTest(unittest.TestCase):
             self.assertNotIn(forbidden, code, forbidden)
         self.assertIn('validate_idle', code)
 
-    def test_raw_mode_refuses_before_anything_is_armed(self):
-        # Config raw_contact without an explicit plan refuses before the MCU
-        # is armed; an explicit raw plan goes to _arm_raw (tested below).
+    def test_every_touch_is_planned_before_anything_is_armed(self):
+        # G99: a touch without a plan resolves one from the user's mode; a
+        # refusal or a raw plan returns before the calibrated arming.
         code, fn, _ = _probe_function('_tare_and_arm')
-        self.assertIn('MODE_RAW', code)
-        self.assertLess(code.index('raw_motion_refusal'),
+        self.assertLess(code.index('self.plan_arming('),
                         code.index('set_raw_range'))
+        self.assertLess(code.index('self._refuse('), code.index('set_raw_range'))
         self.assertLess(code.index('_arm_raw('), code.index('set_raw_range'))
+        code, _, _ = _probe_function('touch_probe')
+        self.assertLess(code.index('self.plan_arming('),
+                        code.index('for i in range(pro_cnt)'))
 
     def test_default_mode_is_auto(self):
-        # G83b-auto (Run 14): 'auto' - with QUALIFIED_PROFILES empty it is
-        # the calibrated behaviour (see ResolveArmingTest).
+        # contact_detection_mode 'auto' = follow the user's choice, which
+        # defaults to automatic (G99); the default profile is ke-stock-v1.
         _, _, src = _probe_function('__init__')
         self.assertIn("'contact_detection_mode'", src)
         self.assertIn("raw_contact.MODE_AUTO)", src)
+        self.assertIn("raw_contact.DEFAULT_PROFILE_ID)", src)
 
     def test_fit_uses_mode_aware_magnitude_and_no_fake_grams(self):
         code, _, _ = _probe_function('_fit_contact_z')
@@ -370,33 +400,80 @@ class CandidateTest(unittest.TestCase):
 
 
 class ResolveArmingTest(unittest.TestCase):
-    def tearDown(self):
-        rc.QUALIFIED_PROFILES.clear()
+    """G99: the user's mode decides, the same for every caller."""
+    CALLERS = (rc.CALLER_Z_OFFSET_PAIR, rc.CALLER_AUTO_CALIBRATE,
+               rc.CALLER_NOZZLE_CLEAN, rc.CALLER_TOUCH)
+    KE = 'ke-stock-v1'
 
-    def test_auto_today_is_the_calibrated_behaviour(self):
-        for caller in (rc.CALLER_Z_OFFSET_PAIR, 'nozzle_clear', 'legacy'):
-            self.assertEqual(rc.resolve_arming('auto', caller, True),
+    def tearDown(self):
+        for k in list(rc.QUALIFIED_PROFILES):
+            if k != self.KE:
+                del rc.QUALIFIED_PROFILES[k]
+
+    def test_auto_is_raw_for_every_caller(self):
+        for caller in self.CALLERS:
+            for calibrated in (True, False):
+                kind, profile = rc.resolve_arming('auto', caller, calibrated,
+                                                  self.KE, -240000)
+                self.assertEqual(kind, rc.ARM_RAW, caller)
+                self.assertEqual(profile['id'], self.KE)
+
+    def test_manual_is_the_calibration_for_every_caller(self):
+        for caller in self.CALLERS:
+            self.assertEqual(rc.resolve_arming('manual', caller, True,
+                                               self.KE, -240000),
                              (rc.ARM_CALIBRATED, None))
-            kind, refusal = rc.resolve_arming('auto', caller, False)
+
+    def test_manual_without_the_bottle_calibration_refuses(self):
+        for caller in self.CALLERS:
+            kind, refusal = rc.resolve_arming('manual', caller, False,
+                                              self.KE, -240000)
             self.assertIsNone(kind)
             self.assertEqual(refusal[0], rc.NOT_CALIBRATED)
+            self.assertIn('NEBULAOS_LOAD_CELL_CALIBRATE', refusal[1])
 
-    def test_other_callers_never_get_raw_even_with_a_qualified_profile(self):
-        rc.QUALIFIED_PROFILES['ke-test'] = _profile(id='ke-test')
-        for mode in rc.MODES:
-            for caller in ('nozzle_clear', 'legacy_z_offset', 'auto_calibrate'):
-                kind, _ = rc.resolve_arming(mode, caller, False, 'ke-test', 0)
-                self.assertNotEqual(kind, rc.ARM_RAW)
+    def test_config_mode_names_are_accepted(self):
+        self.assertEqual(rc.resolve_arming('calibrated_force', 'x', True,
+                                           self.KE, 0)[0], rc.ARM_CALIBRATED)
+        self.assertEqual(rc.resolve_arming('raw_contact', 'x', False,
+                                           self.KE, 0)[0], rc.ARM_RAW)
 
-    def test_calibration_beats_a_model_profile(self):
-        rc.QUALIFIED_PROFILES['ke-test'] = _profile(id='ke-test')
-        self.assertEqual(rc.resolve_arming('auto', rc.CALLER_Z_OFFSET_PAIR,
-                                           True, 'ke-test', 0)[0],
-                         rc.ARM_CALIBRATED)
+    def test_effective_user_mode(self):
+        self.assertEqual(rc.effective_user_mode('auto', 'manual'), 'manual')
+        self.assertEqual(rc.effective_user_mode('auto', 'auto'), 'auto')
+        self.assertEqual(rc.effective_user_mode('auto', 'garbage'), 'auto')
+        self.assertEqual(rc.effective_user_mode('calibrated_force', 'auto'),
+                         'manual')
+        self.assertEqual(rc.effective_user_mode('raw_contact', 'manual'),
+                         'auto')
+
+    def test_auto_never_falls_back_to_the_calibration(self):
+        # a calibrated unit in automatic mode without a reference refuses -
+        # it does not silently use grams
+        kind, refusal = rc.resolve_arming('auto', rc.CALLER_Z_OFFSET_PAIR,
+                                          True, self.KE, None)
+        self.assertIsNone(kind)
+        self.assertEqual(refusal[0], rc.RAW_NO_REFERENCE)
+        self.assertIn('NEBULAOS_LOAD_CELL_AUTO_CHECK', refusal[1])
+
+    def test_a_failed_check_refuses_even_with_a_reference(self):
+        kind, refusal = rc.resolve_arming('auto', rc.CALLER_TOUCH, False,
+                                          self.KE, -240000,
+                                          auto_check_failed=True)
+        self.assertIsNone(kind)
+        self.assertEqual(refusal[0], rc.RAW_AUTO_CHECK_FAILED)
+        self.assertIn('Manual', refusal[1])
+
+    def test_unknown_or_missing_profile_refuses(self):
+        self.assertEqual(rc.resolve_arming('auto', 'x', True, None, 0)[1][0],
+                         rc.RAW_NO_PROFILE)
+        self.assertEqual(rc.resolve_arming('auto', 'x', True, 'ke-v9', 0)[1][0],
+                         rc.RAW_UNKNOWN_PROFILE)
 
     def test_every_qualified_profile_passes_the_schema(self):
         for pid, profile in rc.QUALIFIED_PROFILES.items():
             self.assertEqual(rc.validate_profile(profile), [], pid)
+            self.assertEqual(profile['id'], pid)
 
     def test_an_invalid_registry_profile_is_refused(self):
         bad = _profile(id='ke-bad')
@@ -407,23 +484,50 @@ class ResolveArmingTest(unittest.TestCase):
         self.assertIsNone(kind)
         self.assertEqual(refusal[0], rc.RAW_BAD_PROFILE)
 
-    def test_raw_needs_a_reference(self):
-        rc.QUALIFIED_PROFILES['ke-test'] = _profile(id='ke-test')
-        kind, refusal = rc.resolve_arming('auto', rc.CALLER_Z_OFFSET_PAIR,
-                                          False, 'ke-test', None)
-        self.assertEqual(refusal[0], rc.RAW_NO_REFERENCE)
-        kind, profile = rc.resolve_arming('auto', rc.CALLER_Z_OFFSET_PAIR,
-                                          False, 'ke-test', -240000)
-        self.assertEqual(kind, rc.ARM_RAW)
+    def test_describe_idle_reasons(self):
+        text = rc.describe_idle_reasons(
+            [rc.STUCK, 'noise_above_profile (sigma 900 counts)',
+             rc.DRIFT_ABOVE_PROFILE])
+        self.assertIn('does not change', text)
+        self.assertIn('too noisy', text)
+        self.assertIn('does not settle', text)
+
+def _probe_ns():
+    from . import nebulaos_load_cell_mode
+    import logging
+    import time
+    return {'raw_contact': rc, 'math': math, 'lc_mode': nebulaos_load_cell_mode,
+            'logging': logging, 'time': time}
+
 
 def _bound_probe_methods(names):
     """Methods of ZOffsetProbe executed on a fake (no MCU stack needed)."""
-    ns = {'raw_contact': rc, 'math': __import__('math')}
+    ns = _probe_ns()
     for name in names:
         code, fn, _ = _probe_function(name)
         exec(compile(ast.Module(body=[fn], type_ignores=[]), 'probe', 'exec'),
              ns)
     return {n: ns[n] for n in names}
+
+
+# G99 functions appended to ZOffsetProbe at module level: (name in the
+# module, attribute on the class)
+_APPENDED = (('_save_lc_state', '_save_lc_state'),
+             ('_set_load_cell_mode', 'set_load_cell_mode'),
+             ('_run_auto_check', 'run_auto_check'),
+             ('_record_auto_check', '_record_auto_check'),
+             ('_auto_status', 'auto_status'))
+
+
+def _appended_probe_functions():
+    with open(os.path.join(HERE, 'nebulaos_z_offset_probe.py')) as fh:
+        src = fh.read()
+    wanted = dict(_APPENDED)
+    fns = [n for n in ast.parse(src).body
+           if isinstance(n, ast.FunctionDef) and n.name in wanted]
+    ns = _probe_ns()
+    exec(compile(ast.Module(body=fns, type_ignores=[]), 'p', 'exec'), ns)
+    return {attr: ns[name] for name, attr in _APPENDED}
 
 
 class _Err(Exception):
@@ -513,10 +617,15 @@ class RawArmingTest(unittest.TestCase):
     REF = -240426
 
     def _probe(self, samples, reference=REF, calibrated=True,
-               persisted=None, mode='auto', profile_id=None):
+               persisted=None, mode='auto', profile_id='ke-stock-v1',
+               user_mode='auto', state=None, path=None):
+        from . import nebulaos_load_cell_mode as lcm
         m = _bound_probe_methods(['_arm_raw', '_raw_reference_counts',
                                   '_refuse', 'plan_arming', 'contact_ready',
-                                  '_raw_health_window'])
+                                  '_raw_health_window', '_settled_idle',
+                                  'load_cell_mode', '_auto_reference_counts',
+                                  '_tare_and_arm'])
+        m.update(_appended_probe_functions())
         probe = types.SimpleNamespace()
         probe._printer = _Printer()
         probe._name = 'nebulaos_z_offset_probe'
@@ -526,6 +635,7 @@ class RawArmingTest(unittest.TestCase):
         probe._mcu_trigger_analog = _Trigger()
         probe._raw_health_time = 0.75
         probe._raw_settle_time = 5.
+        probe._auto_check_time = 2.
         probe._raw_reference = persisted
         probe._contact_mode = mode
         probe._raw_profile_id = profile_id
@@ -533,9 +643,21 @@ class RawArmingTest(unittest.TestCase):
         probe._last_contact_rejection_reason = None
         probe._active_profile = None
         probe._effective_mode = None
+        probe._lc_state = state or lcm.default_state()
+        probe._lc_state['mode'] = user_mode
+        probe._mode_path = path or os.path.join(
+            self._tmpdir(), 'load_cell_mode.json')
+        probe._mode_warning = ''
         for name, fn in m.items():
             setattr(probe, name, types.MethodType(fn, probe))
         return probe
+
+    def _tmpdir(self):
+        import shutil
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        return d
 
     def test_arms_on_the_fresh_tare_with_the_window_on_the_reference(self):
         probe = self._probe(_idle(self.REF - 1000))
@@ -619,25 +741,161 @@ class RawArmingTest(unittest.TestCase):
 
     def test_contact_ready_stays_false_without_a_qualified_profile(self):
         probe = self._probe([], reference=None, calibrated=False,
-                            persisted=self.REF)
-        for caller in (rc.CALLER_Z_OFFSET_PAIR, rc.CALLER_AUTO_CALIBRATE):
+                            persisted=self.REF, profile_id=None)
+        for caller in (rc.CALLER_Z_OFFSET_PAIR, rc.CALLER_AUTO_CALIBRATE,
+                       rc.CALLER_NOZZLE_CLEAN):
             self.assertFalse(probe.contact_ready(caller))
 
-    def test_contact_ready_with_a_qualified_profile_only_on_the_pair_path(self):
-        rc.QUALIFIED_PROFILES['ke-test'] = _profile(id='ke-test')
-        self.addCleanup(rc.QUALIFIED_PROFILES.clear)
+    def test_auto_mode_is_ready_for_every_caller_with_a_reference(self):
+        # G99: the Run 14 "auto-calibrate never raw" rule is lifted
         probe = self._probe([], reference=None, calibrated=False,
-                            persisted=self.REF, profile_id='ke-test')
-        self.assertTrue(probe.contact_ready(rc.CALLER_Z_OFFSET_PAIR))
-        self.assertFalse(probe.contact_ready(rc.CALLER_AUTO_CALIBRATE))
+                            persisted=self.REF)
+        for caller in (rc.CALLER_Z_OFFSET_PAIR, rc.CALLER_AUTO_CALIBRATE,
+                       rc.CALLER_NOZZLE_CLEAN, rc.CALLER_TOUCH):
+            self.assertTrue(probe.contact_ready(caller))
+            self.assertEqual(probe.plan_arming(caller)[0], rc.ARM_RAW)
         no_ref = self._probe([], reference=None, calibrated=False,
-                             persisted=None, profile_id='ke-test')
+                             persisted=None)
         self.assertFalse(no_ref.contact_ready(rc.CALLER_Z_OFFSET_PAIR))
+        self.assertEqual(no_ref.plan_arming(rc.CALLER_TOUCH)[1][0],
+                         rc.RAW_NO_REFERENCE)
 
-    def test_calibrated_unit_is_ready_as_before(self):
-        probe = self._probe([])
-        self.assertTrue(probe.contact_ready(rc.CALLER_Z_OFFSET_PAIR))
+    def test_auto_mode_on_a_calibrated_unit_still_needs_the_check(self):
+        # the bottle zero is not the automatic reference
+        probe = self._probe([], calibrated=True, persisted=None)
+        self.assertFalse(probe.contact_ready(rc.CALLER_Z_OFFSET_PAIR))
+
+    def test_calibrated_unit_is_ready_in_manual_mode(self):
+        probe = self._probe([], user_mode='manual')
+        for caller in (rc.CALLER_Z_OFFSET_PAIR, rc.CALLER_AUTO_CALIBRATE,
+                       rc.CALLER_NOZZLE_CLEAN):
+            self.assertTrue(probe.contact_ready(caller))
+            self.assertEqual(probe.plan_arming(caller),
+                             (rc.ARM_CALIBRATED, None))
+
+    def test_manual_without_the_bottle_calibration_refuses(self):
+        probe = self._probe([], calibrated=False, persisted=self.REF,
+                            user_mode='manual')
+        self.assertFalse(probe.contact_ready(rc.CALLER_NOZZLE_CLEAN))
+        with self.assertRaises(_Err) as ctx:
+            probe._tare_and_arm(None)
+        self.assertEqual(probe._last_contact_rejection_reason,
+                         rc.NOT_CALIBRATED)
+        self.assertIn('bottle', str(ctx.exception))
+        self.assertEqual(probe._mcu_trigger_analog.calls, [])
+
+    def test_config_override_beats_the_user_choice(self):
+        probe = self._probe([], calibrated=True, persisted=None,
+                            mode='calibrated_force', user_mode='auto')
+        self.assertEqual(probe.load_cell_mode(), 'manual')
+        self.assertTrue(probe.contact_ready(rc.CALLER_TOUCH))
+
+    def test_touch_without_a_plan_follows_auto_mode(self):
+        # the nozzle clean calls touch_probe() without a plan: raw arming
+        probe = self._probe(_idle(self.REF), reference=None, calibrated=False,
+                            persisted=self.REF)
+        probe._tare_and_arm(None)
+        self.assertEqual(probe._effective_mode, rc.MODE_RAW)
+        self.assertEqual(probe._mcu_trigger_analog.calls[-1],
+                         ('trigger', 'abs_ge', 6400))
+
+    def test_safety_refusals_still_win_in_auto_mode(self):
+        cases = (
+            (_idle(self.REF - 20000), rc.RAW_REFERENCE_DRIFT),   # preload
+            ([(i / 90.6, None, self.REF, None) for i in range(70)],
+             rc.RAW_UNHEALTHY),                                 # stuck
+            (_idle(self.REF, noise=3000), rc.RAW_UNHEALTHY),     # noisy
+            (_idle(self.REF, n=6), rc.RAW_UNHEALTHY),            # too short
+        )
+        for samples, code in cases:
+            probe = self._probe(samples, reference=None, calibrated=False,
+                                persisted=self.REF)
+            with self.assertRaises(_Err):
+                probe._tare_and_arm(None)
+            self.assertEqual(probe._last_contact_rejection_reason, code)
+            self.assertEqual(probe._mcu_trigger_analog.calls, [])
+
+    # --- G99 automatic check ------------------------------------------
+    def test_auto_check_ok_stores_the_reference_in_the_state_file(self):
+        from . import nebulaos_load_cell_mode as lcm
+        probe = self._probe(_idle(self.REF, n=180), reference=None,
+                            calibrated=False)
+        ok, reason = probe.run_auto_check()
+        self.assertTrue(ok, reason)
+        st = probe.auto_status()
+        self.assertEqual(st['auto_check'], 'ok')
+        self.assertTrue(st['auto_ready'])
+        self.assertAlmostEqual(st['auto_reference_counts'], self.REF, delta=60)
+        saved, warning = lcm.read_state(probe._mode_path)
+        self.assertEqual(warning, '')
+        self.assertEqual(saved['auto_check'], 'ok')
+        self.assertEqual(saved['reference_counts'], st['auto_reference_counts'])
+        self.assertEqual(saved['profile_id'], 'ke-stock-v1')
+        # no motion, no tare, no MCU arming, no Klipper config
+        self.assertIsNone(probe._load_cell.tared)
+        self.assertEqual(probe._mcu_trigger_analog.calls, [])
+        # and the touch is now armed around it
         self.assertTrue(probe.contact_ready(rc.CALLER_AUTO_CALIBRATE))
+
+    def test_auto_check_waits_for_a_settling_bed(self):
+        probe = self._probe([self._drifting(n=180), _idle(self.REF, n=180)],
+                            reference=None, calibrated=False)
+        ok, _ = probe.run_auto_check()
+        self.assertTrue(ok)
+        self.assertEqual(probe._raw_diag['settle_windows'], 2)
+
+    def test_auto_check_failure_clears_the_reference_and_says_why(self):
+        from . import nebulaos_load_cell_mode as lcm
+        stuck = [(i / 90.6, None, self.REF, None) for i in range(180)]
+        probe = self._probe(stuck, reference=None, calibrated=False,
+                            persisted=self.REF)
+        self.assertTrue(probe.contact_ready(rc.CALLER_TOUCH))  # legacy ref
+        ok, reason = probe.run_auto_check()
+        self.assertFalse(ok)
+        self.assertIn('does not change', reason)
+        st = probe.auto_status()
+        self.assertEqual((st['auto_check'], st['auto_ready']), ('failed', False))
+        self.assertEqual(st['auto_check_reason'], reason)
+        self.assertIsNone(st['auto_reference_counts'])
+        self.assertFalse(probe.contact_ready(rc.CALLER_TOUCH))
+        self.assertEqual(probe.plan_arming(rc.CALLER_TOUCH)[1][0],
+                         rc.RAW_AUTO_CHECK_FAILED)
+        self.assertEqual(lcm.read_state(probe._mode_path)[0]['auto_check'],
+                         'failed')
+
+    def test_auto_check_never_calm_fails(self):
+        probe = self._probe([self._drifting(n=180)], reference=None,
+                            calibrated=False)
+        ok, reason = probe.run_auto_check()
+        self.assertFalse(ok)
+        self.assertIn('does not settle', reason)
+        self.assertEqual(probe._raw_diag['settle_windows'], 3)   # 5 s / 2 s
+
+    def test_auto_check_without_a_profile_fails(self):
+        probe = self._probe(_idle(self.REF, n=180), profile_id='nope')
+        ok, reason = probe.run_auto_check()
+        self.assertFalse(ok)
+        self.assertIn('not available', reason)
+
+    def test_mode_switch_is_persisted_without_restart(self):
+        from . import nebulaos_load_cell_mode as lcm
+        probe = self._probe([], calibrated=True, persisted=None)
+        self.assertEqual(probe.set_load_cell_mode('manual'), '')
+        self.assertEqual(probe.load_cell_mode(), 'manual')
+        self.assertTrue(probe.contact_ready(rc.CALLER_TOUCH))
+        self.assertEqual(lcm.read_state(probe._mode_path)[0]['mode'], 'manual')
+        probe.set_load_cell_mode('auto')
+        self.assertEqual(lcm.read_state(probe._mode_path)[0]['mode'], 'auto')
+        with self.assertRaises(_Err):
+            probe.set_load_cell_mode('bogus')
+
+    def test_unwritable_state_file_keeps_the_live_choice_with_a_warning(self):
+        probe = self._probe([], path='/proc/nebulaos-no-such/dir/x.json')
+        with self.assertLogs(level='ERROR'):
+            warning = probe.set_load_cell_mode('manual')
+        self.assertIn('could not save', warning)
+        self.assertEqual(probe.load_cell_mode(), 'manual')
+        self.assertEqual(probe.auto_status()['mode_warning'], warning)
 
     def _capture_cmd(self):
         with open(os.path.join(HERE, 'nebulaos_z_offset_probe.py')) as fh:

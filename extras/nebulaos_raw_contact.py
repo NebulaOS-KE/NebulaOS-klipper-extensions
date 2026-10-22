@@ -6,11 +6,18 @@
 #       nebulaos_z_offset_probe already writes to klippy.log ("raw collector
 #       samples" / "ascent fit window data"), so a raw-count fit can be
 #       compared with the calibrated grams fit on the SAME real samples.
-#   B - the qualified-profile registry the opt-in raw_contact mode needs
-#       before it may move. It is EMPTY: no profile has passed the supervised
-#       force qualification (stages C/D), so raw_contact refuses every
-#       nozzle-contact motion. Do not add a profile without measured-force
-#       evidence; never invent thresholds or a fake counts_per_gram.
+#   B - the qualified-profile registry raw contact needs before it may move.
+#
+# G99 (Tim 2026-10-22, final - overrides the brief's "qualify first" rule and
+# the G83b-auto qualification deferral): automatic (raw-count) load-cell
+# contact is the DEFAULT for every user, with the profile "ke-stock-v1"
+# below. The user choice auto|manual is persisted by
+# nebulaos_load_cell_mode.py; resolve_arming() follows it for EVERY caller
+# (Z-offset alone and inside auto-calibrate, nozzle clean, any touch_probe
+# caller). Manual = the unit's own grams (bottle) calibration, as before.
+# Every safety check stays mandatory in automatic mode: sensor health
+# window, drift/noise refusal with the settle loop, the reference-anchored
+# raw safety window and the reference drift check (nebulaos_z_offset_probe).
 #
 # No Klipper imports here: everything is plain data in, plain data out, so it
 # is tested offline (test_nebulaos_raw_contact.py) and used by
@@ -24,22 +31,24 @@ import re
 
 MODE_CALIBRATED = 'calibrated_force'
 MODE_RAW = 'raw_contact'
-# G83b-auto (Run 14): the default. Per caller: the unit's own grams
-# calibration when there is one (per-unit evidence beats a model profile),
-# otherwise a QUALIFIED raw profile - only for the canonical paired Z-offset
-# path - otherwise a refusal (the bottle calibration popup).
+# [nebulaos_z_offset_probe] contact_detection_mode (config). 'auto' (the
+# default) follows the user's persisted choice (USER_MODES below);
+# 'calibrated_force' / 'raw_contact' force manual / automatic (developer
+# override, never written into an image-owned cfg).
 MODE_AUTO = 'auto'
 MODES = (MODE_AUTO, MODE_CALIBRATED, MODE_RAW)
 
-# The only caller that may ever resolve to raw contact: the canonical
-# NEBULAOS_Z_OFFSET_CALIBRATE paired path (fixed reference XY, bounded
-# floor). Nozzle cleaning, the legacy Z_OFFSET_CALIBRATION and
-# NEBULAOS_AUTO_CALIBRATE stay on calibrated force (brief E.2-E.4).
+# G99: the user's choice for load-cell contact (NEBULAOS_LOAD_CELL_MODE).
+USER_AUTO = 'auto'          # automatic raw-count contact (default)
+USER_MANUAL = 'manual'      # the bottle calibration (grams)
+USER_MODES = (USER_AUTO, USER_MANUAL)
+
+# Callers of a nozzle touch. Since G99 they all follow the user's mode; the
+# name is kept for logs and status only.
 CALLER_Z_OFFSET_PAIR = 'z_offset_pair'
-# The same paired Z-offset step run INSIDE NEBULAOS_AUTO_CALIBRATE: stays
-# on calibrated force until nozzle cleaning is separately qualified (brief
-# E.2; Run 14 verifier note 5).
 CALLER_AUTO_CALIBRATE = 'auto_calibrate'
+CALLER_NOZZLE_CLEAN = 'nozzle_clean'
+CALLER_TOUCH = 'touch'      # any other touch_probe() caller
 ARM_CALIBRATED = 'calibrated'
 ARM_RAW = 'raw'
 
@@ -58,6 +67,36 @@ STUCK = 'stuck_signal'
 NON_FINITE = 'non_finite_sample'
 SAMPLE_RATE_MISMATCH = 'sample_rate_mismatch'
 TIME_NOT_MONOTONIC = 'time_not_monotonic'
+# Profile limits in the settle loop (nebulaos_z_offset_probe): prefixes.
+NOISE_ABOVE_PROFILE = 'noise_above_profile'
+DRIFT_ABOVE_PROFILE = 'drift_above_profile'
+
+# Readable text for the codes above (the screen and Mainsail show it).
+IDLE_REASON_TEXT = {
+    NO_SAMPLES: "the sensor sent no readings",
+    TOO_FEW_SAMPLES: "the sensor sent too few readings",
+    SENSOR_ERRORS: "the sensor reported read errors",
+    SATURATED: "the sensor reading is at its limit",
+    STUCK: "the sensor reading does not change at all",
+    NON_FINITE: "the sensor sent invalid readings",
+    SAMPLE_RATE_MISMATCH: "the sensor reads at the wrong speed",
+    TIME_NOT_MONOTONIC: "the sensor readings arrive out of order",
+    NOISE_ABOVE_PROFILE: "the reading is too noisy",
+    DRIFT_ABOVE_PROFILE: "the reading does not settle (something touches "
+                         "the bed or the printer moves?)",
+}
+
+
+def describe_idle_reasons(reasons):
+    """'a, b' in words for validate_idle()/settle-loop reason codes."""
+    out = []
+    for r in reasons:
+        key = next((k for k in (NOISE_ABOVE_PROFILE, DRIFT_ABOVE_PROFILE)
+                    if r.startswith(k)), r)
+        text = IDLE_REASON_TEXT.get(key, r)
+        if text not in out:
+            out.append(text)
+    return ", ".join(out)
 
 # Rejection codes for raw-contact motion (stage B gate).
 RAW_NO_PROFILE = 'raw_contact_no_qualified_profile'
@@ -66,13 +105,55 @@ RAW_NO_REFERENCE = 'raw_contact_no_reference'
 RAW_REFERENCE_DRIFT = 'raw_contact_reference_drift'
 RAW_UNHEALTHY = 'raw_contact_sensor_unhealthy'
 RAW_BAD_PROFILE = 'raw_contact_invalid_profile'
+RAW_AUTO_CHECK_FAILED = 'load_cell_auto_check_failed'
 NOT_CALIBRATED = 'load_cell_not_calibrated'
 
-# Versioned, hardware-qualified raw-contact profiles, keyed by id. Each entry
-# must come from a documented supervised force qualification (brief, PR C/D):
-# polarity, trigger band, reference drift window, ADC safety window, noise /
-# drift / sample-rate bounds, fit-quality limits. None exist yet.
-QUALIFIED_PROFILES = {}
+# Versioned raw-contact profiles, keyed by id. Every safety value of a touch
+# comes from here; an id named in a config file is not enough by itself.
+#
+# ke-stock-v1 - Creality Ender-3 V3 KE, stock under-bed HX711 (front-left
+# screw), upstream hx71x at 80 SPS configured. Tim's decision 2026-10-22
+# (G99, final): automatic contact is the default for everyone with these
+# values. Evidence: two supervised NEBULAOS_RAW_CONTACT_COMPARE runs on
+# ke-dev 2026-10-21 (TRIGGER_COUNTS=6400 POLARITY=-1 SAMPLES=3): automatic vs
+# calibrated Z offset within 0.006 mm, automatic scatter 0.014 mm, the same
+# ~255 g peak force; 9 real contact traces (testdata/ke-dev-contact-traces-
+# 20261019.log): contact LOWERS the counts (polarity -1), peaks 15000-25000
+# counts, idle sigma 110 / p2p 604 counts, 90.6 SPS measured. The window
+# values are the ones the compare's stage-C candidate used on ke-dev
+# (counts_per_gram 85.72084, trigger_force 75 g, force_safety_limit 2000 g):
+# safety = 2000 g, reference drift = 75 g, idle sigma <= trigger/10, idle
+# drift <= trigger/8 per s. NOT a multi-unit force qualification (G83b-auto
+# q stays open): a unit whose cell is much more or less sensitive gets a
+# lower or higher contact force - Manual (bottle) remains for that.
+KE_STOCK_V1 = 'ke-stock-v1'
+DEFAULT_PROFILE_ID = KE_STOCK_V1
+QUALIFIED_PROFILES = {
+    KE_STOCK_V1: {
+        'id': KE_STOCK_V1,
+        'polarity': -1,
+        'trigger_counts': 6400,
+        'safety_counts': 171441,             # int(85.72084 * 2000)
+        'max_reference_drift_counts': 6429,  # int(85.72084 * 75)
+        'expected_sps': 80.,
+        'sps_tolerance': 0.25,
+        'max_idle_sigma': 640.,              # 6400 / 10
+        'max_idle_drift_per_s': 800.,        # 6400 / 8
+        'evidence': "ke-dev supervised compares 2026-10-21 (within 0.006 mm "
+                    "of the calibrated method); Tim's decision 2026-10-22 "
+                    "(G99): default for everyone",
+    },
+}
+
+
+def effective_user_mode(config_mode, user_mode):
+    """The user mode a touch follows: the config override, else the
+    persisted choice (anything unknown -> automatic, the default)."""
+    if config_mode == MODE_CALIBRATED:
+        return USER_MANUAL
+    if config_mode == MODE_RAW:
+        return USER_AUTO
+    return user_mode if user_mode in USER_MODES else USER_AUTO
 
 
 def validate_profile(profile):
@@ -142,27 +223,42 @@ def candidate_profile(trigger_counts, polarity, counts_per_gram,
 
 
 def resolve_arming(mode, caller, calibrated, profile_id=None,
-                   reference_counts=None):
+                   reference_counts=None, auto_check_failed=False):
     """How a touch is armed: (ARM_CALIBRATED, None), (ARM_RAW, profile) or
-    (None, (code, message)) for a refusal. Pure - see MODE_AUTO above."""
-    if caller != CALLER_Z_OFFSET_PAIR or mode == MODE_CALIBRATED:
+    (None, (code, message)) for a refusal. Pure.
+
+    mode: the user mode ('auto' | 'manual'; the config names raw_contact /
+    calibrated_force are accepted as their equivalents). G99: the same rule
+    for EVERY caller (the Run 14 "auto-calibrate / nozzle clean never raw"
+    rule is lifted by Tim's decision 2026-10-22).
+    - manual: the unit's grams calibration, else a refusal (bottle popup);
+    - auto: a qualified profile + an unloaded reference from a passed
+      automatic check, else a refusal. Never falls back to the other mode
+      silently."""
+    if mode in (USER_MANUAL, MODE_CALIBRATED):
         if calibrated:
             return ARM_CALIBRATED, None
-        return None, (NOT_CALIBRATED, "the load cell is not calibrated")
-    if mode == MODE_AUTO and calibrated:
-        return ARM_CALIBRATED, None
+        return None, (NOT_CALIBRATED, "the load cell is not calibrated "
+                      "(Manual mode) - run the bottle calibration "
+                      "(NEBULAOS_LOAD_CELL_CALIBRATE) or select Automatic "
+                      "(NEBULAOS_LOAD_CELL_MODE MODE=auto)")
     refusal = raw_motion_refusal(profile_id)
     if refusal is not None:
-        if mode == MODE_AUTO:
-            return None, (NOT_CALIBRATED, "the load cell is not calibrated")
         return None, refusal
-    if reference_counts is None:
-        return None, (RAW_NO_REFERENCE, "raw contact has no unloaded "
-                      "reference for this unit - nozzle contact refused")
     profile = lookup_profile(profile_id)
     problems = validate_profile(profile)
     if problems:
         return None, (RAW_BAD_PROFILE, "; ".join(problems))
+    if auto_check_failed:
+        return None, (RAW_AUTO_CHECK_FAILED,
+                      "the automatic load cell check failed - run it again "
+                      "on an empty bed (NEBULAOS_LOAD_CELL_AUTO_CHECK) or "
+                      "use Calibration > Load Cell > Manual")
+    if reference_counts is None:
+        return None, (RAW_NO_REFERENCE,
+                      "the automatic load cell check has not run yet - run "
+                      "it on an empty bed (NEBULAOS_LOAD_CELL_AUTO_CHECK) "
+                      "or use Calibration > Load Cell > Manual")
     return ARM_RAW, profile
 
 
@@ -179,8 +275,8 @@ def raw_motion_refusal(profile_id):
     """(code, message) why raw_contact may not move, or None when allowed."""
     if not profile_id:
         return (RAW_NO_PROFILE,
-                "raw_contact mode has no hardware-qualified profile yet - "
-                "nozzle contact refused (use the calibrated load cell: "
+                "automatic load cell contact has no profile configured - "
+                "nozzle contact refused (use Manual: "
                 "NEBULAOS_LOAD_CELL_CALIBRATE)")
     if lookup_profile(profile_id) is None:
         return (RAW_UNKNOWN_PROFILE,

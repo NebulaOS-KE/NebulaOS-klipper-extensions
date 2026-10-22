@@ -66,11 +66,12 @@ modules:
 | **Z offset, contact and calibration** (BLTouch/CR-Touch stays the global probe; the load cell is a secondary contact reference) | |
 | `nebulaos_calibration` | `[nebulaos_calibration]` coordinator for the `NEBULAOS_*` calibration commands (Z offset, auto-calibrate sequence) |
 | `nebulaos_calibration_journal` | Persistent JSON journal of calibration workflow progress |
-| `nebulaos_load_cell_calibration` | Guided load-cell calibration with a weighed water bottle (G86) |
+| `nebulaos_load_cell_calibration` | Guided load-cell calibration with a weighed water bottle (G86); `NEBULAOS_LOAD_CELL_MODE` / `NEBULAOS_LOAD_CELL_AUTO_CHECK` (G99) |
+| `nebulaos_load_cell_mode` | The persisted load-cell contact choice auto (default) / manual and the last automatic check (G99, own JSON state file) |
 | `nebulaos_bed_tram` | Guided bed tramming, one corner instruction at a time (G87) |
 | `nebulaos_z_offset_probe` | Nozzle load cell (HX711) as a contact probe for Z-offset calibration only |
 | `nebulaos_probe_pair` | Pairs a BLTouch reading with a nozzle contact at the same point to derive the Z offset |
-| `nebulaos_raw_contact` | Weight-free load-cell contact detection (G83b). **Locked:** no qualified profile exists, so it refuses every nozzle-contact motion |
+| `nebulaos_raw_contact` | Weight-free (automatic) load-cell contact detection (G83b/G99): qualified profile `ke-stock-v1` (6400 counts, polarity -1), the per-mode arming rule for every touch |
 | `z_compensate` | Per-print auto Z offset, compatible with the stock `[z_compensate]` section |
 | `nozzle_clear` | Nozzle wipe routine using the load-cell contact probe |
 | **Power-loss recovery** | |

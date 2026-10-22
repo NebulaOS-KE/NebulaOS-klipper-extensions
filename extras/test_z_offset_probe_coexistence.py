@@ -169,8 +169,9 @@ class HostKlipperPristineTest(unittest.TestCase):
         source = _module_source()
         # plus NebulaOS's own pure, Klipper-free helper (G83b): it wraps or
         # patches no upstream code
+        # and (G99) the pure state-file helper for the user's load cell mode
         allowed_package = ('hx71x', 'load_cell', 'probe', 'trigger_analog',
-                           'nebulaos_raw_contact')
+                           'nebulaos_raw_contact', 'nebulaos_load_cell_mode')
         allowed_from = {'load_cell_probe'}
         for line in source.splitlines():
             stripped = line.strip()

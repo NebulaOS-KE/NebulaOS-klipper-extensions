@@ -437,5 +437,134 @@ class ReadCommandTest(unittest.TestCase):
         self.assertIn('1531 g', gcmd.responses[0])
 
 
+# ----------------------------------------------------------------------
+# G99: NEBULAOS_LOAD_CELL_MODE / NEBULAOS_LOAD_CELL_AUTO_CHECK + status
+# ----------------------------------------------------------------------
+class FakeModeProbe(FakeProbe):
+    """The probe's G99 surface (implemented and tested in
+    test_nebulaos_raw_contact.RawArmingTest)."""
+    def __init__(self, lc, mode='auto', check_result=(True, '')):
+        super().__init__(lc)
+        self.mode = mode
+        self.check = 'never'
+        self.reason = ''
+        self.ref = None
+        self.check_result = check_result
+        self.checks = 0
+
+    def set_load_cell_mode(self, mode):
+        self.mode = mode
+        return ''
+
+    def run_auto_check(self):
+        self.checks += 1
+        ok, reason = self.check_result
+        self.check = 'ok' if ok else 'failed'
+        self.reason = reason
+        self.ref = TARE if ok else None
+        return ok, reason
+
+    def auto_status(self):
+        return {'mode': self.mode, 'mode_choice': self.mode,
+                'auto_check': self.check, 'auto_check_reason': self.reason,
+                'auto_check_time': None, 'auto_ready': self.ref is not None,
+                'auto_profile': 'ke-stock-v1',
+                'auto_reference_counts': self.ref, 'mode_warning': None}
+
+
+def _build_mode(lc=None, **kw):
+    printer, gcode, obj = _build(lc or FakeLoadCell(),
+                                 print_state=kw.pop('print_state', 'standby'))
+    probe = FakeModeProbe(lc or obj._load_cell(), **kw)
+    printer.add_object('nebulaos_z_offset_probe', probe)
+    return printer, gcode, obj, probe
+
+
+class ModeCommandTest(unittest.TestCase):
+    def test_status_has_the_g99_fields(self):
+        printer, gcode, obj, probe = _build_mode()
+        st = obj.get_status(0.)
+        self.assertEqual(st['mode'], 'auto')
+        self.assertEqual(st['auto_check'], 'never')
+        self.assertEqual(st['auto_check_reason'], '')
+        self.assertIs(st['auto_ready'], False)
+
+    def test_status_without_a_probe_is_none_not_an_error(self):
+        printer, gcode, obj = _build(FakeLoadCell())
+        st = obj.get_status(0.)        # FakeProbe has no auto_status
+        self.assertIsNone(st['mode'])
+        self.assertIsNone(st['auto_ready'])
+
+    def test_set_and_report(self):
+        printer, gcode, obj, probe = _build_mode()
+        gcmd = fake.FakeGCmd({'MODE': 'Manual'})
+        obj.cmd_mode(gcmd)
+        self.assertEqual(probe.mode, 'manual')
+        self.assertEqual(obj.get_status(0.)['mode'], 'manual')
+        self.assertIn('MISSING', gcmd.responses[-1])      # no bottle yet
+        gcmd = fake.FakeGCmd({})
+        obj.cmd_mode(gcmd)
+        self.assertIn('manual', gcmd.responses[-1])
+        obj.cmd_mode(fake.FakeGCmd({'MODE': 'auto'}))
+        self.assertEqual(probe.mode, 'auto')
+
+    def test_bad_mode_is_refused(self):
+        printer, gcode, obj, probe = _build_mode()
+        with self.assertRaises(fake.CommandError):
+            obj.cmd_mode(fake.FakeGCmd({'MODE': 'raw'}))
+        self.assertEqual(probe.mode, 'auto')
+
+    def test_auto_check_ok(self):
+        printer, gcode, obj, probe = _build_mode()
+        gcmd = fake.FakeGCmd({})
+        obj.cmd_auto_check(gcmd)
+        st = obj.get_status(0.)
+        self.assertEqual((st['auto_check'], st['auto_ready']), ('ok', True))
+        self.assertIn('passed', gcmd.responses[-1])
+
+    def test_auto_check_failure_says_why_and_offers_manual(self):
+        printer, gcode, obj, probe = _build_mode(
+            check_result=(False, 'the sensor reading does not change at all'))
+        with self.assertRaises(fake.CommandError) as ctx:
+            obj.cmd_auto_check(fake.FakeGCmd({}))
+        self.assertIn('does not change', str(ctx.exception))
+        self.assertIn('Manual', str(ctx.exception))
+        st = obj.get_status(0.)
+        self.assertEqual((st['auto_check'], st['auto_ready']),
+                         ('failed', False))
+        self.assertIn('does not change', st['auto_check_reason'])
+
+    def test_auto_check_refused_while_printing_or_during_the_bottle_flow(self):
+        printer, gcode, obj, probe = _build_mode(print_state='printing')
+        with self.assertRaises(fake.CommandError):
+            obj.cmd_auto_check(fake.FakeGCmd({}))
+        lc = FakeLoadCell([_samples(TARE)])
+        printer, gcode, obj, probe = _build_mode(lc)
+        _cmd(obj)
+        with self.assertRaises(fake.CommandError):
+            obj.cmd_auto_check(fake.FakeGCmd({}))
+        self.assertEqual(probe.checks, 0)
+
+    def test_saving_a_bottle_calibration_selects_manual(self):
+        lc = FakeLoadCell([_samples(TARE), _samples(_weight(1500)),
+                           _samples(_weight(1500)), _samples(TARE)])
+        printer, gcode, obj, probe = _build_mode(lc)
+        _cmd(obj)
+        for params in ({'CHECK': 1}, {'WEIGH': 1}, {'NEXT': 1}, {'NEXT': 1},
+                       {'NEXT': 1}):
+            _cmd(obj, **params)
+        self.assertEqual(probe.mode, 'auto')        # not before Apply & Save
+        _cmd(obj, ACCEPT=1)
+        self.assertEqual(probe.mode, 'manual')
+        self.assertEqual(gcode.scripts_run[-1], 'SAVE_CONFIG')
+
+    def test_cancelled_bottle_flow_keeps_the_mode(self):
+        lc = FakeLoadCell([_samples(TARE)])
+        printer, gcode, obj, probe = _build_mode(lc)
+        _cmd(obj)
+        obj.cmd_cancel(fake.FakeGCmd({}))
+        self.assertEqual(probe.mode, 'auto')
+
+
 if __name__ == '__main__':
     unittest.main()

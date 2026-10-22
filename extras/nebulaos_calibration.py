@@ -606,12 +606,13 @@ class NebulaOSCalibration:
                 "NEBULAOS_Z_OFFSET_CALIBRATE: no [nebulaos_z_offset_probe] "
                 "is configured on this printer - use stock PROBE_CALIBRATE "
                 "instead, or add [nebulaos_z_offset_probe] to printer.cfg")
-        if not self._contact_ready(z_offset_probe):
-            self._offer_load_cell_calibration()
-            raise self.printer.command_error(
-                "NEBULAOS_Z_OFFSET_CALIBRATE: the load cell has not been "
-                "calibrated yet - run NEBULAOS_LOAD_CELL_CALIBRATE first, or "
-                "use stock PROBE_CALIBRATE instead")
+        # G99: automatic mode runs the no-motion automatic check here
+        # (inside NEBULAOS_AUTO_CALIBRATE its preflight already did).
+        self._require_contact(
+            z_offset_probe, 'NEBULAOS_Z_OFFSET_CALIBRATE',
+            "run NEBULAOS_LOAD_CELL_CALIBRATE first, or use stock "
+            "PROBE_CALIBRATE instead",
+            run_check=self.auto_calibrate_state != 'running')
 
         x, y = self._resolve_reference_xy(gcmd)
         probe_obj = self.printer.lookup_object('probe')
@@ -800,15 +801,48 @@ class NebulaOSCalibration:
                 self.reactor.monotonic())['is_calibrated']
         return ready(self._contact_caller())
 
+    def _load_cell_mode(self, z_offset_probe):
+        """'auto' | 'manual', or None for a probe without modes."""
+        mode = getattr(z_offset_probe, 'load_cell_mode', None)
+        return mode() if mode is not None else None
+
+    def _require_contact(self, z_offset_probe, cmd, manual_hint, run_check):
+        """The guard before any motion (G99). Automatic mode: run the
+        no-motion automatic check (run_check), then the plan must be raw;
+        a failure stops with the reason and offers Manual. Manual mode: the
+        bottle calibration must exist (popup offers it), as before."""
+        if self._load_cell_mode(z_offset_probe) == raw_contact.USER_AUTO:
+            if run_check:
+                self.gcode.respond_info(
+                    "%s: automatic load cell check (no motion - the bed "
+                    "must be empty)" % (cmd,))
+                ok, reason = z_offset_probe.run_auto_check()
+                if not ok:
+                    self._offer_manual_load_cell(reason)
+                    raise self.printer.command_error(
+                        "%s: the automatic load cell check failed - %s - use "
+                        "Calibration > Load Cell > Manual (bottle "
+                        "calibration)" % (cmd, reason))
+            kind, refusal = z_offset_probe.plan_arming(self._contact_caller())
+            if kind is None:
+                self._offer_manual_load_cell(refusal[1])
+                raise self.printer.command_error(
+                    "%s: automatic load cell contact is not ready - %s"
+                    % (cmd, refusal[1]))
+            return
+        if not self._contact_ready(z_offset_probe):
+            self._offer_load_cell_calibration()
+            raise self.printer.command_error(
+                "%s: the load cell has not been calibrated yet - %s"
+                % (cmd, manual_hint))
+
     def _z_offset_arming_kwargs(self, z_offset_probe):
-        """{'arming': plan} for THIS canonical paired path - the only caller
-        that may ever resolve to raw contact (G83b-auto); {} for a probe
-        without plan_arming (calibrated force, as before)."""
+        """{'arming': plan} for the paired Z-offset path (standalone or
+        inside auto-calibrate - G99: both follow the user's mode); {} for a
+        probe without plan_arming (calibrated force, as before)."""
         plan = getattr(z_offset_probe, 'plan_arming', None)
         if plan is None:
             return {}
-        # Inside NEBULAOS_AUTO_CALIBRATE the same step is a different
-        # caller: it never resolves to raw contact.
         return {'arming': plan(self._contact_caller())}
 
     # ------------------------------------------------------------------
@@ -884,8 +918,10 @@ class NebulaOSCalibration:
         self.raw_compare_result = None
         results = {}
         try:
+            # The calibrated half is armed explicitly: a touch without a
+            # plan follows the user's mode (G99), which may be automatic.
             for label, arming in (
-                    ('calibrated', None),
+                    ('calibrated', (raw_contact.ARM_CALIBRATED, None)),
                     ('raw', z_offset_probe.plan_arming(
                         raw_contact.CALLER_Z_OFFSET_PAIR, profile=candidate))):
                 m = nebulaos_probe_pair.measure_probe_nozzle_pair(
@@ -1103,11 +1139,12 @@ class NebulaOSCalibration:
                 raise self.printer.command_error(
                     "NEBULAOS_AUTO_CALIBRATE: no [nebulaos_z_offset_probe] "
                     "is configured on this printer")
-            if not self._contact_ready(z_offset_probe):
-                self._offer_load_cell_calibration()
-                raise self.printer.command_error(
-                    "NEBULAOS_AUTO_CALIBRATE: the load cell has not been "
-                    "calibrated yet - run NEBULAOS_LOAD_CELL_CALIBRATE first")
+            # G99: in automatic mode the no-motion automatic load cell
+            # check runs here, first, on the empty bed (a precondition of
+            # this sequence anyway) - a failure stops before any motion.
+            self._require_contact(
+                z_offset_probe, 'NEBULAOS_AUTO_CALIBRATE',
+                "run NEBULAOS_LOAD_CELL_CALIBRATE first", run_check=True)
             self._resolve_reference_xy(gcmd)
             self._auto_calibrate_check_cancel(journal, time.time())
 
@@ -1716,6 +1753,20 @@ class NebulaOSCalibration:
              "Calibrate it now? It takes about 2 minutes. You need a 1.5 L",
              "bottle of water and a kitchen scale. Nothing moves or heats."],
             [("Calibrate load cell", "NEBULAOS_LOAD_CELL_CALIBRATE"),
+             ("Use automatic", "NEBULAOS_LOAD_CELL_MODE MODE=auto"),
+             ("Close", "RESPOND TYPE=command MSG=action:prompt_end")])
+
+    def _offer_manual_load_cell(self, reason):
+        """G99: the automatic load cell check failed (or automatic contact
+        is not ready): say why and offer Manual (the bottle calibration)."""
+        self._send_action_prompt(
+            "Automatic load cell check failed",
+            ["The automatic nozzle touch sensor check did not pass:",
+             reason,
+             "Remove everything from the bed and try again, or use",
+             "Calibration > Load Cell > Manual (a 1.5 L bottle of water",
+             "and a kitchen scale, about 2 minutes)."],
+            [("Manual calibration", "NEBULAOS_LOAD_CELL_CALIBRATE"),
              ("Close", "RESPOND TYPE=command MSG=action:prompt_end")])
 
     def _verify_expected_values(self, expected):

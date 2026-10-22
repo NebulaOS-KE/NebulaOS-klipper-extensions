@@ -31,12 +31,22 @@
 # infrastructure); only the minimal ascent-collection and fit-analysis logic
 # is adapted here.
 #
+# G99 (Tim 2026-10-22): every touch follows the user's load cell mode -
+# automatic (raw ADC counts, qualified profile ke-stock-v1; the default) or
+# manual (the bottle calibration in grams). A caller without its own plan
+# (the nozzle clean) gets the plan for its mode here. Options (all with
+# defaults, none needed in the image cfg): raw_contact_profile_id
+# (ke-stock-v1), load_cell_mode_file (nebulaos_load_cell_mode.DEFAULT_PATH),
+# auto_check_time (2 s idle windows of the automatic check).
+#
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
 import logging
 import math
+import time
 from . import hx71x, load_cell, probe, trigger_analog
 from . import nebulaos_raw_contact as raw_contact
+from . import nebulaos_load_cell_mode as lc_mode
 from .load_cell_probe import (LCBestFit, _lookup_z_pos,
                                FIT_MIN_POINTS, ASCENT_DATA_WINDOW_SECONDS)
 
@@ -85,13 +95,14 @@ class ZOffsetProbe:
         self._best_fit = LCBestFit(self._printer)
 
         # G83b weight-free contact (docs/NEBULAOS_RAW_CONTACT_BRIEF.md in the
-        # firmware repo). Run 14 (G83b-auto): the default is 'auto' -
-        # resolved per caller by raw_contact.resolve_arming(): the unit's own
-        # grams calibration first, a QUALIFIED raw profile only for the
-        # canonical paired Z-offset path, otherwise a refusal. With
-        # QUALIFIED_PROFILES empty this is today's calibrated behaviour.
-        # Never write this option into the image-owned z_offset_probe.cfg:
-        # configfile refuses an autosaved option that an include also sets.
+        # firmware repo). G99 (Tim 2026-10-22): automatic contact is the
+        # default for everyone. contact_detection_mode 'auto' (default)
+        # follows the user's persisted choice auto|manual
+        # (nebulaos_load_cell_mode, NEBULAOS_LOAD_CELL_MODE);
+        # calibrated_force / raw_contact force manual / automatic (developer
+        # override). Never write this option into the image-owned
+        # z_offset_probe.cfg: configfile refuses an autosaved option that an
+        # include also sets.
         self._contact_mode = config.getchoice(
             'contact_detection_mode',
             {m: m for m in raw_contact.MODES}, raw_contact.MODE_AUTO)
@@ -110,12 +121,26 @@ class ZOffsetProbe:
         # for up to raw_settle_time; real sensor faults still refuse at once.
         self._raw_settle_time = config.getfloat(
             'raw_settle_time', default=5., minval=0.3, maxval=30.)
-        self._raw_profile_id = config.get('raw_contact_profile_id', None)
+        # G99: the qualified profile automatic contact uses (KE stock).
+        self._raw_profile_id = config.get('raw_contact_profile_id',
+                                          raw_contact.DEFAULT_PROFILE_ID)
         # Run 15: the persisted unloaded reference R for a unit WITHOUT a
         # grams calibration (brief 5.1.5), captured by
         # NEBULAOS_RAW_CONTACT_REFERENCE into the SAVE_CONFIG autosave
         # block. Never in an image-owned cfg (configfile include conflict).
+        # G99: superseded by the automatic check's reference (state file);
+        # still used when no automatic check has run.
         self._raw_reference = config.getint('raw_reference_counts', None)
+        # G99: the user's mode + the last automatic check (reference) in a
+        # small state file - no SAVE_CONFIG, no restart.
+        self._auto_check_time = config.getfloat(
+            'auto_check_time', default=2., minval=1., maxval=10.)
+        self._mode_path = config.get('load_cell_mode_file',
+                                     lc_mode.DEFAULT_PATH)
+        self._lc_state, self._mode_warning = lc_mode.read_state(
+            self._mode_path)
+        if self._mode_warning:
+            logging.warning("%s: %s", self._name, self._mode_warning)
         self._last_contact_rejection_reason = None
         self._last_raw_peak_delta_counts = None
         self._raw_diag = None
@@ -168,7 +193,8 @@ class ZOffsetProbe:
         """The arming for a touch by `caller`: (ARM_CALIBRATED, None),
         (ARM_RAW, profile) or a refusal (None, (code, message)). profile=
         is an explicit stage-C candidate (supervised comparison only); it
-        never comes from a registry lookup and needs the calibration."""
+        never comes from a registry lookup and needs the calibration.
+        G99: every caller follows the user's mode (resolve_arming)."""
         if profile is not None:
             problems = raw_contact.validate_profile(profile)
             if problems:
@@ -177,27 +203,46 @@ class ZOffsetProbe:
                 return None, (raw_contact.NOT_CALIBRATED,
                               "the comparison needs the calibrated load cell")
             return raw_contact.ARM_RAW, profile
-        # A persisted unloaded reference for uncalibrated units does not
-        # exist yet (brief 5.1.5): auto/raw cannot resolve to raw without one.
         return raw_contact.resolve_arming(
-            self._contact_mode, caller, self._load_cell.is_calibrated(),
+            self.load_cell_mode(), caller, self._load_cell.is_calibrated(),
             self._raw_profile_id,
-            reference_counts=self._raw_reference_counts())
+            reference_counts=self._auto_reference_counts(),
+            auto_check_failed=(self._lc_state['auto_check']
+                               == lc_mode.CHECK_FAILED))
 
     def contact_ready(self, caller):
         """The guard's predicate (brief E.1): may `caller` touch the bed?
-        True for the unit's grams calibration, or a qualified raw profile
-        plus a reference on the paired path. Never fakes is_calibrated."""
+        Manual: the unit's grams calibration. Automatic: the qualified
+        profile plus the reference of a passed automatic check. Never fakes
+        is_calibrated."""
         kind, _ = self.plan_arming(caller)
         return kind is not None
 
+    def load_cell_mode(self):
+        """'auto' | 'manual': what every touch follows right now."""
+        return raw_contact.effective_user_mode(self._contact_mode,
+                                               self._lc_state['mode'])
+
+    def _auto_reference_counts(self):
+        """The unloaded reference automatic contact is anchored to: the
+        last passed automatic check, else the older autosaved
+        raw_reference_counts; None after a failed check."""
+        check = self._lc_state['auto_check']
+        if check == lc_mode.CHECK_OK:
+            return self._lc_state['reference_counts']
+        if check == lc_mode.CHECK_FAILED:
+            return None
+        return self._raw_reference
+
     def _raw_reference_counts(self):
         """The independent unloaded reference the raw safety window is
-        anchored to (never the fresh tare): the calibration's zero, else the
-        persisted reference of an uncalibrated unit, else None (no raw)."""
-        if self._load_cell.is_calibrated():
+        anchored to (never the fresh tare): the automatic reference, else
+        the calibration's zero (the supervised comparison on a calibrated
+        unit), else None (no raw)."""
+        reference = self._auto_reference_counts()
+        if reference is None and self._load_cell.is_calibrated():
             return self._load_cell.get_reference_tare_counts()
-        return self._raw_reference
+        return reference
 
     def _refuse(self, code, message):
         self._last_contact_rejection_reason = code
@@ -224,14 +269,8 @@ class ZOffsetProbe:
         # a bed still settling must not become the zero (review note 1).
         toolhead = self._printer.lookup_object('toolhead')
         start = toolhead.get_last_move_time()
-        windows = max(1, int(round(self._raw_settle_time / self._raw_health_time)))
-        for window in range(windows):
-            stats, reasons = self._raw_health_window(profile, start)
-            start += self._raw_health_time
-            settling = [r for r in reasons
-                        if r.startswith(('drift_above_profile', 'noise_above_profile'))]
-            if not reasons or len(settling) != len(reasons):
-                break                      # calm, or a real sensor fault
+        stats, reasons, window = self._settled_idle(
+            profile, start, self._raw_health_time)
         self._raw_diag = dict(stats)
         self._raw_diag['reasons'] = list(reasons)
         self._raw_diag['settle_windows'] = window + 1
@@ -246,8 +285,10 @@ class ZOffsetProbe:
             self._refuse(raw_contact.RAW_REFERENCE_DRIFT,
                          "the empty reading moved %d counts from the reference "
                          "(limit %d) - something presses on the bed? nozzle "
-                         "contact refused" % (tare - reference,
-                                              profile['max_reference_drift_counts']))
+                         "contact refused (bed empty: run the automatic load "
+                         "cell check again, NEBULAOS_LOAD_CELL_AUTO_CHECK)"
+                         % (tare - reference,
+                            profile['max_reference_drift_counts']))
         safety_min = int(reference - profile['safety_counts'])
         safety_max = int(reference + profile['safety_counts'])
         sensor_min, sensor_max = self._sensor.get_range()
@@ -263,46 +304,58 @@ class ZOffsetProbe:
         self._active_profile = profile
         self._effective_mode = raw_contact.MODE_RAW
 
-    def _raw_health_window(self, profile, start):
+    def _settled_idle(self, profile, start, window_time):
+        """Consecutive idle windows of window_time from `start` until one is
+        calm, at most raw_settle_time: (stats, reasons, last window index).
+        Settling (drift or noise above the profile) is measured again; a
+        real sensor fault ends the loop at once (no waiting it out)."""
+        windows = max(1, int(math.ceil(self._raw_settle_time / window_time
+                                       - 1e-9)))
+        for window in range(windows):
+            stats, reasons = self._raw_health_window(profile, start,
+                                                     window_time)
+            start += window_time
+            settling = [r for r in reasons if r.startswith(
+                (raw_contact.DRIFT_ABOVE_PROFILE,
+                 raw_contact.NOISE_ABOVE_PROFILE))]
+            if not reasons or len(settling) != len(reasons):
+                break                      # calm, or a real sensor fault
+        return stats, reasons, window
+
+    def _raw_health_window(self, profile, start, window_time=None):
         """One idle window from `start` (print time): (stats, reasons)."""
+        if window_time is None:
+            window_time = self._raw_health_time
         collector = self._load_cell.get_collector()
         collector.start_collecting(min_time=start)
-        samples, errors = collector.collect_until(start + self._raw_health_time)
+        samples, errors = collector.collect_until(start + window_time)
         stats, reasons = raw_contact.validate_idle(
             samples, errors, self._load_cell.saturation_range(),
             profile['expected_sps'], profile['sps_tolerance'])
         if not reasons and stats['sigma'] > profile['max_idle_sigma']:
             # the trigger must sit 10x above the idle noise: a lower
             # TRIGGER_COUNTS is refused here (review note 4)
-            reasons.append('noise_above_profile (sigma %.0f counts, the '
-                           'trigger needs 10x that)' % (stats['sigma'],))
+            reasons.append('%s (sigma %.0f counts, the trigger needs 10x '
+                           'that)' % (raw_contact.NOISE_ABOVE_PROFILE,
+                                      stats['sigma']))
         if not reasons and stats['drift_per_s'] is not None and \
                 abs(stats['drift_per_s']) > profile['max_idle_drift_per_s']:
-            reasons.append('drift_above_profile')
+            reasons.append(raw_contact.DRIFT_ABOVE_PROFILE)
         return stats, reasons
 
     def _tare_and_arm(self, arming=None):
-        """arming: None (every existing caller: calibrated force, as before)
-        or a plan from plan_arming()."""
+        """arming: a plan from plan_arming(). None (a caller without its
+        own plan) resolves the plan here for a generic touch: G99 - every
+        touch follows the user's mode, the nozzle clean included."""
         self._active_profile = None
         self._effective_mode = None
-        if arming is not None:
-            kind, detail = arming
-            if kind is None:
-                self._refuse(detail[0], detail[1])
-            if kind == raw_contact.ARM_RAW:
-                return self._arm_raw(detail)
-        elif self._contact_mode == raw_contact.MODE_RAW:
-            refusal = raw_contact.raw_motion_refusal(self._raw_profile_id)
-            if refusal is None:
-                # A qualified profile exists - but stage B ships without the
-                # count-domain arming (stage C/D evidence decides its values).
-                refusal = ('raw_contact_arming_not_implemented',
-                           "raw_contact arming is not enabled in this "
-                           "version - nozzle contact refused")
-            self._last_contact_rejection_reason = refusal[0]
-            raise self._printer.command_error(
-                "%s: %s" % (self._name, refusal[1]))
+        if arming is None:
+            arming = self.plan_arming(raw_contact.CALLER_TOUCH)
+        kind, detail = arming
+        if kind is None:
+            self._refuse(detail[0], detail[1])
+        if kind == raw_contact.ARM_RAW:
+            return self._arm_raw(detail)
         if not self._load_cell.is_calibrated():
             raise self._printer.command_error(
                 "%s: load cell not calibrated — run LOAD_CELL_CALIBRATE"
@@ -482,7 +535,7 @@ class ZOffsetProbe:
         return z_contact
 
     def touch_probe(self, down_min_z, pro_cnt=1, minimum_allowed_z=None,
-                    arming=None):
+                    arming=None, caller=None):
         # down_min_z: positive depth below Z=0 (e.g. 10 means Z=-10).
         # Negate to get the target Z coordinate, then clamp to stepper limit.
         #
@@ -511,6 +564,10 @@ class ZOffsetProbe:
 
         # A raw plan is used only for this call: every touch re-arms and
         # clears the previous arming first, so nothing leaks into a later call.
+        # No plan from the caller (nozzle clean, ...): resolved once here
+        # from the user's mode, so every touch of this call arms alike.
+        if arming is None:
+            arming = self.plan_arming(caller or raw_contact.CALLER_TOUCH)
         for i in range(pro_cnt):
             self._tare_and_arm(arming)
 
@@ -549,6 +606,9 @@ class ZOffsetProbe:
         kind, _ = self.plan_arming(raw_contact.CALLER_Z_OFFSET_PAIR)
         return {
             'contact_detection_mode': self._contact_mode,
+            # G99: auto | manual, what every touch follows.
+            'load_cell_mode': self.load_cell_mode(),
+            'auto_check': self._lc_state['auto_check'],
             # The arming the last touch actually used.
             'effective_contact_mode': self._effective_mode,
             # Ready for nozzle contact on the canonical Z-offset path.
@@ -651,6 +711,123 @@ ZOffsetProbe.cmd_raw_contact_reference = _cmd_raw_contact_reference
 ZOffsetProbe.cmd_raw_contact_reference_help = (
     "No-motion: capture the empty-bed load cell reference for weight-free "
     "contact (G83b) and save it (SAVE_CONFIG). The bed must be empty.")
+
+
+# --- G99: the user's mode and the automatic check -------------------------
+# Appended like the reference capture above. The commands themselves
+# (NEBULAOS_LOAD_CELL_MODE / NEBULAOS_LOAD_CELL_AUTO_CHECK) and the status
+# the screen reads live in nebulaos_load_cell_calibration (Calibration >
+# Load Cell); NEBULAOS_AUTO_CALIBRATE and NEBULAOS_Z_OFFSET_CALIBRATE call
+# run_auto_check() directly.
+
+def _save_lc_state(self):
+    """Persist the mode + automatic check; '' or a warning (the live state
+    is kept either way - a failed write must not stop the printer)."""
+    try:
+        lc_mode.write_state(self._mode_path, self._lc_state)
+        self._mode_warning = ''
+    except Exception as e:
+        logging.exception("%s: cannot save %s", self._name, self._mode_path)
+        self._mode_warning = ("could not save %s (%s) - the choice is lost "
+                              "at the next Klipper restart"
+                              % (self._mode_path, e.__class__.__name__))
+    return self._mode_warning
+
+
+def _set_load_cell_mode(self, mode):
+    """auto | manual, persisted at once (no restart). Returns '' or a
+    warning (file not written)."""
+    if mode not in raw_contact.USER_MODES:
+        raise self._printer.command_error(
+            "%s: unknown load cell mode %r (auto or manual)" % (self._name, mode))
+    self._lc_state['mode'] = mode
+    return self._save_lc_state()
+
+
+def _run_auto_check(self):
+    """NO MOTION, empty bed: the automatic load cell check (G99).
+    Health window(s) against the qualified profile (sensor errors,
+    saturation, stuck signal, sample rate, noise, drift - settling is
+    measured again for up to raw_settle_time), then the median is stored as
+    the unloaded reference every automatic touch is anchored to. Never
+    tares, arms, moves or saves the Klipper config. Returns (ok, reason);
+    the result is persisted either way (a failure clears the reference:
+    automatic contact refuses until a check passes again)."""
+    profile = raw_contact.lookup_profile(self._raw_profile_id)
+    problems = (raw_contact.validate_profile(profile) if profile is not None
+                else ["no qualified profile %r" % (self._raw_profile_id,)])
+    if problems:
+        return self._record_auto_check(
+            False, "automatic contact is not available on this printer "
+            "(%s)" % ("; ".join(problems),))
+    toolhead = self._printer.lookup_object('toolhead')
+    start = toolhead.get_last_move_time()
+    stats, reasons, window = self._settled_idle(profile, start,
+                                                self._auto_check_time)
+    self._raw_diag = dict(stats)
+    self._raw_diag['reasons'] = list(reasons)
+    self._raw_diag['settle_windows'] = window + 1
+    self._raw_diag['settle_seconds'] = (window + 1) * self._auto_check_time
+    if reasons:
+        return self._record_auto_check(
+            False, "the load cell is not working properly: %s"
+            % (raw_contact.describe_idle_reasons(reasons),))
+    reference = int(stats['median'])
+    sensor_min, sensor_max = self._sensor.get_range()
+    if reference - profile['safety_counts'] <= sensor_min or \
+            reference + profile['safety_counts'] >= sensor_max:
+        return self._record_auto_check(
+            False, "the load cell reading is too close to its limit "
+            "(%d counts)" % (reference,))
+    return self._record_auto_check(True, '', reference)
+
+
+def _record_auto_check(self, ok, reason, reference=None):
+    self._lc_state.update({
+        'auto_check': lc_mode.CHECK_OK if ok else lc_mode.CHECK_FAILED,
+        'auto_check_reason': reason,
+        'reference_counts': reference if ok else None,
+        'checked_at': time.time(),
+        'profile_id': self._raw_profile_id,
+    })
+    if not ok:
+        self._last_contact_rejection_reason = raw_contact.RAW_AUTO_CHECK_FAILED
+    warning = self._save_lc_state()
+    logging.info("%s: automatic load cell check %s%s (reference %s)%s",
+                 self._name, "passed" if ok else "FAILED",
+                 "" if ok else ": " + reason, reference,
+                 " - " + warning if warning else "")
+    return ok, reason
+
+
+def _auto_status(self):
+    """The G99 fields of nebulaos_load_cell_calibration's status."""
+    auto_kind, _ = raw_contact.resolve_arming(
+        raw_contact.USER_AUTO, raw_contact.CALLER_TOUCH, False,
+        self._raw_profile_id, reference_counts=self._auto_reference_counts(),
+        auto_check_failed=(self._lc_state['auto_check']
+                           == lc_mode.CHECK_FAILED))
+    return {
+        'mode': self.load_cell_mode(),
+        # the persisted choice (differs from 'mode' only when the
+        # developer option contact_detection_mode forces one)
+        'mode_choice': self._lc_state['mode'],
+        'auto_check': self._lc_state['auto_check'],
+        'auto_check_reason': self._lc_state['auto_check_reason'],
+        'auto_check_time': self._lc_state['checked_at'],
+        # automatic contact can touch now (profile + passed check)
+        'auto_ready': auto_kind == raw_contact.ARM_RAW,
+        'auto_profile': self._raw_profile_id,
+        'auto_reference_counts': self._auto_reference_counts(),
+        'mode_warning': self._mode_warning or None,
+    }
+
+
+ZOffsetProbe._save_lc_state = _save_lc_state
+ZOffsetProbe.set_load_cell_mode = _set_load_cell_mode
+ZOffsetProbe.run_auto_check = _run_auto_check
+ZOffsetProbe._record_auto_check = _record_auto_check
+ZOffsetProbe.auto_status = _auto_status
 
 
 def load_config(config):

@@ -58,6 +58,7 @@ def wipe_bed_temp(bed_target, bed_add_temp, bed_max_temp=None):
     return temp
 
 from . import nozzle_clear
+from . import nebulaos_raw_contact as raw_contact
 
 
 #: Structured status contract, version 1 - see docs/z_compensate_status_api.md. Consumed by
@@ -367,6 +368,21 @@ class ZCompensate:
             "calibration_error": self.calibration_error,
         }
 
+    def _require_contact_ready(self, command_name):
+        """G99: the touches follow the user's load cell mode (automatic by
+        default, untested on the wipe pad - Tim's decision 2026-10-22).
+        Refuse BEFORE heating or moving when the touch would be refused
+        anyway (manual without the bottle calibration, automatic without a
+        passed automatic check). A probe without plan_arming: unchanged
+        (touch_probe() checks)."""
+        plan = getattr(self.z_offset_probe, 'plan_arming', None)
+        if plan is None:
+            return
+        kind, refusal = plan(raw_contact.CALLER_NOZZLE_CLEAN)
+        if kind is None:
+            raise self.printer.command_error(
+                "%s: nozzle contact refused - %s" % (command_name, refusal[1]))
+
     cmd_nozzle_clear_help = "Wipe the nozzle before Z-offset calibration"
 
     def cmd_nozzle_clear(self, gcmd):
@@ -379,6 +395,7 @@ class ZCompensate:
         HX711/LoadCell/trigger_analog/LCBestFit) for Z positioning on the wipe pad.
         [prtouch_v2] is no longer a dependency of this command or module."""
         self._require_load_cell('_NEBULAOS_NOZZLE_CLEAN')
+        self._require_contact_ready('_NEBULAOS_NOZZLE_CLEAN')
         hot_start_temp = gcmd.get_float('HOT_START_TEMP', self.hot_start_temp)
         hot_rub_temp = gcmd.get_float('HOT_RUB_TEMP', self.hot_rub_temp)
         hot_end_temp = gcmd.get_float('HOT_END_TEMP', self.hot_end_temp)

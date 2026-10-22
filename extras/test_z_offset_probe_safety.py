@@ -304,8 +304,11 @@ class ArchitectureInvariantsTest(unittest.TestCase):
         # Upstream modules, plus NebulaOS's own pure, Klipper-free helper
         # for weight-free contact detection (G83b) - no upstream core is
         # wrapped or patched through it.
+        # wrapped or patched through it; G99: the pure state-file helper
+        # for the user's load cell mode (auto|manual).
         allowed_package_imports = ('hx71x', 'load_cell', 'probe',
-                                   'trigger_analog', 'nebulaos_raw_contact')
+                                   'trigger_analog', 'nebulaos_raw_contact',
+                                   'nebulaos_load_cell_mode')
         allowed_from_imports = {
             'load_cell_probe': ('LCBestFit', '_lookup_z_pos',
                                 'FIT_MIN_POINTS',
