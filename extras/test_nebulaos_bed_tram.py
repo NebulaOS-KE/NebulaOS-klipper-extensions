@@ -284,6 +284,48 @@ class SignedDeviationTest(TramTestBase):
             'Front left: -0.23 mm. Add a 0.20 mm shim to raise it.'))
 
 
+class BusyTest(TramTestBase):
+    """G91: 'busy' while a guided flow runs or waits for the user."""
+    def test_busy_while_waiting_for_mount_and_adjustment(self):
+        obj, gcode, tilt = self.build([[0.0, 0.3, 0.3, 0.3],
+                                       [0.3, 0.3, 0.3, 0.3]])
+        self.assertFalse(obj.get_status(0.)['busy'])
+        self.tram_cmd(obj)
+        self.assertEqual(obj.state, tram.AWAITING_MOUNT)
+        self.assertTrue(obj.get_status(0.)['busy'])
+        self.tram_cmd(obj, MOUNT='rigid')
+        self.assertEqual(obj.state, tram.AWAITING_ADJUSTMENT)
+        self.assertTrue(obj.get_status(0.)['busy'])
+        self.tram_cmd(obj, CONFIRM=1)
+        self.assertEqual(obj.state, tram.COMPLETE)
+        self.assertFalse(obj.get_status(0.)['busy'])
+
+    def test_busy_while_measuring(self):
+        obj, gcode, tilt = self.build([[0.0, 0.0, 0.0, 0.0]], mount='rigid')
+        seen = []
+        measure = tilt.measure
+
+        def spy():
+            seen.append(obj.get_status(0.)['busy'])
+            measure()
+        tilt.measure = spy
+        self.tram_cmd(obj)
+        self.assertEqual(seen, [True])
+        self.assertFalse(obj.get_status(0.)['busy'])
+
+    def test_not_busy_after_cancel_or_stop(self):
+        obj, gcode, tilt = self.build([[0.0, 0.3, 0.3, 0.3]] * 4,
+                                      mount='rigid')
+        self.tram_cmd(obj)
+        obj.cmd_cancel(fake.FakeGCmd({}))
+        self.assertFalse(obj.get_status(0.)['busy'])
+        self.tram_cmd(obj)
+        self.tram_cmd(obj, CONFIRM=1)
+        self.tram_cmd(obj, CONFIRM=1)
+        self.assertEqual(obj.state, tram.STOPPED)
+        self.assertFalse(obj.get_status(0.)['busy'])
+
+
 class SessionTest(TramTestBase):
     def test_mount_is_asked_once_and_remembered(self):
         obj, gcode, tilt = self.build([[0.0, 0.0, 0.0, 0.0]])

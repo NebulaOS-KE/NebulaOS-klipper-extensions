@@ -76,6 +76,14 @@ from . import nebulaos_calibration_journal as calibration_journal
 _MAX_ERROR_LEN = 200
 
 
+# G91: states in which a guided flow is running, committing (restart
+# pending) or waiting for the user - get_status()['busy'].
+BUSY_STATES = frozenset((
+    'running', 'commit_requested', 'restart_pending', 'verification_pending',
+    'awaiting_continue', 'awaiting_measurement', 'awaiting_confirmation',
+    'awaiting_x_mount', 'awaiting_y_mount'))
+
+
 def _sanitize_error(exc):
     """Same convention as z_compensate.py's own _sanitize_calibration_error
     - str() on a Klipper error never includes a traceback/repr, so this
@@ -522,8 +530,15 @@ class NebulaOSCalibration:
                 "specify X=<pos> Y=<pos> explicitly")
         return zc.home_x, zc.home_y
 
+    def busy(self):
+        return any(state in BUSY_STATES for state in (
+            self.z_offset_state, self.raw_compare_state,
+            self.bootstrap_sim_state, self.auto_calibrate_state,
+            self.esteps_state, self.input_shaper_state))
+
     def get_status(self, eventtime):
         return {
+            'busy': self.busy(),
             'z_offset_state': self.z_offset_state,
             'z_offset_id': self.z_offset_id,
             'z_offset_result': self.z_offset_result,

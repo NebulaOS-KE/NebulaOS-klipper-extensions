@@ -397,6 +397,31 @@ class SessionTest(unittest.TestCase):
         self.assertEqual((st['min_grams'], st['max_grams']), (1000, 5000))
 
 
+class BusyTest(unittest.TestCase):
+    """G91: 'busy' while a guided flow runs or waits for the user."""
+    def test_busy_through_the_flow_until_saved(self):
+        lc = FakeLoadCell([_samples(TARE), _samples(_weight(1500)),
+                           _samples(_weight(1500)), _samples(TARE)])
+        printer, gcode, obj = _build(lc)
+        self.assertFalse(obj.get_status(0.)['busy'])
+        _cmd(obj)
+        self.assertTrue(obj.get_status(0.)['busy'])
+        for params in ({'CHECK': 1}, {'WEIGH': 1}, {'NEXT': 1}, {'NEXT': 1},
+                       {'NEXT': 1}):
+            _cmd(obj, **params)
+            self.assertTrue(obj.get_status(0.)['busy'], obj.state)
+        self.assertEqual(obj.state, lcc.AWAITING_CONFIRMATION)
+        _cmd(obj, ACCEPT=1)
+        self.assertEqual(obj.state, lcc.COMPLETE)
+        self.assertFalse(obj.get_status(0.)['busy'])
+
+    def test_not_busy_after_cancel(self):
+        lc, gcode, obj = _up_to_weight([_samples(_weight(1531))])
+        self.assertTrue(obj.get_status(0.)['busy'])
+        obj.cmd_cancel(fake.FakeGCmd({}))
+        self.assertFalse(obj.get_status(0.)['busy'])
+
+
 class ReadCommandTest(unittest.TestCase):
     def test_read_needs_a_calibration(self):
         printer, gcode, obj = _build(FakeLoadCell())

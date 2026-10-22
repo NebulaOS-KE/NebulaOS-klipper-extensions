@@ -146,6 +146,8 @@ class NebulaOSLoadCellCalibration:
         return {
             'id': self.run_id,
             'state': self.state,
+            # G91: a guided flow is running or waiting for the user.
+            'busy': self.state in ACTIVE,
             'error': self.error,
             'problem': self.problem,
             'calibrated': self._calibrated(),

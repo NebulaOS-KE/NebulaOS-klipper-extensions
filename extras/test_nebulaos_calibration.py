@@ -2417,5 +2417,52 @@ class AutoCalibrateMeshBeforeLiveOffsetTest(unittest.TestCase):
         self.assertAlmostEqual(probe_obj.probe_offsets.z_offset, 1.795)
 
 
+class BusyTest(unittest.TestCase):
+    """G91: get_status()['busy'] while any guided flow runs or waits."""
+    FLOWS = ('z_offset_state', 'raw_compare_state', 'bootstrap_sim_state',
+             'auto_calibrate_state', 'esteps_state', 'input_shaper_state')
+
+    def test_idle_is_not_busy(self):
+        printer, gcode, coord = _build()
+        self.assertIs(coord.get_status(0.)['busy'], False)
+
+    def test_each_flow_running_or_waiting_is_busy(self):
+        for attr in self.FLOWS:
+            for state in ('running', 'awaiting_continue',
+                          'awaiting_measurement', 'awaiting_confirmation',
+                          'awaiting_x_mount', 'awaiting_y_mount',
+                          'commit_requested'):
+                printer, gcode, coord = _build()
+                setattr(coord, attr, state)
+                self.assertIs(coord.get_status(0.)['busy'], True,
+                              (attr, state))
+
+    def test_finished_flows_are_not_busy(self):
+        for state in ('idle', 'complete', 'error', 'cancelled',
+                      'capability_unqualified',
+                      'measurement_quality_failure'):
+            printer, gcode, coord = _build()
+            for attr in self.FLOWS:
+                setattr(coord, attr, state)
+            self.assertIs(coord.get_status(0.)['busy'], False, state)
+
+    def test_busy_during_auto_calibrate_and_not_after_a_failure(self):
+        tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        printer, gcode, coord = _build_auto_calibrate(
+            FakeZOffsetProbe(is_calibrated=True), FakeProbeObj(),
+            config_overrides={'journal_path': os.path.join(tmpdir, 'j.json')})
+        seen = []
+
+        def nozzle_clean(gcmd):
+            seen.append(coord.get_status(0.)['busy'])
+            raise fake.CommandError("_NEBULAOS_NOZZLE_CLEAN: failed")
+        gcode.commands['_NEBULAOS_NOZZLE_CLEAN'] = nozzle_clean
+        with self.assertRaises(fake.CommandError):
+            coord.cmd_auto_calibrate(fake.FakeGCmd({}))
+        self.assertEqual(seen, [True])
+        self.assertIs(coord.get_status(0.)['busy'], False)
+
+
 if __name__ == '__main__':
     unittest.main()
