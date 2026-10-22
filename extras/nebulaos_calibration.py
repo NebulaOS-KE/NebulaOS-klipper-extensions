@@ -65,6 +65,7 @@
 # section and calibrate_start/end_x/y geometry remain untouched.
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
+import logging
 import math
 import time
 
@@ -740,10 +741,27 @@ class NebulaOSCalibration:
             % (new_offset, measurement.raw_probe_trigger_z,
                measurement.raw_nozzle_contact_z, x, y))
         if self.auto_calibrate_state != 'running':
+            try:
+                self._reset_z_adjust()
+            except Exception as e:
+                self.z_offset_state = 'error'
+                self.z_offset_error = _sanitize_error(e)
+                raise
             self.gcode.respond_info(
                 "NEBULAOS_Z_OFFSET_CALIBRATE: committing with SAVE_CONFIG, "
                 "printer will restart")
             self.gcode.run_script_from_command('SAVE_CONFIG')
+
+    def _z_adjust(self):
+        # [nebulaos_z_adjust] is optional: an older printer.cfg has none.
+        return self.printer.lookup_object('nebulaos_z_adjust', None)
+
+    def _reset_z_adjust(self):
+        """A new z_offset is about to be saved: the saved Z offset
+        adjustment (G92) was made against the old one -> 0 (file + live)."""
+        z_adjust = self._z_adjust()
+        if z_adjust is not None:
+            z_adjust.reset_for_calibration()
 
     def _contact_caller(self):
         return (raw_contact.CALLER_AUTO_CALIBRATE
@@ -1078,6 +1096,10 @@ class NebulaOSCalibration:
             run('M140 S%.1f' % (self.pid_bed_target,))
 
             self._auto_calibrate_advance(journal, 'nozzle_clean', time.time())
+            # C5: the wipe/press depth follows the live gcode Z offset - a
+            # saved Z offset adjustment (or any other) must not shift it.
+            # Live only; the saved adjustment is left alone here.
+            run('SET_GCODE_OFFSET Z=0 MOVE=0')
             run('_NEBULAOS_NOZZLE_CLEAN')
             self._auto_calibrate_check_cancel(journal, time.time())
 
@@ -1127,6 +1149,7 @@ class NebulaOSCalibration:
             }
             self._auto_calibrate_check_cancel(journal, time.time())
 
+            self._reset_z_adjust()
             calibration_journal.mark_commit_requested(
                 journal, expected_values, time.time())
             calibration_journal.write_journal(journal, path=self.journal_path)
@@ -1174,6 +1197,15 @@ class NebulaOSCalibration:
                 calibration_journal.mark_error(
                     journal, self.auto_calibrate_error, time.time())
                 calibration_journal.write_journal(journal, path=self.journal_path)
+            # The live Z offset was zeroed for the nozzle clean (C5): give
+            # the user's saved adjustment back.
+            z_adjust = self._z_adjust()
+            if z_adjust is not None:
+                try:
+                    z_adjust.apply_saved()
+                except Exception:
+                    logging.exception("nebulaos_calibration: could not "
+                                      "re-apply the Z offset adjustment")
             raise
 
     cmd_calibration_cancel_help = (

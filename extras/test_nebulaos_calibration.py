@@ -947,19 +947,21 @@ class AutoCalibrateTest(unittest.TestCase):
 
         script_names = [s.split()[0] for s in gcode.scripts_run]
         self.assertEqual(script_names, [
-            'G28', 'M140', '_NEBULAOS_NOZZLE_CLEAN',
+            'G28', 'M140', 'SET_GCODE_OFFSET', '_NEBULAOS_NOZZLE_CLEAN',
             'M104', 'M190', 'M109', 'G4',
             '_NEBULAOS_Z_OFFSET_CALIBRATE', 'BED_MESH_CALIBRATE',
             'SAVE_CONFIG',
         ])
         self.assertNotIn('PID_CALIBRATE', script_names)
+        # C5: live gcode Z offset zeroed (not moved) before the nozzle clean.
+        self.assertEqual(gcode.scripts_run[2], 'SET_GCODE_OFFSET Z=0 MOVE=0')
         # Bed preheated before nozzle_clean; establish_thermal_state
         # confirms exact temps (nozzle at z_offset_reference_temp 150C,
         # bed at pid_bed_target 65C).
         self.assertEqual(gcode.scripts_run[1], 'M140 S65.0')
-        self.assertEqual(gcode.scripts_run[3], 'M104 S150.0')
-        self.assertEqual(gcode.scripts_run[4], 'M190 S65.0')
-        self.assertEqual(gcode.scripts_run[5], 'M109 S150.0')
+        self.assertEqual(gcode.scripts_run[4], 'M104 S150.0')
+        self.assertEqual(gcode.scripts_run[5], 'M190 S65.0')
+        self.assertEqual(gcode.scripts_run[6], 'M109 S150.0')
 
         journal = calibration_journal.read_journal(path=self.journal_path)
         self.assertEqual(journal['state'], calibration_journal.STATE_COMMIT_REQUESTED)
@@ -988,7 +990,8 @@ class AutoCalibrateTest(unittest.TestCase):
             coord.cmd_auto_calibrate(fake.FakeGCmd({}))
         script_names = [s.split()[0] for s in gcode.scripts_run]
         self.assertEqual(
-            script_names, ['G28', 'M140', '_NEBULAOS_NOZZLE_CLEAN'])
+            script_names,
+            ['G28', 'M140', 'SET_GCODE_OFFSET', '_NEBULAOS_NOZZLE_CLEAN'])
         self.assertNotIn('PID_CALIBRATE', script_names)
         journal = calibration_journal.read_journal(path=self.journal_path)
         self.assertEqual(journal['state'], calibration_journal.STATE_ERROR)
@@ -2230,6 +2233,119 @@ class RawContactCompareTest(unittest.TestCase):
                          (raw_contact.CALLER_Z_OFFSET_PAIR, None))
         self.assertEqual(self.calls[0]['arming'],
                          (raw_contact.ARM_CALIBRATED, None))
+
+
+class FakeZAdjust:
+    """Stands in for [nebulaos_z_adjust]: records its calls into the same
+    gcode script list, so the tests see the order against SAVE_CONFIG."""
+    def __init__(self, gcode, fail=False):
+        self.gcode = gcode
+        self.fail = fail
+        self.calls = []
+
+    def reset_for_calibration(self):
+        self.calls.append('reset')
+        self.gcode.scripts_run.append('<z_adjust reset>')
+        if self.fail:
+            raise fake.CommandError("NEBULAOS_Z_ADJUST: NOT saved")
+
+    def apply_saved(self, move=False):
+        self.calls.append('apply')
+        self.gcode.scripts_run.append('<z_adjust apply>')
+
+
+class ZAdjustResetTest(unittest.TestCase):
+    """G92: a new z_offset resets the saved Z offset adjustment to 0 before
+    the SAVE_CONFIG that commits it - standalone and inside auto-calibrate."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.journal_path = os.path.join(self.tmpdir, 'journal.json')
+        orig = nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair
+        nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = \
+            _stub_pair(probe_trigger_z=2.5, nozzle_contact_z=0.831)
+        self.addCleanup(
+            setattr, nebulaos_calibration.nebulaos_probe_pair,
+            'measure_probe_nozzle_pair', orig)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _standalone(self, fail=False):
+        printer, gcode, coord = _build(
+            FakeZOffsetProbe(is_calibrated=True), FakeProbeObj(),
+            FakeZCompensate(home_x=20., home_y=25.))
+        z_adjust = FakeZAdjust(gcode, fail=fail)
+        printer.add_object('nebulaos_z_adjust', z_adjust)
+        return printer, gcode, coord, z_adjust
+
+    def _auto(self, nozzle_clean_ok=True):
+        printer, gcode, coord = _build_auto_calibrate(
+            FakeZOffsetProbe(is_calibrated=True), FakeProbeObj(z_offset=1.795),
+            config_overrides={'journal_path': self.journal_path})
+
+        def nozzle_clean(gcmd):
+            if not nozzle_clean_ok:
+                raise fake.CommandError("_NEBULAOS_NOZZLE_CLEAN: failed")
+        gcode.commands['_NEBULAOS_NOZZLE_CLEAN'] = nozzle_clean
+        z_adjust = FakeZAdjust(gcode)
+        printer.add_object('nebulaos_z_adjust', z_adjust)
+        return printer, gcode, coord, z_adjust
+
+    def test_standalone_resets_before_save_config(self):
+        printer, gcode, coord, z_adjust = self._standalone()
+        coord.cmd_z_offset_calibrate(fake.FakeGCmd({}))
+        self.assertEqual(z_adjust.calls, ['reset'])
+        self.assertEqual(gcode.scripts_run[-2:],
+                         ['<z_adjust reset>', 'SAVE_CONFIG'])
+
+    def test_standalone_without_z_adjust_still_saves(self):
+        printer, gcode, coord = _build(
+            FakeZOffsetProbe(is_calibrated=True), FakeProbeObj(),
+            FakeZCompensate(home_x=20., home_y=25.))
+        coord.cmd_z_offset_calibrate(fake.FakeGCmd({}))
+        self.assertEqual(gcode.scripts_run, ['SAVE_CONFIG'])
+
+    def test_standalone_stops_before_save_config_if_reset_fails(self):
+        printer, gcode, coord, z_adjust = self._standalone(fail=True)
+        with self.assertRaises(fake.CommandError):
+            coord.cmd_z_offset_calibrate(fake.FakeGCmd({}))
+        self.assertNotIn('SAVE_CONFIG', gcode.scripts_run)
+        self.assertEqual(coord.z_offset_state, 'error')
+
+    def test_rejected_measurement_keeps_the_adjustment(self):
+        printer, gcode, coord, z_adjust = self._standalone()
+        nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = \
+            lambda printer_, x, y, *a, **kw: _rejected_measurement(x, y)
+        with self.assertRaises(fake.CommandError):
+            coord.cmd_z_offset_calibrate(fake.FakeGCmd({}))
+        self.assertEqual(z_adjust.calls, [])
+
+    def test_auto_calibrate_resets_once_before_save_config(self):
+        printer, gcode, coord, z_adjust = self._auto()
+        with self.assertRaises(RestartTriggered):
+            coord.cmd_auto_calibrate(fake.FakeGCmd({}))
+        self.assertEqual(z_adjust.calls, ['reset'])
+        names = [s.split()[0] for s in gcode.scripts_run]
+        self.assertEqual(names[-3:],
+                         ['BED_MESH_CALIBRATE', '<z_adjust', 'SAVE_CONFIG'])
+
+    def test_auto_calibrate_zeroes_live_offset_before_nozzle_clean(self):
+        # C5: live only - the saved adjustment is not touched there.
+        printer, gcode, coord, z_adjust = self._auto()
+        with self.assertRaises(RestartTriggered):
+            coord.cmd_auto_calibrate(fake.FakeGCmd({}))
+        i = gcode.scripts_run.index('_NEBULAOS_NOZZLE_CLEAN')
+        self.assertEqual(gcode.scripts_run[i - 1],
+                         'SET_GCODE_OFFSET Z=0 MOVE=0')
+        self.assertLess(i, gcode.scripts_run.index('<z_adjust reset>'))
+
+    def test_failed_auto_calibrate_gives_the_saved_adjustment_back(self):
+        printer, gcode, coord, z_adjust = self._auto(nozzle_clean_ok=False)
+        with self.assertRaises(fake.CommandError):
+            coord.cmd_auto_calibrate(fake.FakeGCmd({}))
+        self.assertEqual(z_adjust.calls, ['apply'])
+        self.assertEqual(gcode.scripts_run[-1], '<z_adjust apply>')
 
 
 if __name__ == '__main__':
