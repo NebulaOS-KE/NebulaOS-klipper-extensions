@@ -991,7 +991,8 @@ class AutoCalibrateTest(unittest.TestCase):
         script_names = [s.split()[0] for s in gcode.scripts_run]
         self.assertEqual(
             script_names,
-            ['G28', 'M140', 'SET_GCODE_OFFSET', '_NEBULAOS_NOZZLE_CLEAN'])
+            ['G28', 'M140', 'SET_GCODE_OFFSET', '_NEBULAOS_NOZZLE_CLEAN',
+             'TURN_OFF_HEATERS'])   # the bed was heating: off again
         self.assertNotIn('PID_CALIBRATE', script_names)
         journal = calibration_journal.read_journal(path=self.journal_path)
         self.assertEqual(journal['state'], calibration_journal.STATE_ERROR)
@@ -2415,6 +2416,7 @@ class LoadCellModeTest(unittest.TestCase):
         self.assertNotIn('_NEBULAOS_Z_OFFSET_CALIBRATE', names)
         self.assertNotIn('BED_MESH_CALIBRATE', names)
         self.assertNotIn('SAVE_CONFIG', names)
+        self.assertIn('TURN_OFF_HEATERS', names)      # heated for the soak: off again
         self.assertEqual(self.calls, [])               # no touch
         self.assertEqual(coord.auto_calibrate_state, 'error')
         journal = calibration_journal.read_journal(

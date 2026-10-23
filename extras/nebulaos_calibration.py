@@ -1151,6 +1151,7 @@ class NebulaOSCalibration:
         def run(script):
             self.gcode.run_script_from_command(script)
 
+        heated = [False]
         try:
             # preflight: the same load-cell/reference-point checks
             # cmd_z_offset_calibrate() already performs, run up front so a
@@ -1177,6 +1178,7 @@ class NebulaOSCalibration:
             self._auto_calibrate_check_cancel(journal, time.time())
 
             # Start bed heating early so it soaks during nozzle_clean.
+            heated[0] = True
             run('M140 S%.1f' % (self.pid_bed_target,))
 
             self._auto_calibrate_advance(journal, 'nozzle_clean', time.time())
@@ -1293,6 +1295,15 @@ class NebulaOSCalibration:
                 calibration_journal.mark_error(
                     journal, self.auto_calibrate_error, time.time())
                 calibration_journal.write_journal(journal, path=self.journal_path)
+            # Run 18 architect note: a failed or cancelled run must not leave
+            # the bed/nozzle heating until idle_timeout (wasted heat, and the
+            # NebulaOS busy check reports ACTIVE, blocking restarts/updates).
+            try:
+                if heated[0]:
+                    self.gcode.run_script_from_command("TURN_OFF_HEATERS")
+            except Exception:
+                logging.exception("nebulaos_calibration: could not turn "
+                                  "the heaters off after a failed run")
             # The live Z offset was zeroed for the nozzle clean (C5): give
             # the user's saved adjustment back.
             z_adjust = self._z_adjust()
