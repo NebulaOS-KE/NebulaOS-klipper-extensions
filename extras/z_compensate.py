@@ -383,6 +383,24 @@ class ZCompensate:
             raise self.printer.command_error(
                 "%s: nozzle contact refused - %s" % (command_name, refusal[1]))
 
+    def _hot_reference_refresher(self, command_name):
+        """G99: a callable that refreshes the automatic empty-bed reference
+        after the heating, right before the first touch (the drift check
+        must compare against a hot reference, not the cold check's), or
+        None (manual mode, or a probe without modes)."""
+        refresh = getattr(self.z_offset_probe, 'refresh_auto_reference', None)
+        if refresh is None:
+            return None
+
+        def run():
+            ok, reason = refresh()
+            if not ok:
+                raise self.printer.command_error(
+                    "%s: the automatic load cell check before the first "
+                    "touch failed - %s - use Calibration > Load Cell > "
+                    "Manual (bottle calibration)" % (command_name, reason))
+        return run
+
     cmd_nozzle_clear_help = "Wipe the nozzle before Z-offset calibration"
 
     def cmd_nozzle_clear(self, gcmd):
@@ -409,7 +427,9 @@ class ZCompensate:
             self.native_clear_nozzle_config,
             hot_start_temp, hot_rub_temp,
             wipe_bed_temp(bed_target, bed_add_temp, bed_max),
-            hot_end_temp=hot_end_temp)
+            hot_end_temp=hot_end_temp,
+            before_first_touch=self._hot_reference_refresher(
+                '_NEBULAOS_NOZZLE_CLEAN'))
 
     cmd_z_offset_calibration_help = (
         "Internal: one load-cell nozzle-touch reading, applied as this "

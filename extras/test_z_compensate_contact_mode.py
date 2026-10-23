@@ -17,11 +17,23 @@ from . import z_compensate
 
 
 class ModeProbe(fake.FakeZOffsetProbe):
-    def __init__(self, mode, calibrated=False, reference=None, failed=False):
+    def __init__(self, mode, calibrated=False, reference=None, failed=False,
+                 refresh_ok=True):
         super().__init__()
         self.mode, self.calibrated = mode, calibrated
         self.reference, self.failed = reference, failed
         self.plans = []
+        self.refresh_ok = refresh_ok
+        self.refreshes = 0
+
+    def refresh_auto_reference(self):
+        self.refreshes += 1
+        if self.mode != 'auto':
+            return True, ''
+        if self.refresh_ok:
+            return True, ''
+        self.failed = True
+        return False, 'the sensor reading does not change at all'
 
     def plan_arming(self, caller, profile=None):
         self.plans.append(caller)
@@ -89,6 +101,30 @@ class NozzleCleanFollowsTheModeTest(unittest.TestCase):
         msg = self._refused(ModeProbe('manual', calibrated=False,
                                       reference=-240426))
         self.assertIn('NEBULAOS_LOAD_CELL_CALIBRATE', msg)
+
+    def test_the_reference_is_refreshed_hot_before_the_first_touch(self):
+        probe = ModeProbe('auto', reference=-240426)
+        clear = self._run(probe)
+        refresh = clear.call_args.kwargs['before_first_touch']
+        self.assertEqual(probe.refreshes, 0)   # not before the heating
+        refresh()
+        self.assertEqual(probe.refreshes, 1)
+
+    def test_a_failed_hot_refresh_stops_with_the_manual_offer(self):
+        probe = ModeProbe('auto', reference=-240426, refresh_ok=False)
+        refresh = self._run(probe).call_args.kwargs['before_first_touch']
+        with self.assertRaises(fake.CommandError) as ctx:
+            refresh()
+        self.assertIn('does not change', str(ctx.exception))
+        self.assertIn('Manual', str(ctx.exception))
+
+    def test_clear_nozzle_refreshes_after_heating_before_touching(self):
+        import inspect
+        from . import nozzle_clear
+        src = inspect.getsource(nozzle_clear.clear_nozzle)
+        call = src.index('before_first_touch()')
+        self.assertLess(src.index('wait=True'), call)          # heated
+        self.assertLess(call, src.index('src_pos[2] = _touch_probe_no_mesh'))
 
     def test_a_probe_without_modes_is_unchanged(self):
         printer, zc = _build(fake.FakeZOffsetProbe())

@@ -607,7 +607,8 @@ class NebulaOSCalibration:
                 "is configured on this printer - use stock PROBE_CALIBRATE "
                 "instead, or add [nebulaos_z_offset_probe] to printer.cfg")
         # G99: automatic mode runs the no-motion automatic check here
-        # (inside NEBULAOS_AUTO_CALIBRATE its preflight already did).
+        # (inside NEBULAOS_AUTO_CALIBRATE: the cold preflight check, then
+        # the hot refresh right before this step - _refresh_hot_reference).
         self._require_contact(
             z_offset_probe, 'NEBULAOS_Z_OFFSET_CALIBRATE',
             "run NEBULAOS_LOAD_CELL_CALIBRATE first, or use stock "
@@ -835,6 +836,29 @@ class NebulaOSCalibration:
             raise self.printer.command_error(
                 "%s: the load cell has not been calibrated yet - %s"
                 % (cmd, manual_hint))
+
+    def _refresh_hot_reference(self, z_offset_probe, cmd, run):
+        """G99, automatic mode only: lift the nozzle to horizontal_move_z
+        (clear of the bed and the wipe pad), then the no-motion automatic
+        check again at the current (hot) temperature. A failure stops with
+        the reason and offers Manual, like the cold check."""
+        if self._load_cell_mode(z_offset_probe) != raw_contact.USER_AUTO:
+            return
+        run('SAVE_GCODE_STATE NAME=_nebulaos_hot_ref')
+        run('G90')
+        run('G1 Z%.3f F%.0f' % (self.horizontal_move_z,
+                                self.probe_lift_speed * 60.))
+        run('RESTORE_GCODE_STATE NAME=_nebulaos_hot_ref')
+        self.gcode.respond_info(
+            "%s: automatic load cell check at temperature (no motion - "
+            "the bed must be empty)" % (cmd,))
+        ok, reason = z_offset_probe.run_auto_check()
+        if not ok:
+            self._offer_manual_load_cell(reason)
+            raise self.printer.command_error(
+                "%s: the automatic load cell check at temperature failed - "
+                "%s - use Calibration > Load Cell > Manual (bottle "
+                "calibration)" % (cmd, reason))
 
     def _z_offset_arming_kwargs(self, z_offset_probe):
         """{'arming': plan} for the paired Z-offset path (standalone or
@@ -1182,6 +1206,12 @@ class NebulaOSCalibration:
 
             self._auto_calibrate_advance(
                 journal, 'localized_z_offset', time.time())
+            # G99: the preflight check was cold; bed and nozzle are hot
+            # now. Refresh the empty-bed reference right before the touches
+            # (nozzle lifted, no contact; the check waits for the moves and
+            # settles) so the drift check compares hot with hot.
+            self._refresh_hot_reference(z_offset_probe,
+                                        'NEBULAOS_AUTO_CALIBRATE', run)
             run('_NEBULAOS_Z_OFFSET_CALIBRATE')
             if self.z_offset_state != 'complete' or self.z_offset_result is None:
                 raise self.printer.command_error(

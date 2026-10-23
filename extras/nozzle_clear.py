@@ -107,7 +107,7 @@ def _set_temp(pheaters, heater, reactor, temp, wait=False, tolerance=5.0):
 
 def clear_nozzle(z_offset_probe, toolhead, gcode, printer, params,
                  hot_min_temp, hot_max_temp, bed_max_temp, hot_end_temp=None,
-                 approach_speed=2.0):
+                 approach_speed=2.0, before_first_touch=None):
     """Native nozzle-wipe equivalent of prtouch_nozzle.clear_nozzle().
 
     Same physical sequence:
@@ -216,6 +216,12 @@ def clear_nozzle(z_offset_probe, toolhead, gcode, printer, params,
     # Step 3: wait for nozzle to reach start temp, then boost
     _set_temp(pheaters, extruder_heater, reactor, hot_min_temp, wait=True)
     _set_temp(pheaters, extruder_heater, reactor, hot_min_temp + 40, wait=False)
+
+    # G99: the heating above happens between any earlier load cell check
+    # and the first touch - the caller refreshes the empty-bed reference
+    # here (no motion; automatic mode only; raises on an unhealthy sensor).
+    if before_first_touch is not None:
+        before_first_touch()
 
     # Step 4: move to src point, touch-probe Z
     _move(gcode, toolhead, src_pos, rdy_xy_spd)

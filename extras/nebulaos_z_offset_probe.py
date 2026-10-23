@@ -782,6 +782,17 @@ def _run_auto_check(self):
     return self._record_auto_check(True, '', reference)
 
 
+def _refresh_auto_reference(self):
+    """The automatic check again, for a flow that heated (or moved) since
+    the last one: the reference must be taken at the temperature of the
+    touches (bed 65 C / nozzle 150 C), else the drift check compares a hot
+    empty reading against a cold reference. (True, '') in manual mode
+    (nothing to refresh)."""
+    if self.load_cell_mode() != raw_contact.USER_AUTO:
+        return True, ''
+    return self.run_auto_check()
+
+
 def _record_auto_check(self, ok, reason, reference=None):
     self._lc_state.update({
         'auto_check': lc_mode.CHECK_OK if ok else lc_mode.CHECK_FAILED,
@@ -826,6 +837,7 @@ def _auto_status(self):
 ZOffsetProbe._save_lc_state = _save_lc_state
 ZOffsetProbe.set_load_cell_mode = _set_load_cell_mode
 ZOffsetProbe.run_auto_check = _run_auto_check
+ZOffsetProbe.refresh_auto_reference = _refresh_auto_reference
 ZOffsetProbe._record_auto_check = _record_auto_check
 ZOffsetProbe.auto_status = _auto_status
 

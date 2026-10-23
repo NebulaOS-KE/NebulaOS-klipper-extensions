@@ -515,6 +515,7 @@ def _bound_probe_methods(names):
 _APPENDED = (('_save_lc_state', '_save_lc_state'),
              ('_set_load_cell_mode', 'set_load_cell_mode'),
              ('_run_auto_check', 'run_auto_check'),
+             ('_refresh_auto_reference', 'refresh_auto_reference'),
              ('_record_auto_check', '_record_auto_check'),
              ('_auto_status', 'auto_status'))
 
@@ -836,6 +837,43 @@ class RawArmingTest(unittest.TestCase):
         self.assertEqual(probe._mcu_trigger_analog.calls, [])
         # and the touch is now armed around it
         self.assertTrue(probe.contact_ready(rc.CALLER_AUTO_CALIBRATE))
+
+    def test_hot_reference_refresh_lets_the_touch_proceed(self):
+        # cold check passes at REF; heated, the empty bed reads 10000 counts
+        # (> 75 g = 6429) lower: against the cold reference the drift check
+        # refuses, after the hot refresh the touch arms around the hot one
+        hot = self.REF - 10000
+        probe = self._probe([_idle(self.REF, n=180)], reference=None,
+                            calibrated=False)
+        self.assertTrue(probe.run_auto_check()[0])
+        probe._load_cell.samples = [_idle(hot, n=180)]
+        with self.assertRaises(_Err):
+            probe._tare_and_arm(None)
+        self.assertEqual(probe._last_contact_rejection_reason,
+                         rc.RAW_REFERENCE_DRIFT)
+        self.assertEqual(probe.refresh_auto_reference(), (True, ''))
+        self.assertAlmostEqual(probe.auto_status()['auto_reference_counts'],
+                               hot, delta=60)
+        probe._tare_and_arm(None)
+        self.assertEqual(probe._effective_mode, rc.MODE_RAW)
+        lo, hi = probe._mcu_trigger_analog.calls[0][1:]
+        self.assertAlmostEqual((lo + hi) / 2., hot, delta=60)
+
+    def test_hot_refresh_unhealthy_fails_and_clears_the_reference(self):
+        probe = self._probe([_idle(self.REF, n=180)], reference=None,
+                            calibrated=False)
+        self.assertTrue(probe.run_auto_check()[0])
+        probe._load_cell.samples = [[(i / 90.6, None, self.REF, None)
+                                     for i in range(180)]]
+        ok, reason = probe.refresh_auto_reference()
+        self.assertFalse(ok)
+        self.assertIn('does not change', reason)
+        self.assertFalse(probe.contact_ready(rc.CALLER_TOUCH))
+
+    def test_hot_refresh_is_a_no_op_in_manual_mode(self):
+        probe = self._probe([], user_mode='manual')
+        self.assertEqual(probe.refresh_auto_reference(), (True, ''))
+        self.assertEqual(probe._load_cell.collect_log, [])
 
     def test_auto_check_waits_for_a_settling_bed(self):
         probe = self._probe([self._drifting(n=180), _idle(self.REF, n=180)],

@@ -2262,7 +2262,10 @@ class FakeModeProbe(FakeZOffsetProbe):
 
     def run_auto_check(self):
         self.checks += 1
-        if self.check_ok:
+        ok = self.check_ok
+        if isinstance(ok, list):            # one result per check, in order
+            ok = ok.pop(0)
+        if ok:
             self.reference, self.failed = -240426, False
             return True, ''
         self.reference, self.failed = None, True
@@ -2368,13 +2371,57 @@ class LoadCellModeTest(unittest.TestCase):
         printer, gcode, coord = self._auto(probe)
         with self.assertRaises(RestartTriggered):
             coord.cmd_auto_calibrate(fake.FakeGCmd({}))
-        self.assertEqual(probe.checks, 1)          # preflight only
+        self.assertEqual(probe.checks, 2)    # cold preflight + hot refresh
         self.assertEqual(len(self.cleans), 1)
         # the Z-offset step inside follows the mode: raw (Run 14's
         # "auto-calibrate never raw" is lifted)
         self.assertEqual(self.calls[0]['arming'][0], raw_contact.ARM_RAW)
         self.assertIn(raw_contact.CALLER_AUTO_CALIBRATE, probe.plans)
         self.assertEqual(gcode.scripts_run[-1], 'SAVE_CONFIG')
+
+    def test_auto_calibrate_refreshes_the_reference_hot_before_the_touch(self):
+        probe = FakeModeProbe('auto', check_ok=[True, True])
+        printer, gcode, coord = self._auto(probe)
+        at_check = []
+        orig = probe.run_auto_check
+
+        def check():
+            at_check.append(list(gcode.scripts_run))
+            return orig()
+        probe.run_auto_check = check
+        with self.assertRaises(RestartTriggered):
+            coord.cmd_auto_calibrate(fake.FakeGCmd({}))
+        self.assertEqual(probe.checks, 2)
+        self.assertEqual(at_check[0], [])              # cold: before motion
+        hot = [s.split()[0] for s in at_check[1]]
+        # after the soak (bed M190 65 C, nozzle M109 150 C, G4), nozzle
+        # lifted, before the Z-offset touches
+        self.assertEqual(hot[-6:], ['M109', 'G4', 'SAVE_GCODE_STATE', 'G90',
+                                    'G1', 'RESTORE_GCODE_STATE'])
+        self.assertIn('M190', hot)
+        self.assertEqual(at_check[1][-2], 'G1 Z5.000 F1200')
+        self.assertNotIn('_NEBULAOS_Z_OFFSET_CALIBRATE', hot)
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.calls[0]['arming'][0], raw_contact.ARM_RAW)
+
+    def test_auto_calibrate_stops_cleanly_on_a_failed_hot_refresh(self):
+        probe = FakeModeProbe('auto', check_ok=[True, False])
+        printer, gcode, coord = self._auto(probe)
+        with self.assertRaises(fake.CommandError) as ctx:
+            coord.cmd_auto_calibrate(fake.FakeGCmd({}))
+        self.assertIn('at temperature failed', str(ctx.exception))
+        self.assertIn('Calibration > Load Cell > Manual', str(ctx.exception))
+        names = [s.split()[0] for s in gcode.scripts_run]
+        self.assertNotIn('_NEBULAOS_Z_OFFSET_CALIBRATE', names)
+        self.assertNotIn('BED_MESH_CALIBRATE', names)
+        self.assertNotIn('SAVE_CONFIG', names)
+        self.assertEqual(self.calls, [])               # no touch
+        self.assertEqual(coord.auto_calibrate_state, 'error')
+        journal = calibration_journal.read_journal(
+            path=os.path.join(self.tmpdir, 'journal.json'))
+        self.assertEqual(journal['state'], calibration_journal.STATE_ERROR)
+        self.assertFalse(journal['commit_requested'])
+        self.assertEqual(self.prompts[-1][0], 'Automatic load cell check failed')
 
     def test_auto_calibrate_stops_cleanly_on_a_failed_check(self):
         probe = FakeModeProbe('auto', check_ok=False)
