@@ -764,3 +764,39 @@ class ContactForceTelemetryPropagationTest(_Base):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+# ======================================================================
+# G104: "touch n of m" event (informational only)
+# ======================================================================
+
+class TouchEventTest(_Base):
+    def test_each_touch_is_announced_before_it_starts(self):
+        toolhead = FakeToolhead()
+        gcode = FakeGCode()
+        printer = FakePrinter(toolhead, gcode)
+        events = []
+        z_probe = FakeZOffsetProbe([(0.5, 0.5, 0.0)] * 3)
+        orig_touch = z_probe.touch_probe
+
+        def touch(*a, **kw):
+            events.append('touch')
+            return orig_touch(*a, **kw)
+        z_probe.touch_probe = touch
+        printer.send_event = lambda name, *args: events.append((name,) + args)
+        orig = pairmod.probe_module.run_single_probe
+        pairmod.probe_module.run_single_probe = \
+            lambda probe_obj, gcmd: FakeProbeResult(2.0)
+        try:
+            pairmod.measure_probe_nozzle_pair(
+                printer, x=100., y=100., probe_x_offset=0., probe_y_offset=27.,
+                probe_z_offset=1.0, horizontal_move_z=8., z_offset_probe=z_probe,
+                down_min_z=10., pro_cnt=3, established_contact_margin_mm=1.0,
+                max_abs_fit_delta=1.0, min_accepted_samples=2,
+                max_repeatability_range=1.0, max_repeatability_stddev=1.0)
+        finally:
+            pairmod.probe_module.run_single_probe = orig
+        self.assertEqual(events, [
+            ('nebulaos:contact_touch', 1, 3), 'touch',
+            ('nebulaos:contact_touch', 2, 3), 'touch',
+            ('nebulaos:contact_touch', 3, 3), 'touch'])

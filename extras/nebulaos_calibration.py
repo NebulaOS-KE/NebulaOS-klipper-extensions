@@ -67,11 +67,13 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging
 import math
+import os
 import time
 
 from . import nebulaos_probe_pair
 from . import nebulaos_raw_contact as raw_contact
 from . import nebulaos_calibration_journal as calibration_journal
+from . import nebulaos_calibration_history as calibration_history
 
 _MAX_ERROR_LEN = 200
 
@@ -83,6 +85,64 @@ BUSY_STATES = frozenset((
     'awaiting_continue', 'awaiting_measurement', 'awaiting_confirmation',
     'awaiting_x_mount', 'awaiting_y_mount'))
 
+# G104: the user-facing steps of each guided flow - get_status()['progress']
+# = {"flow", "step", "total", "key", "label", "detail"} (PLAN Run 19, fixed
+# interface). (key, label, advice when this step fails).
+_LOAD_CELL_ADVICE = ("Remove everything from the bed and try again, or use "
+                     "Calibration > Load Cell > Manual.")
+AUTO_CALIBRATE_STEPS = (
+    ('preflight', "Load cell check", _LOAD_CELL_ADVICE),
+    ('home', "Homing",
+     "Check that nothing blocks the axes, then try again."),
+    ('nozzle_clean', "Nozzle clean",
+     "Check the wipe pad and that the nozzle is free of filament, then try "
+     "again."),
+    ('establish_thermal_state', "Heating up",
+     "Check the heaters (Calibration > Heaters (PID)), then try again."),
+    ('stabilize', "Settling", "Try again."),
+    ('hot_load_cell_check', "Load cell check (hot)", _LOAD_CELL_ADVICE),
+    ('localized_z_offset', "Measuring the Z offset",
+     "Clean the nozzle and the bed at the front-left corner, then try "
+     "again."),
+    ('bed_mesh', "Bed mesh",
+     "Check that the bed is clean and the probe (BLTouch) deploys, then try "
+     "again."),
+    ('commit', "Saving (Klipper restarts)",
+     "Restart the printer and run Auto Calibration again."),
+    ('post_restart_verification', "Verifying",
+     "The saved values do not match what was measured - run Auto "
+     "Calibration again."),
+)
+_AUTO_STAGE_STEP = {
+    'preflight': 1, 'home': 2, 'nozzle_clean': 3,
+    'establish_thermal_state': 4, 'stabilize': 5, 'localized_z_offset': 7,
+    'bed_mesh': 8, 'final_validation': 9, 'commit': 9, 'restart': 9,
+    'post_restart_verification': 10}
+_SHAPER_ADVICE = ("Check that the accelerometer is mounted firmly and its "
+                  "cable is connected, then try again.")
+INPUT_SHAPER_STEPS = (
+    ('home', "Homing", "Check that nothing blocks the axes, then try again."),
+    ('mount_x', "Mount the sensor on the toolhead", ""),
+    ('measure_x', "Measuring X", _SHAPER_ADVICE),
+    ('mount_y', "Move the sensor to the bed", ""),
+    ('measure_y', "Measuring Y", _SHAPER_ADVICE),
+    ('commit', "Saving (Klipper restarts)",
+     "Restart the printer and run Input Shaper again."),
+    ('post_restart_verification', "Verifying",
+     "The saved values do not match what was measured - run Input Shaper "
+     "again."),
+)
+ESTEPS_STEPS = (
+    ('heating', "Heating up",
+     "Check the hotend heater, then try again."),
+    ('mark_filament', "Mark the filament", ""),
+    ('measure', "Measure and enter the length",
+     "Check the measurement (in mm) and try again."),
+    ('confirm', "Confirm the new value", ""),
+    ('commit', "Saving (Klipper restarts)", ""),
+)
+_MAX_LINE = calibration_history.MAX_SUMMARY_LEN
+
 
 def _sanitize_error(exc):
     """Same convention as z_compensate.py's own _sanitize_calibration_error
@@ -92,6 +152,44 @@ def _sanitize_error(exc):
     text = ' '.join(text.split())
     if len(text) > _MAX_ERROR_LEN:
         text = text[:_MAX_ERROR_LEN - 3].rstrip() + '...'
+    return text
+
+
+def mesh_summary(mesh_status):
+    """'Bed mesh 9x9, range 0.16 mm' from the probed matrix (columns x
+    rows, max - min of every probed point), or None."""
+    matrix = (mesh_status or {}).get('probed_matrix') or []
+    values = [v for row in matrix for v in (row or [])
+              if isinstance(v, (int, float)) and math.isfinite(v)]
+    if not values:
+        return None
+    return "Bed mesh %dx%d, range %.2f mm" % (
+        len(matrix[0]), len(matrix), max(values) - min(values))
+
+
+def auto_calibrate_summary(new_z, old_z, mesh_status, old_z_adjust=None):
+    lines = []
+    if old_z is not None and math.isfinite(old_z):
+        lines.append("Z offset %.3f mm (was %.3f)" % (new_z, old_z))
+    else:
+        lines.append("Z offset %.3f mm" % (new_z,))
+    mesh = mesh_summary(mesh_status)
+    if mesh:
+        lines.append(mesh)
+    if old_z_adjust:
+        lines.append("Z adjustment reset to 0 (was %+.3f mm)"
+                     % (old_z_adjust,))
+    return lines
+
+
+def auto_calibrate_history_summary(new_z, mesh_status):
+    """The one-line status of the Calibration menu row (G105)."""
+    text = "Z offset %.3f mm" % (new_z,)
+    matrix = (mesh_status or {}).get('probed_matrix') or []
+    values = [v for row in matrix for v in (row or [])
+              if isinstance(v, (int, float)) and math.isfinite(v)]
+    if values:
+        text += ", mesh range %.2f mm" % (max(values) - min(values),)
     return text
 
 
@@ -294,6 +392,12 @@ class NebulaOSCalibration:
         # auto_calibrate_* fields are the normal way to poll progress).
         self.journal_path = config.get(
             'journal_path', default=calibration_journal.DEFAULT_JOURNAL_PATH)
+        # G104/G105: history + last result, next to the journal (same
+        # directory; a test journal_path keeps its history beside it).
+        self.history_path = config.get(
+            'history_path', default=os.path.join(
+                os.path.dirname(self.journal_path) or '.',
+                calibration_history.FILE_NAME))
 
         # NEBULAOS_ESTEPS_CALIBRATE (mission §14) - a separate, standalone
         # guided workflow (not part of NEBULAOS_AUTO_CALIBRATE). Formula
@@ -453,6 +557,28 @@ class NebulaOSCalibration:
         self._input_shaper_freq_x = None
         self._input_shaper_active_journal = None
 
+        # G104/G105: progress, last result and calibration history.
+        self._auto_step = None          # 1..10 while auto-calibrate runs
+        self._touch = None              # (n, m) during the Z offset touches
+        self._mesh_probe_events = 0     # probe results during the bed mesh
+        self._esteps_saving = False
+        self._history_warning = None
+        try:
+            self._history, self._history_warning = calibration_history.load(
+                self.history_path)
+        except Exception:
+            logging.exception("nebulaos_calibration: history not loaded")
+            self._history = calibration_history.empty_state()
+        if self._history_warning:
+            logging.warning("nebulaos_calibration: %s", self._history_warning)
+        self.printer.register_event_handler(
+            "nebulaos:contact_touch", self._handle_contact_touch)
+        self.printer.register_event_handler(
+            "probe:update_results", self._handle_probe_result)
+
+        self.gcode.register_command(
+            'NEBULAOS_CALIBRATION_RECORD', self.cmd_calibration_record,
+            desc=self.cmd_calibration_record_help)
         self.gcode.register_command(
             '_NEBULAOS_Z_OFFSET_CALIBRATE', self.cmd_z_offset_calibrate,
             desc=self.cmd_z_offset_calibrate_help)
@@ -537,6 +663,7 @@ class NebulaOSCalibration:
             self.esteps_state, self.input_shaper_state))
 
     def get_status(self, eventtime):
+        history, last_result = calibration_history.snapshot(self._history)
         return {
             'busy': self.busy(),
             'z_offset_state': self.z_offset_state,
@@ -583,7 +710,174 @@ class NebulaOSCalibration:
             'input_shaper_stage': self.input_shaper_stage,
             'input_shaper_error': self.input_shaper_error,
             'input_shaper_result': self.input_shaper_result,
+            # G104/G105 (PLAN Run 19 fixed interface)
+            'progress': self._progress(eventtime),
+            'last_result': last_result,
+            'history': history,
         }
+
+    # ------------------------------------------------------------------
+    # G104: progress of the running guided flow
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _step(flow, steps, n, detail=''):
+        key, label, _advice = steps[n - 1]
+        return {'flow': flow, 'step': n, 'total': len(steps), 'key': key,
+                'label': label, 'detail': detail}
+
+    def _temps(self, eventtime, bed=True):
+        """'bed 61/65 C, nozzle 148/150 C' from the live heater status, or
+        '' when the heaters are not available."""
+        parts = []
+        names = (('heater_bed', 'bed'), ('extruder', 'nozzle'))
+        for obj_name, label in names if bed else names[1:]:
+            heater = self.printer.lookup_object(obj_name, None)
+            if heater is None:
+                continue
+            try:
+                st = heater.get_status(eventtime)
+                parts.append("%s %.0f/%.0f C" % (
+                    label, st['temperature'], st['target']))
+            except Exception:
+                continue
+        return ", ".join(parts)
+
+    def _mesh_point_detail(self):
+        """'point n of 81' from upstream's own per-sample probe event
+        (probe:update_results) and the configured grid; '' when either is
+        not observable."""
+        try:
+            bed_mesh = self.printer.lookup_object('bed_mesh', None)
+            cfg = bed_mesh.bmc.mesh_config
+            total = int(cfg['x_count']) * int(cfg['y_count'])
+            probe = self.printer.lookup_object('probe')
+            samples = max(1, int(probe.get_probe_params()['samples']))
+        except Exception:
+            return ''
+        if total <= 0:
+            return ''
+        point = min(total, self._mesh_probe_events // samples + 1)
+        return "point %d of %d" % (point, total)
+
+    def _auto_progress(self, eventtime):
+        n = self._auto_step
+        detail = ''
+        if n == 4:
+            detail = self._temps(eventtime)
+        elif n == 7 and self._touch is not None:
+            detail = "touch %d of %d" % self._touch
+        elif n == 8:
+            detail = self._mesh_point_detail()
+        return self._step('auto_calibrate', AUTO_CALIBRATE_STEPS, n, detail)
+
+    def _input_shaper_step(self):
+        state, stage = self.input_shaper_state, self.input_shaper_stage
+        if state not in ('running', 'awaiting_x_mount', 'awaiting_y_mount'):
+            return None
+        if stage in ('commit', 'restart'):
+            return 6
+        if stage == 'final_validation':
+            return 5
+        if state == 'awaiting_y_mount':
+            return 5 if stage == 'measure_y' else 4
+        if state == 'awaiting_x_mount':
+            return 3 if stage == 'measure_x' else 2
+        return 1
+
+    def _esteps_step(self):
+        if self._esteps_saving:
+            return 5
+        return {'running': 1, 'awaiting_continue': 2,
+                'awaiting_measurement': 3,
+                'awaiting_confirmation': 4}.get(self.esteps_state)
+
+    def _progress(self, eventtime):
+        if self.auto_calibrate_state == 'running' and self._auto_step:
+            return self._auto_progress(eventtime)
+        n = self._input_shaper_step()
+        if n is not None:
+            return self._step('input_shaper', INPUT_SHAPER_STEPS, n)
+        n = self._esteps_step()
+        if n is not None:
+            return self._step('esteps', ESTEPS_STEPS, n,
+                              self._temps(eventtime, bed=False)
+                              if n == 1 else '')
+        return None
+
+    def _set_auto_step(self, n):
+        self._auto_step = n
+        if n == 7:
+            self._touch = None
+        elif n == 8:
+            self._mesh_probe_events = 0
+
+    def _handle_contact_touch(self, n, m):
+        # nebulaos_probe_pair: nozzle touch n of m is about to start.
+        self._touch = (n, m)
+
+    def _handle_probe_result(self, results):
+        if self.auto_calibrate_state == 'running' and self._auto_step == 8:
+            self._mesh_probe_events += 1
+
+    # ------------------------------------------------------------------
+    # G104/G105: last result + calibration history (persisted next to the
+    # journal; see nebulaos_calibration_history.py)
+    # ------------------------------------------------------------------
+    def _save_history(self):
+        try:
+            calibration_history.save(self.history_path, self._history)
+        except Exception:
+            # Never fails a calibration: the status keeps the in-memory copy.
+            logging.exception("nebulaos_calibration: could not write the "
+                              "calibration history %s", self.history_path)
+
+    def record_flow(self, key, summary, save=True):
+        """A flow finished successfully (also called by nebulaos_bed_tram
+        and nebulaos_load_cell_calibration)."""
+        calibration_history.record(self._history, key, summary, time.time())
+        if save:
+            self._save_history()
+
+    def mark_redo(self, keys, reason):
+        calibration_history.mark_redo(self._history, keys, reason)
+        self._save_history()
+
+    def _set_last_result(self, flow, ok, summary=(), steps=None, step=None,
+                         error='', advice=None, save=True):
+        error_step = step_advice = ''
+        if not ok and steps is not None and step:
+            _key, error_step, step_advice = steps[step - 1]
+        if advice is None:
+            advice = step_advice
+        self._history['last_result'] = calibration_history.make_result(
+            flow, ok, time.time(), summary, error_step, error, advice)
+        if save:
+            self._save_history()
+
+    def _clear_last_result(self):
+        if self._history.get('last_result') is not None:
+            self._history['last_result'] = None
+            self._save_history()
+
+    cmd_calibration_record_help = (
+        "Record a finished calibration that NebulaOS does not run itself: "
+        "FLOW=pid|axis_twist|skew|tmc_autotune|bed_mesh SUMMARY=\"<text>\" "
+        "(shown on the Calibration menu)")
+
+    def cmd_calibration_record(self, gcmd):
+        flow = gcmd.get('FLOW', '').strip().lower()
+        if flow not in calibration_history.EXTERNAL_FLOWS:
+            if flow in calibration_history.FLOWS:
+                raise gcmd.error(
+                    "NEBULAOS_CALIBRATION_RECORD: FLOW=%s is recorded "
+                    "automatically when it finishes" % (flow,))
+            raise gcmd.error(
+                "NEBULAOS_CALIBRATION_RECORD: unknown FLOW - use one of %s"
+                % (", ".join(calibration_history.EXTERNAL_FLOWS),))
+        summary = calibration_history.sanitize_text(gcmd.get('SUMMARY', ''))
+        self.record_flow(flow, summary)
+        gcmd.respond_info("NEBULAOS_CALIBRATION_RECORD: %s recorded%s"
+                          % (flow, (" - " + summary) if summary else ""))
 
     # ------------------------------------------------------------------
     # NEBULAOS_Z_OFFSET_CALIBRATE
@@ -1115,6 +1409,7 @@ class NebulaOSCalibration:
         to the journal file would still leave this process's own status
         correct for as long as it keeps running."""
         self.auto_calibrate_stage = stage
+        self._set_auto_step(_AUTO_STAGE_STEP[stage])
         calibration_journal.advance_stage(journal, stage, now)
         calibration_journal.write_journal(journal, path=self.journal_path)
 
@@ -1144,6 +1439,19 @@ class NebulaOSCalibration:
         self.auto_calibrate_error = None
         self.auto_calibrate_result = None
         self._auto_calibrate_cancel_requested = False
+        self._set_auto_step(None)
+        self._clear_last_result()
+        # G104 end screen: the values before this run.
+        old_z_offset = None
+        probe_before = self.printer.lookup_object('probe', None)
+        if probe_before is not None:
+            try:
+                old_z_offset = probe_before.get_offsets()[2]
+            except Exception:
+                old_z_offset = None
+        old_z_adjust = getattr(self._z_adjust(), 'value', None)
+        if not isinstance(old_z_adjust, (int, float)):
+            old_z_adjust = None
         journal = calibration_journal.new_journal(
             self.auto_calibrate_id, 'auto_calibrate', now)
         calibration_journal.write_journal(journal, path=self.journal_path)
@@ -1212,8 +1520,10 @@ class NebulaOSCalibration:
             # now. Refresh the empty-bed reference right before the touches
             # (nozzle lifted, no contact; the check waits for the moves and
             # settles) so the drift check compares hot with hot.
+            self._set_auto_step(6)
             self._refresh_hot_reference(z_offset_probe,
                                         'NEBULAOS_AUTO_CALIBRATE', run)
+            self._set_auto_step(7)
             run('_NEBULAOS_Z_OFFSET_CALIBRATE')
             if self.z_offset_state != 'complete' or self.z_offset_result is None:
                 raise self.printer.command_error(
@@ -1248,10 +1558,18 @@ class NebulaOSCalibration:
             self._auto_calibrate_check_cancel(journal, time.time())
 
             self._reset_z_adjust()
+            # G104: the end-screen lines travel in the journal across the
+            # SAVE_CONFIG restart; _handle_ready() publishes them once the
+            # saved values are verified.
+            journal['summary'] = auto_calibrate_summary(
+                z_offset_result, old_z_offset, mesh_status, old_z_adjust)
+            journal['history_summary'] = auto_calibrate_history_summary(
+                z_offset_result, mesh_status)
             calibration_journal.mark_commit_requested(
                 journal, expected_values, time.time())
             calibration_journal.write_journal(journal, path=self.journal_path)
             self.auto_calibrate_stage = 'commit'
+            self._set_auto_step(9)
             self.gcode.respond_info(
                 "NEBULAOS_AUTO_CALIBRATE: all stages complete (z_offset=%.5f, "
                 "bed_mesh profile=%r) - committing with SAVE_CONFIG, "
@@ -1291,6 +1609,17 @@ class NebulaOSCalibration:
                 'cancelled' if 'cancelled by NEBULAOS_CALIBRATION_CANCEL'
                 in str(e) else 'error')
             self.auto_calibrate_error = _sanitize_error(e)
+            failed_step = self._auto_step or 1
+            self._set_auto_step(None)
+            if self.auto_calibrate_state == 'cancelled':
+                self._set_last_result(
+                    'auto_calibrate', False,
+                    steps=AUTO_CALIBRATE_STEPS, step=failed_step,
+                    error="Cancelled", advice='')
+            else:
+                self._set_last_result(
+                    'auto_calibrate', False, steps=AUTO_CALIBRATE_STEPS,
+                    step=failed_step, error=self.auto_calibrate_error)
             if journal['state'] not in (calibration_journal.STATE_CANCELLED,):
                 calibration_journal.mark_error(
                     journal, self.auto_calibrate_error, time.time())
@@ -1369,6 +1698,14 @@ class NebulaOSCalibration:
         else:
             self._esteps_start(gcmd, extruder_name)
 
+    def _esteps_failed(self, exc):
+        failed_step = self._esteps_step() or 1
+        self.esteps_state = 'error'
+        self.esteps_error = _sanitize_error(exc)
+        self._esteps_saving = False
+        self._set_last_result('esteps', False, steps=ESTEPS_STEPS,
+                              step=failed_step, error=self.esteps_error)
+
     def _esteps_lookup_extruder(self, name):
         extruder_obj = self.printer.lookup_object(name, None)
         if extruder_obj is None or getattr(
@@ -1394,13 +1731,14 @@ class NebulaOSCalibration:
         self.esteps_measured_length = None
         self.esteps_old_rotation_distance = None
         self.esteps_new_rotation_distance = None
+        self._esteps_saving = False
+        self._clear_last_result()
 
         try:
             self.gcode.run_script_from_command('M104 S%.1f' % (self.esteps_temp,))
             self.gcode.run_script_from_command('M109 S%.1f' % (self.esteps_temp,))
         except Exception as e:
-            self.esteps_state = 'error'
-            self.esteps_error = _sanitize_error(e)
+            self._esteps_failed(e)
             raise
 
         self.esteps_state = 'awaiting_continue'
@@ -1436,8 +1774,7 @@ class NebulaOSCalibration:
                 'G1 E%.4f F%d' % (self.esteps_commanded_length_mm,
                                   int(self.esteps_extrude_speed_mm_s * 60)))
         except Exception as e:
-            self.esteps_state = 'error'
-            self.esteps_error = _sanitize_error(e)
+            self._esteps_failed(e)
             raise
 
         self.esteps_commanded_length = self.esteps_commanded_length_mm
@@ -1480,8 +1817,7 @@ class NebulaOSCalibration:
                     % (measured, commanded, (ratio - 1.0) * 100.,
                        self.esteps_max_correction_ratio * 100.))
         except Exception as e:
-            self.esteps_state = 'error'
-            self.esteps_error = _sanitize_error(e)
+            self._esteps_failed(e)
             raise
 
         self.esteps_measured_length = measured
@@ -1573,6 +1909,7 @@ class NebulaOSCalibration:
         self.input_shaper_result = None
         self._input_shaper_type_x = None
         self._input_shaper_freq_x = None
+        self._clear_last_result()
         journal = calibration_journal.new_journal(
             self.input_shaper_id, 'input_shaper_calibrate', now)
         calibration_journal.write_journal(
@@ -1603,6 +1940,9 @@ class NebulaOSCalibration:
         except Exception as e:
             self.input_shaper_state = 'error'
             self.input_shaper_error = _sanitize_error(e)
+            self._set_last_result('input_shaper', False,
+                                  steps=INPUT_SHAPER_STEPS, step=1,
+                                  error=self.input_shaper_error)
             calibration_journal.mark_error(
                 journal, self.input_shaper_error, time.time())
             calibration_journal.write_journal(
@@ -1687,6 +2027,12 @@ class NebulaOSCalibration:
                 'input_shaper.shaper_freq_y':
                     round(shaper.params.shaper_freq, 3),
             }
+            journal['summary'] = [
+                "X: %s %.1f Hz" % (self._input_shaper_type_x,
+                                   self._input_shaper_freq_x),
+                "Y: %s %.1f Hz" % (shaper.params.shaper_type,
+                                   shaper.params.shaper_freq)]
+            journal['history_summary'] = "; ".join(journal['summary'])
             calibration_journal.mark_commit_requested(
                 journal, expected_values, time.time())
             calibration_journal.write_journal(
@@ -1705,8 +2051,12 @@ class NebulaOSCalibration:
         except Exception as e:
             if journal.get('commit_requested'):
                 raise
+            failed_step = self._input_shaper_step() or 1
             self.input_shaper_state = 'error'
             self.input_shaper_error = _sanitize_error(e)
+            self._set_last_result('input_shaper', False,
+                                  steps=INPUT_SHAPER_STEPS, step=failed_step,
+                                  error=self.input_shaper_error)
             if journal['state'] != calibration_journal.STATE_CANCELLED:
                 calibration_journal.mark_error(
                     journal, self.input_shaper_error, time.time())
@@ -1758,12 +2108,18 @@ class NebulaOSCalibration:
             configfile.set(self.esteps_extruder_name, 'rotation_distance',
                             "%.6f" % (new_rd,))
         except Exception as e:
-            self.esteps_state = 'error'
-            self.esteps_error = _sanitize_error(e)
+            self._esteps_failed(e)
             raise
 
         self.esteps_state = 'complete'
         self.esteps_error = None
+        # G104/G105: no post-restart verification for E-Steps - the
+        # result and history are written before the restart.
+        summary = ["Rotation distance %.4f (was %.4f)"
+                   % (new_rd, self.esteps_old_rotation_distance)]
+        self.record_flow('esteps', summary[0], save=False)
+        self._set_last_result('esteps', True, summary)
+        self._esteps_saving = True
         self._dismiss_action_prompt()
         self.gcode.respond_info(
             "NEBULAOS_ESTEPS_CALIBRATE: rotation_distance %.6f applied "
@@ -1939,6 +2295,9 @@ class NebulaOSCalibration:
             self.auto_calibrate_stage = journal['stage']
             self.auto_calibrate_error = journal['error']
             self.auto_calibrate_result = journal['result']
+        if journal is not None:
+            self._publish_verified('auto_calibrate', journal,
+                                   AUTO_CALIBRATE_STEPS)
 
         input_shaper_journal = self._verify_journal_at_path(
             self.input_shaper_journal_path)
@@ -1950,6 +2309,30 @@ class NebulaOSCalibration:
             self.input_shaper_stage = input_shaper_journal['stage']
             self.input_shaper_error = input_shaper_journal['error']
             self.input_shaper_result = input_shaper_journal['result']
+        if input_shaper_journal is not None:
+            self._publish_verified('input_shaper', input_shaper_journal,
+                                   INPUT_SHAPER_STEPS)
+        if self._history_warning:
+            self.gcode.respond_info("nebulaos_calibration: %s"
+                                    % (self._history_warning,))
+            self._history_warning = None
+
+    def _publish_verified(self, flow, journal, steps):
+        """G104/G105: a commit was just verified after its restart - the
+        end screen (last_result) and the history; a mismatch is a failure
+        at the last step (Verifying)."""
+        summary = [s for s in (journal.get('summary') or [])
+                   if isinstance(s, str)]
+        if journal.get('state') == calibration_journal.STATE_COMPLETE:
+            history_summary = journal.get('history_summary')
+            if not isinstance(history_summary, str):
+                history_summary = "; ".join(summary)
+            self.record_flow(flow, history_summary, save=False)
+            self._set_last_result(flow, True, summary)
+        else:
+            self._set_last_result(flow, False, summary, steps=steps,
+                                  step=len(steps),
+                                  error=journal.get('error') or '')
 
     # ------------------------------------------------------------------
     # NEBULAOS_CALIBRATION_STATUS

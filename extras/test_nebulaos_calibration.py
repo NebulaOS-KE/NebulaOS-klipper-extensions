@@ -19,9 +19,28 @@
 # Run from klippy/: python3 -m unittest extras.test_nebulaos_calibration -v
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
+import atexit
+import os
+import shutil
 import sys
+import tempfile
 import types
 import unittest
+
+# G104/G105: every coordinator built here keeps its calibration history in
+# a private temp file (never the real /usr/data default) unless the test
+# sets journal_path (history beside it) or history_path itself.
+_HISTORY_TMP = tempfile.mkdtemp()
+atexit.register(shutil.rmtree, _HISTORY_TMP, True)
+_HISTORY_N = [0]
+
+
+def _isolate_history(values):
+    if 'history_path' in values or 'journal_path' in values:
+        return
+    _HISTORY_N[0] += 1
+    values['history_path'] = os.path.join(
+        _HISTORY_TMP, 'history_%d.json' % (_HISTORY_N[0],))
 
 from . import prtouch_test_support as fake
 
@@ -102,6 +121,7 @@ def _build(z_offset_probe=None, probe_obj=None, z_compensate=None,
         printer.add_object('z_compensate', z_compensate)
 
     values = dict(config_overrides or {})
+    _isolate_history(values)
     config = fake.FakeConfig(values, section='nebulaos_calibration', printer=printer)
     coordinator = nebulaos_calibration.NebulaOSCalibration(config)
     config.assert_all_consumed()
@@ -621,7 +641,8 @@ class UpstreamFirstCleanupTest(unittest.TestCase):
         printer, gcode, coord = _build()
         self.assertEqual(
             sorted(gcode.commands.keys()),
-            ['NEBULAOS_CALIBRATION_STATUS',
+            ['NEBULAOS_CALIBRATION_RECORD',
+             'NEBULAOS_CALIBRATION_STATUS',
              'NEBULAOS_RAW_CONTACT_COMPARE',
              '_NEBULAOS_AUTO_CALIBRATE',
              '_NEBULAOS_CALIBRATION_CANCEL',
@@ -903,6 +924,7 @@ def _build_auto_calibrate(z_offset_probe=None, probe_obj=None,
     printer.add_object('bed_mesh', bed_mesh if bed_mesh is not None else FakeBedMesh())
 
     values = dict(config_overrides or {})
+    _isolate_history(values)
     values.setdefault('reference_x', '20')
     values.setdefault('reference_y', '25')
     config = fake.FakeConfig(values, section='nebulaos_calibration', printer=printer)
@@ -1335,6 +1357,7 @@ def _build_input_shaper_calibrate(
     gcode.commands['SHAPER_CALIBRATE'] = fake_shaper_calibrate
 
     values = dict(config_overrides or {})
+    _isolate_history(values)
     values.setdefault('reference_x', '20')
     values.setdefault('reference_y', '25')
     config = fake.FakeConfig(values, section='nebulaos_calibration', printer=printer)
@@ -2719,3 +2742,445 @@ class BusyTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+# ----------------------------------------------------------------------
+# G104/G105 (Run 19): progress, last_result, history,
+# NEBULAOS_CALIBRATION_RECORD, staleness rules
+# ----------------------------------------------------------------------
+import json
+
+from . import nebulaos_calibration_history as calibration_history
+
+
+class FakeHeaterStatus:
+    def __init__(self, temperature, target):
+        self.temperature = temperature
+        self.target = target
+
+    def get_status(self, eventtime):
+        return {'temperature': self.temperature, 'target': self.target}
+
+
+class FakeMeshCalibrate:
+    def __init__(self, x_count, y_count):
+        self.mesh_config = {'x_count': x_count, 'y_count': y_count}
+
+
+class FakeMeshWithMatrix(FakeBedMesh):
+    def __init__(self, matrix, x_count=9, y_count=9, **kw):
+        super().__init__(**kw)
+        self.matrix = matrix
+        self.bmc = FakeMeshCalibrate(x_count, y_count)
+
+    def get_status(self, eventtime):
+        st = super().get_status(eventtime)
+        st['probed_matrix'] = self.matrix
+        return st
+
+
+class FakeProbeObjWithSamples(FakeProbeObj):
+    def __init__(self, samples=1, **kw):
+        super().__init__(**kw)
+        self.samples = samples
+
+    def get_probe_params(self, gcmd=None):
+        return {'samples': self.samples}
+
+
+MATRIX = [[0.10, 0.05, -0.05], [0.20, 0.00, -0.10]]     # 3x2, range 0.30
+
+
+class AutoCalibrateProgressTest(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmpdir, True)
+        self.journal_path = os.path.join(self.tmpdir, 'journal.json')
+        self.history_path = os.path.join(self.tmpdir,
+                                         'calibration_history.json')
+
+    def _run(self, probe=None, samples=1, touches=3, mesh_events=0,
+             nozzle_clean_ok=True):
+        probe = probe if probe is not None else FakeZOffsetProbe(True)
+        probe_obj = FakeProbeObjWithSamples(samples=samples, z_offset=1.795)
+        printer, gcode, coord = _build_auto_calibrate(
+            probe, probe_obj, bed_mesh=FakeMeshWithMatrix(MATRIX),
+            config_overrides={'journal_path': self.journal_path})
+        printer.add_object('heater_bed', FakeHeaterStatus(61.4, 65.))
+        printer.add_object('extruder', FakeHeaterStatus(148., 150.))
+        seen = []
+
+        def snap(name):
+            seen.append((name, coord.get_status(0.)['progress']))
+        orig_run = gcode.run_script_from_command
+
+        def run(script):
+            snap(script.split()[0])
+            return orig_run(script)
+        gcode.run_script_from_command = run
+
+        def clean(gcmd):
+            if not nozzle_clean_ok:
+                raise fake.CommandError("simulated nozzle clean failure")
+        gcode.commands['_NEBULAOS_NOZZLE_CLEAN'] = clean
+
+        def mesh(gcmd):
+            for _ in range(mesh_events):
+                printer.send_event('probe:update_results', [None])
+            snap('mesh-probed')
+        gcode.commands['BED_MESH_CALIBRATE'] = mesh
+
+        def measure(printer_, x, y, *a, **kw):
+            for n in range(1, touches + 1):
+                printer_.send_event('nebulaos:contact_touch', n, touches)
+                snap('touch')
+            return _accepted_measurement(x, y, 2.5, 0.831)
+        orig = nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair
+        nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = \
+            measure
+        self.addCleanup(setattr, nebulaos_calibration.nebulaos_probe_pair,
+                        'measure_probe_nozzle_pair', orig)
+        if nozzle_clean_ok:
+            with self.assertRaises(RestartTriggered):
+                coord.cmd_auto_calibrate(fake.FakeGCmd({}))
+        else:
+            with self.assertRaises(fake.CommandError):
+                coord.cmd_auto_calibrate(fake.FakeGCmd({}))
+        return printer, gcode, coord, seen
+
+    def test_idle_progress_is_null_and_history_has_every_key(self):
+        printer, gcode, coord = _build_auto_calibrate(
+            config_overrides={'journal_path': self.journal_path})
+        st = coord.get_status(0.)
+        self.assertIsNone(st['progress'])
+        self.assertIsNone(st['last_result'])
+        self.assertEqual(sorted(st['history']),
+                         sorted(calibration_history.FLOWS))
+        self.assertEqual(st['history']['pid'],
+                         {'done_at': None, 'summary': '', 'redo': None})
+        self.assertEqual(coord.history_path, self.history_path)
+
+    def test_steps_in_order_with_labels(self):
+        printer, gcode, coord, seen = self._run()
+        steps = {}
+        for name, p in seen:
+            self.assertEqual(p['flow'], 'auto_calibrate')
+            self.assertEqual(p['total'], 10)
+            steps.setdefault(name, p['step'])
+        self.assertEqual(steps['G28'], 2)
+        self.assertEqual(steps['_NEBULAOS_NOZZLE_CLEAN'], 3)
+        self.assertEqual(steps['M190'], 4)
+        self.assertEqual(steps['G4'], 5)
+        self.assertEqual(steps['touch'], 7)
+        self.assertEqual(steps['BED_MESH_CALIBRATE'], 8)
+        self.assertEqual(steps['SAVE_CONFIG'], 9)
+        order = [p['step'] for _, p in seen]
+        self.assertEqual(order, sorted(order))
+        save = dict(seen)['SAVE_CONFIG']
+        self.assertEqual(save['label'], "Saving (Klipper restarts)")
+        self.assertEqual(save['key'], 'commit')
+        touch = dict(seen)['touch']
+        self.assertEqual((touch['key'], touch['label']),
+                         ('localized_z_offset', 'Measuring the Z offset'))
+
+    def test_first_step_is_the_load_cell_check_and_hot_check_is_step_6(self):
+        probe = FakeModeProbe('auto')
+        at_check = []
+        printer_box = []
+        orig = probe.run_auto_check
+
+        def check():
+            at_check.append(printer_box[0].get_status(0.)['progress']['step'])
+            return orig()
+        probe.run_auto_check = check
+        printer, gcode, coord = _build_auto_calibrate(
+            probe, FakeProbeObj(z_offset=1.795),
+            config_overrides={'journal_path': self.journal_path})
+        printer_box.append(coord)
+        gcode.commands['_NEBULAOS_NOZZLE_CLEAN'] = lambda g: None
+        gcode.commands['_NEBULAOS_Z_OFFSET_CALIBRATE'] = \
+            coord.cmd_z_offset_calibrate
+        orig_m = nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair
+        nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = \
+            lambda printer_, x, y, *a, **kw: _accepted_measurement(
+                x, y, 2.5, 0.831)
+        self.addCleanup(setattr, nebulaos_calibration.nebulaos_probe_pair,
+                        'measure_probe_nozzle_pair', orig_m)
+        with self.assertRaises(RestartTriggered):
+            coord.cmd_auto_calibrate(fake.FakeGCmd({}))
+        self.assertEqual(at_check, [1, 6])
+
+    def test_heating_detail_shows_live_temperatures(self):
+        printer, gcode, coord, seen = self._run()
+        self.assertEqual(dict(seen)['M190']['detail'],
+                         "bed 61/65 C, nozzle 148/150 C")
+        self.assertEqual(dict(seen)['G28']['detail'], '')
+
+    def test_touch_count(self):
+        printer, gcode, coord, seen = self._run(touches=3)
+        details = [p['detail'] for name, p in seen if name == 'touch']
+        self.assertEqual(details, ['touch 1 of 3', 'touch 2 of 3',
+                                   'touch 3 of 3'])
+
+    def test_bed_mesh_point_count(self):
+        printer, gcode, coord, seen = self._run(samples=2, mesh_events=5)
+        self.assertEqual(dict(seen)['BED_MESH_CALIBRATE']['detail'],
+                         'point 1 of 81')
+        self.assertEqual(dict(seen)['mesh-probed']['detail'],
+                         'point 3 of 81')
+
+    def test_bed_mesh_point_count_unobservable_is_empty(self):
+        printer, gcode, coord, seen = self._run()
+        printer.objects['bed_mesh'].bmc = None
+        coord._auto_step = 8
+        self.assertEqual(coord.get_status(0.)['progress']['detail'], '')
+
+    def test_last_result_and_history_survive_the_save_config_restart(self):
+        self._run()
+        # the restart: a NEW process reads the journal and the history
+        printer, gcode, coord = _build_auto_calibrate(
+            probe_obj=FakeProbeObj(z_offset=1.669),
+            bed_mesh=FakeBedMesh(profile_name=''
+                                 , profiles={'default': {}}),
+            config_overrides={'journal_path': self.journal_path})
+        self.assertIsNone(coord.get_status(0.)['last_result'])
+        printer.send_event('klippy:ready')
+        st = coord.get_status(0.)
+        self.assertIsNone(st['progress'])
+        res = st['last_result']
+        self.assertEqual(res['flow'], 'auto_calibrate')
+        self.assertTrue(res['ok'])
+        self.assertEqual(res['summary'], ["Z offset 1.669 mm (was 1.795)",
+                                          "Bed mesh 3x2, range 0.30 mm"])
+        self.assertEqual((res['error_step'], res['error'], res['advice']),
+                         ('', '', ''))
+        self.assertIsInstance(res['finished_at'], float)
+        h = st['history']['auto_calibrate']
+        self.assertEqual(h['summary'], "Z offset 1.669 mm, mesh range 0.30 mm")
+        self.assertIsNotNone(h['done_at'])
+        self.assertIsNone(h['redo'])
+        # and it is on disk for the next restart too
+        printer2, _, coord2 = _build_auto_calibrate(
+            config_overrides={'journal_path': self.journal_path})
+        self.assertEqual(coord2.get_status(0.)['last_result'], res)
+
+    def test_z_adjustment_reset_is_on_the_end_screen(self):
+        lines = nebulaos_calibration.auto_calibrate_summary(
+            1.7, 1.75, {'probed_matrix': MATRIX}, 0.05)
+        self.assertEqual(lines[-1], "Z adjustment reset to 0 (was +0.050 mm)")
+        self.assertEqual(len(nebulaos_calibration.auto_calibrate_summary(
+            1.7, 1.75, {}, 0.)), 1)
+
+    def test_verification_mismatch_is_a_failure_at_verifying(self):
+        self._run()
+        printer, gcode, coord = _build_auto_calibrate(
+            probe_obj=FakeProbeObj(z_offset=9.0),
+            config_overrides={'journal_path': self.journal_path})
+        printer.send_event('klippy:ready')
+        res = coord.get_status(0.)['last_result']
+        self.assertFalse(res['ok'])
+        self.assertEqual(res['error_step'], 'Verifying')
+        self.assertIn('bltouch.z_offset', res['error'])
+        self.assertTrue(res['advice'])
+        self.assertIsNone(
+            coord.get_status(0.)['history']['auto_calibrate']['done_at'])
+
+    def test_failure_names_the_step_why_and_what_to_do(self):
+        printer, gcode, coord, seen = self._run(nozzle_clean_ok=False)
+        st = coord.get_status(0.)
+        self.assertIsNone(st['progress'])
+        res = st['last_result']
+        self.assertFalse(res['ok'])
+        self.assertEqual(res['error_step'], 'Nozzle clean')
+        self.assertIn('simulated nozzle clean failure', res['error'])
+        self.assertIn('wipe pad', res['advice'])
+        with open(self.history_path) as f:
+            self.assertEqual(json.load(f)['last_result'], res)
+
+    def test_cancel_is_reported_as_cancelled(self):
+        printer, gcode, coord = _build_auto_calibrate(
+            FakeZOffsetProbe(True),
+            config_overrides={'journal_path': self.journal_path})
+        gcode.commands['G28'] = lambda g: coord.cmd_calibration_cancel(
+            fake.FakeGCmd({}))
+        with self.assertRaises(fake.CommandError):
+            coord.cmd_auto_calibrate(fake.FakeGCmd({}))
+        res = coord.get_status(0.)['last_result']
+        self.assertEqual((res['ok'], res['error_step'], res['error'],
+                          res['advice']), (False, 'Homing', 'Cancelled', ''))
+
+    def test_new_run_clears_the_previous_result(self):
+        printer, gcode, coord, seen = self._run(nozzle_clean_ok=False)
+        self.assertIsNotNone(coord.get_status(0.)['last_result'])
+        gcode.commands['G28'] = lambda g: self.assertIsNone(
+            coord.get_status(0.)['last_result'])
+        gcode.commands['_NEBULAOS_NOZZLE_CLEAN'] = lambda g: None
+        with self.assertRaises(RestartTriggered):
+            coord.cmd_auto_calibrate(fake.FakeGCmd({}))
+
+    def test_status_values_are_copies(self):
+        printer, gcode, coord = _build_auto_calibrate(
+            config_overrides={'journal_path': self.journal_path})
+        st = coord.get_status(0.)
+        st['history']['pid']['summary'] = 'changed'
+        self.assertEqual(coord.get_status(0.)['history']['pid']['summary'], '')
+
+
+class CalibrationRecordTest(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmpdir, True)
+        self.journal_path = os.path.join(self.tmpdir, 'journal.json')
+
+    def _coord(self):
+        return _build_auto_calibrate(
+            config_overrides={'journal_path': self.journal_path})
+
+    def _record(self, coord, **params):
+        gcmd = fake.FakeGCmd({k: str(v) for k, v in params.items()})
+        coord.cmd_calibration_record(gcmd)
+        return gcmd
+
+    def test_records_and_persists(self):
+        printer, gcode, coord = self._coord()
+        self._record(coord, FLOW='PID',
+                     SUMMARY='"Bed 65 C, hotend 230 C"')
+        h = coord.get_status(0.)['history']['pid']
+        self.assertEqual(h['summary'], 'Bed 65 C, hotend 230 C')
+        self.assertIsNotNone(h['done_at'])
+        printer2, _, coord2 = self._coord()
+        self.assertEqual(coord2.get_status(0.)['history']['pid'], h)
+
+    def test_unknown_flow_is_refused(self):
+        printer, gcode, coord = self._coord()
+        for flow in ('', 'nonsense', 'auto_calibrate', 'load_cell',
+                     'bed_tram', 'esteps', 'input_shaper'):
+            with self.assertRaises(fake.CommandError):
+                self._record(coord, FLOW=flow, SUMMARY='x')
+        self.assertFalse(os.path.exists(coord.history_path))
+
+    def test_summary_is_sanitised_and_capped(self):
+        printer, gcode, coord = self._coord()
+        self._record(coord, FLOW='skew', SUMMARY='a\x1b[31m\tb\n  c' + 'x' * 300)
+        s = coord.get_status(0.)['history']['skew']['summary']
+        self.assertTrue(s.startswith('a [31m b c'))
+        self.assertEqual(len(s), calibration_history.MAX_SUMMARY_LEN)
+        self.assertTrue(s.endswith('...'))
+        self.assertTrue(all(c.isprintable() for c in s))
+
+    def test_axis_twist_makes_auto_calibrate_stale_and_a_new_run_clears_it(self):
+        printer, gcode, coord = self._coord()
+        self._record(coord, FLOW='axis_twist', SUMMARY='X and Y')
+        self.assertEqual(
+            coord.get_status(0.)['history']['auto_calibrate']['redo'],
+            'Axis Twist changed')
+        coord.record_flow('auto_calibrate', 'Z offset 1.700 mm')
+        self.assertIsNone(
+            coord.get_status(0.)['history']['auto_calibrate']['redo'])
+
+    def test_corrupt_history_file_starts_empty_with_a_warning(self):
+        with open(os.path.join(self.tmpdir, 'calibration_history.json'),
+                  'w') as f:
+            f.write('{not json')
+        with self.assertLogs(level='WARNING'):
+            printer, gcode, coord = self._coord()
+        said = []
+        gcode.respond_info = said.append
+        st = coord.get_status(0.)
+        self.assertIsNone(st['last_result'])
+        self.assertIsNone(st['history']['pid']['done_at'])
+        printer.send_event('klippy:ready')
+        self.assertTrue(any('unreadable' in s for s in said))
+        # and the next write repairs it
+        self._record(coord, FLOW='pid', SUMMARY='ok')
+        printer2, _, coord2 = self._coord()
+        self.assertEqual(coord2.get_status(0.)['history']['pid']['summary'],
+                         'ok')
+
+    def test_unwritable_history_never_fails_the_record(self):
+        printer, gcode, coord = self._coord()
+        blocker = os.path.join(self.tmpdir, 'file')
+        open(blocker, 'w').close()
+        coord.history_path = os.path.join(blocker, 'sub', 'h.json')
+        with self.assertLogs(level='ERROR'):
+            self._record(coord, FLOW='pid', SUMMARY='ok')
+        self.assertEqual(coord.get_status(0.)['history']['pid']['summary'],
+                         'ok')
+
+
+class GuidedFlowProgressTest(unittest.TestCase):
+    def test_esteps_progress_and_result(self):
+        printer, gcode, coord = _build_esteps(FakeExtruderObj(rotation_distance=7.5))
+        seen = []
+        orig_run = gcode.run_script_from_command
+
+        def run(script):
+            p = coord.get_status(0.)['progress']
+            seen.append((script.split()[0], p and p['step']))
+            return orig_run(script)
+        gcode.run_script_from_command = run
+        coord.cmd_esteps_calibrate(fake.FakeGCmd({}))
+        self.assertEqual(seen[0], ('M104', 1))
+        p = coord.get_status(0.)['progress']
+        self.assertEqual((p['flow'], p['step'], p['total'], p['key']),
+                         ('esteps', 2, 5, 'mark_filament'))
+        coord.cmd_esteps_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
+        self.assertEqual(coord.get_status(0.)['progress']['step'], 3)
+        coord.cmd_esteps_calibrate(fake.FakeGCmd({'MEASURED': '95'}))
+        self.assertEqual(coord.get_status(0.)['progress']['step'], 4)
+        coord.cmd_esteps_confirm(fake.FakeGCmd({}))
+        st = coord.get_status(0.)
+        self.assertEqual(st['progress']['label'], 'Saving (Klipper restarts)')
+        self.assertTrue(st['last_result']['ok'])
+        self.assertEqual(st['last_result']['summary'],
+                         ['Rotation distance 7.1250 (was 7.5000)'])
+        self.assertIsNotNone(st['history']['esteps']['done_at'])
+
+    def test_esteps_implausible_measurement_is_a_failed_result(self):
+        printer, gcode, coord = _build_esteps()
+        coord.cmd_esteps_calibrate(fake.FakeGCmd({}))
+        coord.cmd_esteps_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
+        with self.assertRaises(fake.CommandError):
+            coord.cmd_esteps_calibrate(fake.FakeGCmd({'MEASURED': '10'}))
+        st = coord.get_status(0.)
+        self.assertIsNone(st['progress'])
+        self.assertEqual(st['last_result']['error_step'],
+                         'Measure and enter the length')
+        self.assertIsNone(st['history']['esteps']['done_at'])
+
+    def test_input_shaper_progress_and_result_after_restart(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        overrides = {'input_shaper_journal_path': os.path.join(tmp, 'is.json'),
+                     'journal_path': os.path.join(tmp, 'ac.json')}
+        printer, gcode, coord, shaper = _build_input_shaper_calibrate(
+            config_overrides=dict(overrides))
+        seen = []
+        orig_run = gcode.run_script_from_command
+
+        def run(script):
+            seen.append((script.split()[0],
+                         coord.get_status(0.)['progress']['step']))
+            return orig_run(script)
+        gcode.run_script_from_command = run
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({}))
+        self.assertEqual(coord.get_status(0.)['progress']['step'], 2)
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
+        self.assertEqual(coord.get_status(0.)['progress']['step'], 4)
+        with self.assertRaises(RestartTriggered):
+            coord.cmd_input_shaper_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
+        self.assertEqual(seen, [('G28', 1), ('SHAPER_CALIBRATE', 3),
+                                ('SHAPER_CALIBRATE', 5), ('SAVE_CONFIG', 6)])
+        # restart: the new process verifies and publishes
+        printer2, gcode2, coord2, shaper2 = _build_input_shaper_calibrate(
+            config_overrides=dict(overrides))
+        shaper2.x.params.shaper_type, shaper2.x.params.shaper_freq = 'mzv', 45.3
+        shaper2.y.params.shaper_type, shaper2.y.params.shaper_freq = 'ei', 38.7
+        printer2.send_event('klippy:ready')
+        st = coord2.get_status(0.)
+        self.assertEqual(st['last_result']['flow'], 'input_shaper')
+        self.assertTrue(st['last_result']['ok'])
+        self.assertEqual(st['last_result']['summary'],
+                         ['X: mzv 45.3 Hz', 'Y: ei 38.7 Hz'])
+        self.assertEqual(st['history']['input_shaper']['summary'],
+                         'X: mzv 45.3 Hz; Y: ei 38.7 Hz')

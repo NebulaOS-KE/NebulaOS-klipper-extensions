@@ -294,7 +294,12 @@ def measure_probe_nozzle_pair(printer, x, y, probe_x_offset, probe_y_offset,
     contact_id = reactor.monotonic()
     samples = []
     accepted_zs = []
+    send_event = getattr(printer, 'send_event', None)
     for i in range(pro_cnt):
+        # G104: "touch n of m" for the screen (nebulaos_calibration
+        # listens); purely informational, never changes the motion.
+        if send_event is not None:
+            send_event("nebulaos:contact_touch", i + 1, pro_cnt)
         starting_z = toolhead.get_position()[2]
         raw_z = fitted_z = fit_delta = None
         fit_valid = motion_safe = accepted = False
