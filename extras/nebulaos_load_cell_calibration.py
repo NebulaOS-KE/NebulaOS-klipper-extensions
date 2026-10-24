@@ -46,6 +46,8 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
+import logging
+
 from . import nebulaos_raw_contact as raw_contact
 
 _MAX_ERROR_LEN = 200
@@ -521,10 +523,24 @@ class NebulaOSLoadCellCalibration:
             raise
         self.state = COMPLETE
         self._dismiss()
+        self._record("Manual (bottle): %.1f counts per gram"
+                     % (self.counts_per_gram,))
         self.gcode.respond_info(
             "%s: %.5f counts per gram, zero %d - saving, Klipper restarts"
             % (CMD, self.counts_per_gram, self.tare_counts))
         self.gcode.run_script_from_command('SAVE_CONFIG')
+
+    def _record(self, summary):
+        """G105: a new load cell result - history 'load_cell' (clears its
+        Redo). Owned by [nebulaos_calibration]; never fails this flow."""
+        cal = self.printer.lookup_object('nebulaos_calibration', None)
+        if cal is None or not hasattr(cal, 'record_flow'):
+            return
+        try:
+            cal.record_flow('load_cell', summary)
+        except Exception:
+            logging.exception("nebulaos_load_cell_calibration: calibration "
+                              "history not updated")
 
     def cmd_cancel(self, gcmd):
         if self.state not in ACTIVE:
@@ -611,6 +627,7 @@ class NebulaOSLoadCellCalibration:
             raise gcmd.error("%s: automatic check FAILED - %s. Remove "
                              "everything from the bed and try again, or %s."
                              % (CHECK_CMD, reason, MANUAL_HINT))
+        self._record("Automatic check passed")
         st = probe.auto_status()
         gcmd.respond_info(
             "%s: passed - empty-bed reference %d counts saved%s%s"

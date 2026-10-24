@@ -568,3 +568,50 @@ class ModeCommandTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class RecordingCalibration:
+    def __init__(self):
+        self.calls = []
+
+    def record_flow(self, key, summary):
+        self.calls.append((key, summary))
+
+
+class CalibrationHistoryTest(unittest.TestCase):
+    """G105: a new load cell result records 'load_cell' (clears its Redo)."""
+
+    def test_passed_auto_check_records(self):
+        printer, gcode, obj, probe = _build_mode()
+        cal = RecordingCalibration()
+        printer.add_object('nebulaos_calibration', cal)
+        obj.cmd_auto_check(fake.FakeGCmd({}))
+        self.assertEqual(cal.calls, [('load_cell', 'Automatic check passed')])
+
+    def test_failed_auto_check_does_not_record(self):
+        printer, gcode, obj, probe = _build_mode(
+            check_result=(False, 'the reading does not change'))
+        cal = RecordingCalibration()
+        printer.add_object('nebulaos_calibration', cal)
+        with self.assertRaises(fake.CommandError):
+            obj.cmd_auto_check(fake.FakeGCmd({}))
+        self.assertEqual(cal.calls, [])
+
+    def test_bottle_apply_and_save_records_before_the_restart(self):
+        lc, gcode, obj = _up_to_weight([_samples(_weight(1500)),
+                                        _samples(_weight(1500)),
+                                        _samples(TARE)])
+        cal = RecordingCalibration()
+        obj.printer.add_object('nebulaos_calibration', cal)
+        order = []
+        cal.record_flow = lambda k, s: order.append(('record', k, s))
+        orig = gcode.run_script_from_command
+        gcode.run_script_from_command = lambda s: (order.append(s), orig(s))
+        _cmd(obj, WEIGH=1)
+        _cmd(obj, NEXT=1)
+        _cmd(obj, NEXT=1)
+        _cmd(obj, NEXT=1)
+        _cmd(obj, ACCEPT=1)
+        self.assertEqual(order[-1], 'SAVE_CONFIG')
+        self.assertEqual(order[-2][:2], ('record', 'load_cell'))
+        self.assertIn('counts per gram', order[-2][2])

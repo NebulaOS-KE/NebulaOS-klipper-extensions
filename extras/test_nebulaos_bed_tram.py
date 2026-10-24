@@ -376,3 +376,70 @@ class SessionTest(TramTestBase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class RecordingCalibration:
+    """[nebulaos_calibration]'s history surface (G105)."""
+    def __init__(self, fail=False):
+        self.calls = []
+        self.fail = fail
+
+    def record_flow(self, key, summary):
+        self.calls.append(('record', key, summary))
+        if self.fail:
+            raise RuntimeError("disk full")
+
+    def mark_redo(self, keys, reason):
+        self.calls.append(('redo', tuple(keys), reason))
+        if self.fail:
+            raise RuntimeError("disk full")
+
+
+class CalibrationHistoryTest(TramTestBase):
+    def _with_cal(self, measurements, fail=False):
+        obj, gcode, tilt = self.build(measurements, mount='rigid')
+        cal = RecordingCalibration(fail)
+        obj.printer.add_object('nebulaos_calibration', cal)
+        return obj, cal
+
+    def test_shim_at_front_left_marks_load_cell_and_auto_calibrate(self):
+        obj, cal = self._with_cal(
+            [[0.00, 0.15, 0.13, 0.12], [0.09, 0.15, 0.13, 0.12]])
+        self.tram_cmd(obj)
+        self.assertEqual(cal.calls, [])          # nothing done yet
+        self.tram_cmd(obj, CONFIRM=1)
+        self.assertEqual(cal.calls[0], ('redo', ('load_cell', 'auto_calibrate'),
+                                        'a shim was added at front left'))
+        self.assertEqual(obj.state, tram.COMPLETE)
+        self.assertEqual(cal.calls[1], ('record', 'bed_tram',
+                                        'All corners within 0.06 mm'))
+
+    def test_shim_elsewhere_marks_nothing(self):
+        obj, cal = self._with_cal(
+            [[0.15, 0.15, 0.00, 0.12], [0.15, 0.15, 0.10, 0.12]])
+        self.tram_cmd(obj)
+        self.assertEqual(obj.target, 2)
+        self.tram_cmd(obj, CONFIRM=1)
+        self.assertEqual([c[0] for c in cal.calls], ['record'])
+
+    def test_stopped_flow_is_not_recorded_as_done(self):
+        obj, cal = self._with_cal([[0.0, 0.3, 0.3, 0.3]] * 3)
+        self.tram_cmd(obj)
+        self.tram_cmd(obj, CONFIRM=1)
+        self.tram_cmd(obj, CONFIRM=1)
+        self.assertEqual(obj.state, tram.STOPPED)
+        self.assertNotIn('record', [c[0] for c in cal.calls])
+
+    def test_history_failure_never_breaks_tramming(self):
+        obj, cal = self._with_cal(
+            [[0.00, 0.15, 0.13, 0.12], [0.09, 0.15, 0.13, 0.12]], fail=True)
+        self.tram_cmd(obj)
+        with self.assertLogs(level='ERROR'):
+            self.tram_cmd(obj, CONFIRM=1)
+        self.assertEqual(obj.state, tram.COMPLETE)
+
+    def test_without_calibration_object_nothing_happens(self):
+        obj, gcode, tilt = self.build([[0.0, 0.04, 0.08, 0.02]],
+                                      mount='rigid')
+        self.tram_cmd(obj)
+        self.assertEqual(obj.state, tram.COMPLETE)

@@ -26,6 +26,7 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
 import json
+import logging
 import math
 import os
 
@@ -300,6 +301,12 @@ class NebulaOSBedTram:
                 % (CMD, self.state))
         if self.target == LOAD_CELL_CORNER:
             self.load_cell_corner_changed = True
+            # G105: the load cell mounting changed - Load Cell Calibration
+            # and Auto Calibration must be redone (recorded at once: the
+            # shim is in, whether or not the tramming is finished).
+            self._calibration_history(
+                'mark_redo', ('load_cell', 'auto_calibrate'),
+                "a shim was added at front left")
         self._measure_and_decide()
 
     def _measure(self):
@@ -372,10 +379,25 @@ class NebulaOSBedTram:
         self.message = " ".join(self.action_lines())
         self._show()
 
+    def _calibration_history(self, method, *args):
+        """G105: tell [nebulaos_calibration] (history owner); never fails
+        the tramming."""
+        cal = self.printer.lookup_object('nebulaos_calibration', None)
+        if cal is None or not hasattr(cal, method):
+            return
+        try:
+            getattr(cal, method)(*args)
+        except Exception:
+            logging.exception("nebulaos_bed_tram: calibration history "
+                              "not updated")
+
     def _complete(self):
         self.state = COMPLETE
         self.target = None
         self.action = None
+        self._calibration_history(
+            'record_flow', 'bed_tram',
+            "All corners within %.2f mm" % (max(self.devs),))
         lines = ["Bed tramming complete. No further screw or spacer "
                  "adjustments needed."] + self._corner_lines()
         buttons = []
