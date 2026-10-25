@@ -196,6 +196,75 @@ class RecordingPwm(nb.SysfsPwm):
         self.log.append((name, int(value)))
 
 
+class KernelRulesPwm(nb.SysfsPwm):
+    """The Linux 6.6 PWM core's rules for the sysfs files (core.c
+    pwm_apply_state): every change is applied as a whole state, and a state
+    with period 0 or duty > period is refused with EINVAL. A fresh export
+    starts at period 0, duty 0, disabled."""
+    def __init__(self, *a, **kw):
+        nb.SysfsPwm.__init__(self, *a, **kw)
+        self.hw = {'period': 0, 'duty_cycle': 0, 'enable': 0}
+        self.dir_exists = True
+
+    def _read_int(self, name):
+        return self.hw[name]
+
+    def _write(self, name, value):
+        new = dict(self.hw)
+        new[name] = int(value)
+        if not new['period'] or new['duty_cycle'] > new['period']:
+            raise OSError(22, "Invalid argument")
+        self.hw = new
+
+
+class KernelRulesTest(unittest.TestCase):
+    """Run 19 ke-dev: 'beeper unavailable: [Errno 22] Invalid argument' -
+    setup wrote enable/duty while the fresh channel's period was 0."""
+    def fresh(self):
+        p = KernelRulesPwm('/x', 3)
+        p.setup_export = lambda: None
+        return p
+
+    def test_setup_on_a_fresh_channel(self):
+        p = self.fresh()
+        orig = os.path.isdir
+        os.path.isdir = lambda d: True
+        try:
+            p.setup()
+        finally:
+            os.path.isdir = orig
+        self.assertEqual(p.hw['enable'], 0)
+        self.assertEqual(p.hw['period'], 40000)
+
+    def test_every_pitch_change_is_valid(self):
+        p = self.fresh()
+        orig = os.path.isdir
+        os.path.isdir = lambda d: True
+        try:
+            p.setup()
+        finally:
+            os.path.isdir = orig
+        for freq, duty in ((440, 0.5), (2000, 0.5), (20, 0.5), (262, 0.02),
+                           (262, 0.5), (20000, 0.5), (260, 0.02)):
+            p.tone(freq, duty)
+            self.assertEqual(p.hw['enable'], 1)
+            self.assertEqual(p.hw['period'], nb.NS_PER_S // freq)
+        p.off()
+        self.assertEqual(p.hw['enable'], 0)
+
+    def test_setup_after_a_previous_klippy(self):
+        # a long low note left behind: duty above the 40 us prime period
+        p = self.fresh()
+        p.hw = {'period': 3816793, 'duty_cycle': 1908396, 'enable': 1}
+        orig = os.path.isdir
+        os.path.isdir = lambda d: True
+        try:
+            p.setup()
+        finally:
+            os.path.isdir = orig
+        self.assertEqual((p.hw['enable'], p.hw['period']), (0, 40000))
+
+
 class RtttlTest(unittest.TestCase):
     def test_defaults_and_notes(self):
         segs = nb.parse_rtttl("t:d=4,o=5,b=120:8c,p,a#4,8e6.", 0.5)

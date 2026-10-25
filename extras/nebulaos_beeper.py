@@ -188,12 +188,31 @@ class SysfsPwm:
         with open(os.path.join(self.dir, name), 'w') as f:
             f.write(str(value))
 
+    def _read_int(self, name):
+        try:
+            with open(os.path.join(self.dir, name)) as f:
+                return int(f.read().strip())
+        except (IOError, OSError, ValueError):
+            return 0
+
     def setup(self):
         if not os.path.isdir(self.dir):
             with open(os.path.join(self.chip_dir, 'export'), 'w') as f:
                 f.write(str(self.channel))
         if not os.path.isdir(self.dir):
             raise BeeperError("%s did not appear after export" % (self.dir,))
+        # A freshly exported channel has period 0, and the PWM core refuses
+        # EVERY change while the period is 0 (pwm_apply_state: -EINVAL for
+        # !state->period, found on ke-dev in Run 19) - so the period is set
+        # first; duty is 0 after export, so this write is always valid.
+        self.period = self._read_int('period')
+        self.duty = self._read_int('duty_cycle')
+        if not self.period or self.duty > 40000:
+            if self.duty > 40000:
+                self._write('duty_cycle', 0)
+                self.duty = 0
+            self._write('period', 40000)
+            self.period = 40000
         # Known state: off. Then "prime" the output once: the kernel driver
         # enables the pad output (PWM_OEN) on the first apply, after which a
         # disabled channel drives its idle level (low) instead of leaving
