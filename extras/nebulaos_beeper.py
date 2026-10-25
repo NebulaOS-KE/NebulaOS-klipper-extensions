@@ -229,6 +229,12 @@ class SysfsPwm:
                 self.duty = 0
             self._set_period(period)
         if duty_ns != self.duty:
+            # Run 19 architect A5: the vendor driver spins on pwm_busy() when
+            # an ENABLED channel is reprogrammed (up to one period on the
+            # reactor) - so a duty-only change also goes through off first.
+            if self.enabled:
+                self._write('enable', 0)
+                self.enabled = False
             self._write('duty_cycle', duty_ns)
             self.duty = duty_ns
         if not self.enabled:

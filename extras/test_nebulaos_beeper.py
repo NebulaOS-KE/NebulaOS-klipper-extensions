@@ -293,8 +293,13 @@ class SysfsPwmTest(unittest.TestCase):
                                  ('period', 500000), ('duty_cycle', 250000),
                                  ('enable', 1)])
         p.log = []
-        p.tone(2000, 0.02)  # same pitch, new volume: duty only
-        self.assertEqual(p.log, [('duty_cycle', 10000)])
+        p.tone(2000, 0.02)  # same pitch, new volume: off, duty, on (A5:
+        # never reprogram an enabled channel - the driver would spin)
+        self.assertEqual(p.log, [('enable', 0), ('duty_cycle', 10000),
+                                 ('enable', 1)])
+        p.log = []
+        p.tone(2000, 0.02)  # nothing changes: nothing written
+        self.assertEqual(p.log, [])
         p.log = []
         p.off()
         p.off()
