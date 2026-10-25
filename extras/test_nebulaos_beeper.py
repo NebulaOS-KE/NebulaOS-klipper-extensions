@@ -64,10 +64,13 @@ class FakeReactor(object):
     def update_timer(self, timer, waketime):
         self.timers[timer] = waketime
 
+    lag = 0.     # a busy Klippy: every timer fires this much late
+
     def run_until(self, t):
         """Fire due timers in order until reactor time t."""
         while True:
-            due = [(w, cb) for cb, w in self.timers.items() if w <= t]
+            due = [(w + self.lag, cb) for cb, w in self.timers.items()
+                   if w + self.lag <= t]
             if not due:
                 break
             w, cb = min(due, key=lambda x: x[0])
@@ -509,12 +512,37 @@ class BeeperTest(unittest.TestCase):
         self.assertEqual(b.pwm.duty, int(NS(260) * 0.02))
         self.r.run_until(100.01)
         self.assertFalse(b.pwm.enabled)
+        b.pwm.log = []
         b.cmd_NEBULAOS_BEEP(FakeGcmd({'FREQ': '1000', 'DURATION': '500'}))
         self.printer.objects['toolhead'].flush(50.01)
+        self.assertEqual(self.tones(b), [NS(1000)])   # starts at once
         b.pwm.log = []
         click(FakeWebRequest())
         self.r.run_until(100.2)
-        self.assertEqual(self.tones(b), [NS(1000)])   # no click mixed in
+        self.assertEqual(self.tones(b), [])           # no click mixed in
+
+    def test_click_on_a_late_reactor_is_played_in_full(self):
+        # Run 19 ke-dev: every second click was lost - the 4 ms click was
+        # discarded when the timer came more than 4 ms late.
+        b = self.make()
+        self.r.lag = 0.010
+        click = self.printer.objects['webhooks'].endpoints[
+            'nebulaos_beeper/click']
+        for i in range(5):
+            click(FakeWebRequest())
+            self.assertTrue(b.pwm.enabled)              # sounds at once
+            self.assertEqual(b.pwm.period, NS(260))
+            self.r.run_until(self.r.now + 0.1)
+            self.assertFalse(b.pwm.enabled)
+
+    def test_tune_on_a_late_reactor_keeps_every_note(self):
+        b = self.make()
+        self.r.lag = 0.030      # longer than the notes
+        b.cmd_NEBULAOS_PLAY_TUNE(FakeGcmd({'RTTTL': 'x:d=32,o=5,b=200:c,e,g,c6'}))
+        self.printer.objects['toolhead'].flush(50.)
+        self.r.run_until(self.r.now + 2.)
+        self.assertEqual(len(set(self.tones(b))), 4)     # c e g c6 all played
+        self.assertFalse(b.pwm.enabled)
 
     def test_unavailable_never_fails_a_print(self):
         b = self.make(available=False)
@@ -541,8 +569,8 @@ class BeeperTest(unittest.TestCase):
     def test_write_error_mid_sound_silences(self):
         b = self.make()
         b.cmd_NEBULAOS_BEEP(FakeGcmd({'FREQ': '1000', 'DURATION': '500'}))
-        self.printer.objects['toolhead'].flush(50.)
         b.pwm.fail = True
+        self.printer.objects['toolhead'].flush(50.)
         self.r.run_until(100.1)
         self.assertFalse(b.available)
         self.assertIn('write failed', b.last_error)

@@ -299,6 +299,7 @@ class NebulaOSBeeper:
         self.toolhead = self.mcu = self.print_stats = None
         # (start, end, freq, duty) in reactor time, sorted, non-overlapping
         self.segments = collections.deque()
+        self.current = None     # the segment sounding now (start, end, ...)
         self.queue_end = 0.
         self.playing = None
         self.timer = self.reactor.register_timer(self._timer_event)
@@ -334,6 +335,7 @@ class NebulaOSBeeper:
 
     def _silence(self):
         self.segments.clear()
+        self.current = None
         self.queue_end = 0.
         self.playing = None
         self.reactor.update_timer(self.timer, self.reactor.NEVER)
@@ -349,6 +351,7 @@ class NebulaOSBeeper:
         logging.warning("nebulaos_beeper: %s", self.last_error)
         self.available = False
         self.segments.clear()
+        self.current = None
         self.playing = None
         try:
             self.pwm.off()
@@ -380,8 +383,17 @@ class NebulaOSBeeper:
                 self.segments.append((t, end, freq, duty))
             t = end
         self.queue_end = t
-        self.reactor.update_timer(self.timer, self.reactor.NOW)
+        # Start right here (same reactor turn) instead of one timer hop later:
+        # the touch click is 4 ms, shorter than a busy reactor's timer delay.
+        self.reactor.update_timer(self.timer, self._timer_event(now))
         return True
+
+    def _shift(self, late):
+        # A sound that starts late keeps its full length; everything queued
+        # behind it moves back by the same amount.
+        self.segments = collections.deque(
+            (st + late, en + late, f, d) for st, en, f, d in self.segments)
+        self.queue_end += late
 
     def _enqueue_at_print_time(self, print_time, segments):
         now = self.reactor.monotonic()
@@ -400,18 +412,27 @@ class NebulaOSBeeper:
             lambda pt: self._enqueue_at_print_time(pt, segments))
 
     def _timer_event(self, eventtime):
+        # Run 19 ke-dev (Tim: touch clicks "half come through, sound
+        # different"): the reactor fires timers late on a busy Klippy. A
+        # segment that has not started yet is never dropped for being late:
+        # it is played for its full length from now (_shift).
         try:
-            while self.segments and self.segments[0][1] <= eventtime:
-                self.segments.popleft()
-            if not self.segments:
-                self.playing = None
-                self.pwm.off()
-                return self.reactor.NEVER
-            start, end, freq, duty = self.segments[0]
-            if start > eventtime:
-                self.playing = None
-                self.pwm.off()
-                return start
+            if self.current is not None and self.current[1] <= eventtime:
+                self.current = None
+            if self.current is None:
+                if not self.segments:
+                    self.playing = None
+                    self.pwm.off()
+                    return self.reactor.NEVER
+                start = self.segments[0][0]
+                if start > eventtime:
+                    self.playing = None
+                    self.pwm.off()
+                    return start
+                if eventtime > start:
+                    self._shift(eventtime - start)
+                self.current = self.segments.popleft()
+            start, end, freq, duty = self.current
             if self.playing != (freq, duty):
                 self.pwm.tone(freq, duty)
                 self.playing = (freq, duty)
