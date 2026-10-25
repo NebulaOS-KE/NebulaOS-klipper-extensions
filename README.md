@@ -52,7 +52,7 @@ update supervisor. See `docs/NEBULAOS_EXTENSIONS_BRANCH_STRATEGY.md` in the firm
 
 ## Modules
 
-`nebulaos-extensions.json` lists 49 managed files: 25 `role: runtime` and 24 `role: test`. All of
+`nebulaos-extensions.json` lists 58 managed files: 29 `role: runtime` and 29 `role: test`. All of
 them are composed (the tests import runtime modules relative to the `extras` package). Runtime
 modules:
 
@@ -63,6 +63,7 @@ modules:
 | `nebulaos_version` | `nebulaos_version` printer object: firmware, component pins and live Klipper commit |
 | `nebulaos_temperature_mcu` | MCU die temperature for the KE's GD32 chips (subclasses upstream `temperature_mcu`) |
 | `nebulaos_memory` | Klippy memory policy: resets OOM priority for forked helpers; optional `mlockall` |
+| `nebulaos_beeper` | Owner of the KE buzzer (kernel PWM channel `/sys/class/pwm/pwmchip0/pwm3`): `NEBULAOS_BEEP`, `NEBULAOS_PLAY_TUNE` (RTTTL / `songs.conf`), `NEBULAOS_BEEPER_STOP`, API endpoint `nebulaos_beeper/click` for the screen's touch click. Sounds start at the print position and never hold the G-code queue (G108) |
 | **Z offset, contact and calibration** (BLTouch/CR-Touch stays the global probe; the load cell is a secondary contact reference) | |
 | `nebulaos_calibration` | `[nebulaos_calibration]` coordinator for the `NEBULAOS_*` calibration commands (Z offset, auto-calibrate sequence) |
 | `nebulaos_calibration_journal` | Persistent JSON journal of calibration workflow progress |
@@ -83,7 +84,7 @@ modules:
 | `tmcstatus` | TMC driver status for the screen app's TMC panel (vendored, ballaswag) |
 | `calibrate_shaper_config` | `SAVE_INPUT_SHAPER`: persists input-shaper results (vendored, ballaswag) |
 | `bl24c16f` | I2C driver for the BL24C16F EEPROM (vendored, Eric Callahan) |
-| `gcode_shell_command` | Run a shell command from G-code (vendored, Eric Callahan) |
+| `gcode_shell_command` | Run a shell command from G-code (vendored, Eric Callahan); the firmware's camera quality macros still use it |
 | `virtual_pins` | Virtual pins (vendored, Pedro Lamas) |
 | **Test infrastructure** | |
 | `prtouch_test_support` | Offline fakes (config, MCU, toolhead, reactor) shared by tests. The name is legacy: the PRTouch runtime was removed (see `extras/PRTOUCH_REMOVAL_PLAN.md`) |
