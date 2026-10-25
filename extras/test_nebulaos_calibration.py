@@ -2406,6 +2406,7 @@ class LoadCellModeTest(unittest.TestCase):
     def test_auto_calibrate_refreshes_the_reference_hot_before_the_touch(self):
         probe = FakeModeProbe('auto', check_ok=[True, True])
         printer, gcode, coord = self._auto(probe)
+        coord.mark_redo(('load_cell',), 'a shim was added at front left')
         at_check = []
         orig = probe.run_auto_check
 
@@ -2427,6 +2428,12 @@ class LoadCellModeTest(unittest.TestCase):
         self.assertNotIn('_NEBULAOS_Z_OFFSET_CALIBRATE', hot)
         self.assertEqual(len(self.calls), 1)
         self.assertEqual(self.calls[0]['arming'][0], raw_contact.ARM_RAW)
+        # G105: the passed hot check is the load cell calibration in
+        # automatic mode - recorded, its redo cleared
+        lc = coord.get_status(0.)['history']['load_cell']
+        self.assertIsNotNone(lc['done_at'])
+        self.assertIsNone(lc['redo'])
+        self.assertIn('Automatic check passed', lc['summary'])
 
     def test_auto_calibrate_stops_cleanly_on_a_failed_hot_refresh(self):
         probe = FakeModeProbe('auto', check_ok=[True, False])
@@ -2447,6 +2454,8 @@ class LoadCellModeTest(unittest.TestCase):
         self.assertEqual(journal['state'], calibration_journal.STATE_ERROR)
         self.assertFalse(journal['commit_requested'])
         self.assertEqual(self.prompts[-1][0], 'Automatic load cell check failed')
+        self.assertIsNone(
+            coord.get_status(0.)['history']['load_cell']['done_at'])
 
     def test_auto_calibrate_stops_cleanly_on_a_failed_check(self):
         probe = FakeModeProbe('auto', check_ok=False)

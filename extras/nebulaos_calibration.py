@@ -1153,6 +1153,9 @@ class NebulaOSCalibration:
                 "%s: the automatic load cell check at temperature failed - "
                 "%s - use Calibration > Load Cell > Manual (bottle "
                 "calibration)" % (cmd, reason))
+        # G105: in automatic mode this IS the load cell calibration, the same
+        # check as NEBULAOS_LOAD_CELL_AUTO_CHECK - record it (clears its redo).
+        self.record_flow('load_cell', "Automatic check passed (%s)" % (cmd,))
 
     def _z_offset_arming_kwargs(self, z_offset_probe):
         """{'arming': plan} for the paired Z-offset path (standalone or
