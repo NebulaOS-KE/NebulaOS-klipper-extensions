@@ -110,7 +110,19 @@ def render(freqs, psd, shapers, axis, shaper, freq, out, size, dpi, theme):
     os.rename(tmp, out)
 
 
+def leave_oom_protection():
+    """The child starts with Klippy's OOM protection (oom_score_adj -900):
+    give it up before matplotlib loads, so on the KE's small RAM the graph -
+    not Moonraker or the screen - is what the kernel kills first."""
+    try:
+        with open('/proc/self/oom_score_adj', 'w') as f:
+            f.write('300')
+    except (IOError, OSError):
+        pass
+
+
 def main(argv):
+    leave_oom_protection()
     if len(argv) not in (6, 7):
         sys.stderr.write("usage: nebulaos_shaper_graph.py CSV AXIS SHAPER FREQ "
                          "SCREEN_PNG [BIG_PNG]\n")

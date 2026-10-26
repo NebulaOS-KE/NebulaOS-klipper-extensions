@@ -2959,6 +2959,47 @@ class G109InputShaperFeedbackTest(unittest.TestCase):
         self.assertIn("longer than", err)
 
 
+class G109HardeningTest(unittest.TestCase):
+    """Verifier notes (Run 20): the console reader never raises into
+    upstream respond_raw; the real child's stderr is read from a file."""
+
+    def _coord(self):
+        printer = fake.FakePrinter()
+        gcode = RecordingGCode()
+        printer.add_object('gcode', gcode)
+        printer.add_object('probe', FakeProbeObj())
+        printer.add_object('configfile', FakeConfigFile())
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        values = {'reference_x': '20', 'reference_y': '25',
+                  'input_shaper_journal_path': os.path.join(tmp, 'is.json'),
+                  'shaper_graph_config_dir': os.path.join(tmp, 'cfg')}
+        _isolate_history(values)
+        config = fake.FakeConfig(values, section='nebulaos_calibration', printer=printer)
+        return printer, nebulaos_calibration.NebulaOSCalibration(config), tmp
+
+    def test_a_bad_console_line_never_raises(self):
+        printer, coord, tmp = self._coord()
+        coord.input_shaper_phase = 'measuring'
+        def boom(msg):
+            raise ValueError("unexpected")
+        coord._read_shaper_line = boom
+        coord._handle_gcode_output("// Testing frequency 45 Hz")   # no exception
+
+    def test_real_child_reports_its_error_through_the_file(self):
+        printer, coord, tmp = self._coord()
+        import time as _time
+        printer.get_reactor = lambda: types.SimpleNamespace(
+            monotonic=_time.monotonic,
+            pause=lambda t: (_time.sleep(max(0., t - _time.monotonic())), _time.monotonic())[1])
+        proc = coord._start_graph_process(
+            [os.path.join(tmp, 'missing.csv'), 'x', 'mzv', '52.4', os.path.join(tmp, 's.png')])
+        rc, err = coord._wait_child(proc, 60.)
+        self.assertEqual(rc, 1)
+        self.assertIn("missing.csv", err)
+        self.assertTrue(proc.stderr.closed)
+
+
 class G109EStepsPromptTest(unittest.TestCase):
     def _build(self):
         printer = fake.FakePrinter()

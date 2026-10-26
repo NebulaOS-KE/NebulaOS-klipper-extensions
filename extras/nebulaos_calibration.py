@@ -883,9 +883,16 @@ class NebulaOSCalibration:
         return ''
 
     def _handle_gcode_output(self, msg):
-        """Every console line; only read while an axis is measured."""
+        """Every console line; only read while an axis is measured. Runs
+        inside upstream respond_raw: it must never raise."""
         if self.input_shaper_phase not in ('measuring', 'calculating'):
             return
+        try:
+            self._read_shaper_line(msg)
+        except Exception:
+            logging.exception("nebulaos_calibration: console line not read")
+
+    def _read_shaper_line(self, msg):
         m = _RE_TEST_FREQ.search(msg)
         if m:
             self.input_shaper_test_freq = float(m.group(1))
@@ -928,7 +935,17 @@ class NebulaOSCalibration:
                 proc.wait()
                 return None, "took longer than %.0f s" % (timeout,)
             eventtime = reactor.pause(eventtime + .2)
-        err = proc.stderr.read() if proc.stderr is not None else b''
+        err = b''
+        if proc.stderr is not None:
+            try:
+                proc.stderr.seek(0)
+                err = proc.stderr.read(4096)
+            except Exception:
+                err = b''
+            try:
+                proc.stderr.close()
+            except Exception:
+                pass
         if isinstance(err, bytes):
             err = err.decode('utf-8', 'replace')
         return proc.returncode, err.strip()
@@ -940,9 +957,19 @@ class NebulaOSCalibration:
         nice = shutil.which('nice')
         if nice:
             cmd = [nice, '-n', '19'] + cmd
-        return subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
-                                stdout=subprocess.DEVNULL,
-                                stderr=subprocess.PIPE, close_fds=True, env=env)
+        # stderr goes to an unlinked temp file, not a pipe: a chatty child
+        # can never block on a full pipe while it is waited for
+        import tempfile
+        err = tempfile.TemporaryFile()
+        try:
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=err, close_fds=True, env=env)
+        except Exception:
+            err.close()
+            raise
+        proc.stderr = err   # read back by _wait_child (Popen leaves it None)
+        return proc
 
     def _draw_shaper_graph(self, axis, info):
         """Fills info['graph'] or info['graph_error']; never raises."""
