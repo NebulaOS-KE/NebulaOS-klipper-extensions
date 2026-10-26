@@ -20,6 +20,7 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import atexit
+import io
 import os
 import shutil
 import sys
@@ -2747,6 +2748,250 @@ class BusyTest(unittest.TestCase):
             coord.cmd_auto_calibrate(fake.FakeGCmd({}))
         self.assertEqual(seen, [True])
         self.assertIs(coord.get_status(0.)['busy'], False)
+
+
+# ----------------------------------------------------------------------
+# G109 (Run 20): Input Shaper / E-Steps prompts close, live phase, graphs
+# ----------------------------------------------------------------------
+class RecordingGCode(DispatchingFakeGCode):
+    """Records raw prompt lines and feeds respond_info through the output
+    handlers, like the real gcode object (Klipper prefixes '// ')."""
+
+    def __init__(self):
+        DispatchingFakeGCode.__init__(self)
+        self.raw = []
+        self.handlers = []
+
+    def register_output_handler(self, cb):
+        self.handlers.append(cb)
+
+    def respond_raw(self, msg):
+        self.raw.append(msg)
+        for cb in self.handlers:
+            cb(msg)
+
+    def respond_info(self, msg):
+        for line in msg.split('\n'):
+            self.respond_raw("// " + line)
+
+
+def _write_shaper_csv(path):
+    names = ["zv(59.0)", "mzv(52.4)", "ei(63.2)"]
+    with open(path, "w") as f:
+        f.write("freq,psd_x,psd_y,psd_z,psd_xyz,shapers:," + ",".join(names) + "\n")
+        fr = 5.0
+        while fr < 133.0:
+            p = 1e3 / (1 + ((fr - 48.0) / 4.0) ** 2) + 30.0
+            f.write("%.1f,%.3e,%.3e,%.3e,%.3e,," % (fr, p * .8, p * .1, p * .1, p)
+                    + ",".join("%.3f" % (1.0 / (1 + (fr / 50.0) ** 2),) for _ in names)
+                    + "\n")
+            fr += 0.2
+
+
+class G109InputShaperFeedbackTest(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmpdir, True)
+        self.seen = []
+
+    def _build(self, graph_ok=True, csv=True):
+        printer = fake.FakePrinter()
+        gcode = RecordingGCode()
+        printer.add_object('gcode', gcode)
+        printer.add_object('probe', FakeProbeObj())
+        printer.add_object('configfile', FakeConfigFile())
+        printer.add_object('resonance_tester', object())
+        shaper = FakeInputShaper()
+        printer.add_object('input_shaper', shaper)
+        results = {'X': ('mzv', 52.4), 'Y': ('ei', 38.7)}
+        test = self
+
+        def fake_shaper_calibrate(gcmd):
+            axis = gcmd.get('AXIS').upper()
+            gcode.respond_info("Testing axis %s" % axis.lower())
+            gcode.respond_info("Testing frequency 45 Hz")
+            test.seen.append(coord._progress(0)['detail'])
+            gcode.respond_info("Calculating the best input shaper parameters for %s axis" % axis.lower())
+            test.seen.append(coord._progress(0)['detail'])
+            gcode.respond_info("Fitted shaper 'mzv' frequency = 52.4 Hz (vibrations = 2.1%, smoothing ~= 0.061)")
+            gcode.respond_info("To avoid too much smoothing with 'mzv', suggested max_accel <= 7000 mm/sec^2")
+            gcode.respond_info("Fitted shaper 'ei' frequency = 38.7 Hz (vibrations = 1.0%, smoothing ~= 0.090)")
+            gcode.respond_info("To avoid too much smoothing with 'ei', suggested max_accel <= 4400 mm/sec^2")
+            t, f = results[axis]
+            getattr(shaper, axis.lower()).params.shaper_type = t
+            getattr(shaper, axis.lower()).params.shaper_freq = f
+            gcode.respond_info("Recommended shaper_type_%s = %s, shaper_freq_%s = %.1f Hz"
+                               % (axis.lower(), t, axis.lower(), f))
+            if csv:
+                path = os.path.join(test.tmpdir, 'calibration_data_%s_x.csv' % axis.lower())
+                _write_shaper_csv(path)
+                gcode.respond_info("Shaper calibration data written to %s file" % path)
+        gcode.commands['SHAPER_CALIBRATE'] = fake_shaper_calibrate
+
+        values = {'input_shaper_journal_path': os.path.join(self.tmpdir, 'is.json'),
+                  'shaper_graph_config_dir': os.path.join(self.tmpdir, 'config', 'input_shaper'),
+                  'reference_x': '20', 'reference_y': '25'}
+        _isolate_history(values)
+        config = fake.FakeConfig(values, section='nebulaos_calibration', printer=printer)
+        coord = nebulaos_calibration.NebulaOSCalibration(config)
+        config.assert_all_consumed()
+
+        def draw(args):
+            test.graph_args = args
+            if graph_ok:
+                for out in args[4:]:
+                    os.makedirs(os.path.dirname(out), exist_ok=True)
+                    with open(out, 'wb') as f:
+                        f.write(b'\x89PNG')
+            return types.SimpleNamespace(poll=lambda: 0, returncode=0 if graph_ok else 1,
+                                         stderr=io.BytesIO(b'' if graph_ok else b'ImportError: no matplotlib'))
+        coord._start_graph_process = draw
+        return gcode, coord
+
+    def test_continue_closes_the_prompt_before_measuring(self):
+        gcode, coord = self._build()
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({}))
+        gcode.raw[:] = []
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
+        self.assertEqual(gcode.raw[0], "// action:prompt_end")
+        self.assertIn("// action:prompt_show", gcode.raw)   # then "move the sensor"
+
+    def test_live_phase_detail(self):
+        gcode, coord = self._build()
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({}))
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
+        self.assertTrue(self.seen[0].startswith("Shaking X: 45 Hz"), self.seen)
+        self.assertEqual(self.seen[1], "Calculating the best shaper for X...")
+        st = coord.get_status(0)
+        self.assertEqual(st['input_shaper_phase'], '')       # back to waiting
+        self.assertEqual(st['input_shaper_state'], 'awaiting_y_mount')
+
+    def test_axis_result_with_fit_details_and_graph(self):
+        gcode, coord = self._build()
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({}))
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
+        x = coord.get_status(0)['input_shaper_axes']['x']
+        self.assertEqual((x['type'], x['freq'], x['vibrations'], x['smoothing'], x['max_accel']),
+                         ('mzv', 52.4, 2.1, 0.061, 7000.0))
+        self.assertEqual(x['graph'], os.path.join(self.tmpdir, 'input_shaper_x.png'))
+        self.assertEqual(x['graph_error'], '')
+        self.assertEqual(self.graph_args[1:4], ['x', 'mzv', '52.4'])
+        self.assertTrue(self.graph_args[5].endswith(os.path.join('config', 'input_shaper', 'shaper_x.png')))
+
+    def test_graphs_0_draws_nothing(self):
+        gcode, coord = self._build()
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({'GRAPHS': '0'}))
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
+        st = coord.get_status(0)
+        self.assertFalse(st['input_shaper_graphs_enabled'])
+        self.assertEqual(st['input_shaper_axes']['x']['graph'], '')
+        self.assertFalse(hasattr(self, 'graph_args'))
+
+    def test_a_failed_graph_never_fails_the_calibration(self):
+        gcode, coord = self._build(graph_ok=False)
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({}))
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
+        st = coord.get_status(0)
+        self.assertEqual(st['input_shaper_state'], 'awaiting_y_mount')
+        self.assertEqual(st['input_shaper_axes']['x']['graph'], '')
+        self.assertIn('no matplotlib', st['input_shaper_axes']['x']['graph_error'])
+
+    def test_no_csv_is_a_graph_error_only(self):
+        gcode, coord = self._build(csv=False)
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({}))
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
+        x = coord.get_status(0)['input_shaper_axes']['x']
+        self.assertEqual(x['graph'], '')
+        self.assertTrue(x['graph_error'])
+
+    def test_both_axes_survive_the_restart_and_the_prompt_is_closed_before_save(self):
+        gcode, coord = self._build()
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({}))
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
+        gcode.raw[:] = []
+        with self.assertRaises(RestartTriggered):
+            coord.cmd_input_shaper_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
+        self.assertEqual(gcode.raw[-1], "// action:prompt_end")
+        self.assertEqual(gcode.scripts_run[-1], 'SAVE_CONFIG')
+        # a fresh Klippy after SAVE_CONFIG (verification passes)
+        gcode2, coord2 = self._build()
+        shaper = coord2.printer.lookup_object('input_shaper')
+        shaper.x.params.shaper_type, shaper.x.params.shaper_freq = 'mzv', 52.4
+        shaper.y.params.shaper_type, shaper.y.params.shaper_freq = 'ei', 38.7
+        coord2._handle_ready()
+        st = coord2.get_status(0)
+        self.assertEqual(st['input_shaper_state'], 'complete')
+        self.assertEqual(sorted(st['input_shaper_axes']), ['x', 'y'])
+        self.assertEqual(st['input_shaper_axes']['y']['type'], 'ei')
+        self.assertTrue(st['input_shaper_axes']['y']['graph'].endswith('input_shaper_y.png'))
+
+    def test_error_closes_the_prompt_and_resets_the_phase(self):
+        gcode, coord = self._build()
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({}))
+
+        def boom(gcmd):
+            gcode.respond_info("Testing frequency 20 Hz")
+            raise fake.CommandError("accelerometer: no data")
+        gcode.commands['SHAPER_CALIBRATE'] = boom
+        gcode.raw[:] = []
+        with self.assertRaises(fake.CommandError):
+            coord.cmd_input_shaper_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
+        self.assertEqual(gcode.raw[-1], "// action:prompt_end")
+        st = coord.get_status(0)
+        self.assertEqual(st['input_shaper_phase'], '')
+        self.assertEqual(st['input_shaper_state'], 'error')
+
+    def test_cancel_resets_the_phase(self):
+        gcode, coord = self._build()
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({}))
+        coord.cmd_input_shaper_cancel(fake.FakeGCmd({}))
+        self.assertEqual(coord.get_status(0)['input_shaper_phase'], '')
+        self.assertIn("// action:prompt_end", gcode.raw[-2:])
+
+    def test_wait_child_times_out_without_blocking(self):
+        gcode, coord = self._build()
+        killed = []
+        proc = types.SimpleNamespace(poll=lambda: None, kill=lambda: killed.append(1),
+                                     wait=lambda: None, stderr=None, returncode=None)
+        rc, err = coord._wait_child(proc, 1.0)
+        self.assertIsNone(rc)
+        self.assertEqual(killed, [1])
+        self.assertIn("longer than", err)
+
+
+class G109EStepsPromptTest(unittest.TestCase):
+    def _build(self):
+        printer = fake.FakePrinter()
+        gcode = RecordingGCode()
+        printer.add_object('gcode', gcode)
+        printer.add_object('probe', FakeProbeObj())
+        printer.add_object('configfile', FakeConfigFile())
+        stepper = types.SimpleNamespace(get_rotation_distance=lambda: (7.53, 200))
+        printer.add_object('extruder', types.SimpleNamespace(
+            extruder_stepper=types.SimpleNamespace(stepper=stepper)))
+        values = {'reference_x': '20', 'reference_y': '25'}
+        _isolate_history(values)
+        config = fake.FakeConfig(values, section='nebulaos_calibration', printer=printer)
+        coord = nebulaos_calibration.NebulaOSCalibration(config)
+        return gcode, coord
+
+    def test_start_extrusion_closes_the_mark_prompt_first(self):
+        gcode, coord = self._build()
+        coord.cmd_esteps_calibrate(fake.FakeGCmd({}))
+        gcode.raw[:] = []
+        coord.cmd_esteps_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
+        self.assertEqual(gcode.raw[0], "// action:prompt_end")
+        self.assertLess(gcode.raw.index("// action:prompt_end"),
+                        len(gcode.raw) - 1)
+
+    def test_a_rejected_measurement_closes_the_prompt(self):
+        gcode, coord = self._build()
+        coord.cmd_esteps_calibrate(fake.FakeGCmd({}))
+        coord.cmd_esteps_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
+        gcode.raw[:] = []
+        with self.assertRaises(fake.CommandError):
+            coord.cmd_esteps_calibrate(fake.FakeGCmd({'MEASURED': '10'}))
+        self.assertEqual(gcode.raw[-1], "// action:prompt_end")
 
 
 if __name__ == '__main__':

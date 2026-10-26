@@ -68,6 +68,10 @@
 import logging
 import math
 import os
+import re
+import shutil
+import subprocess
+import sys
 import time
 
 from . import nebulaos_probe_pair
@@ -142,6 +146,23 @@ ESTEPS_STEPS = (
     ('commit', "Saving (Klipper restarts)", ""),
 )
 _MAX_LINE = calibration_history.MAX_SUMMARY_LEN
+
+# G109 (Run 20): what upstream SHAPER_CALIBRATE prints (resonance_tester.py /
+# shaper_calibrate.py, pinned 58bd67db) - read through a gcode output
+# handler, so the screen can say what is happening without any change to
+# the upstream command.
+_RE_TEST_FREQ = re.compile(r"Testing frequency ([0-9.]+) Hz")
+_RE_CALCULATING = re.compile(
+    r"Calculating the best input shaper parameters for (\w+) axis")
+_RE_FITTED = re.compile(
+    r"Fitted shaper '(\w+)' frequency = ([0-9.]+) Hz \(vibrations = "
+    r"([0-9.]+)%, smoothing ~= ([0-9.]+)\)")
+_RE_MAX_ACCEL = re.compile(
+    r"To avoid too much smoothing with '(\w+)', suggested max_accel <= "
+    r"([0-9.]+) mm/sec\^2")
+_RE_CSV = re.compile(r"Shaper calibration data written to (\S+\.csv) file")
+_GRAPH_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             'nebulaos_shaper_graph.py')
 
 
 def _sanitize_error(exc):
@@ -475,6 +496,18 @@ class NebulaOSCalibration:
             'shaper_freq_end', default=None, above=0.)
         self.shaper_accel_per_hz = config.getfloat(
             'shaper_accel_per_hz', default=None, above=0.)
+        # G109 (Run 20): per-axis graphs, drawn by nebulaos_shaper_graph.py
+        # in a nice'd child process after each axis. The screen PNG lives
+        # next to the journal, the large one in the config folder for
+        # Mainsail (latest per axis). A graph that fails or times out never
+        # fails the calibration.
+        self.shaper_graph_timeout = config.getfloat(
+            'shaper_graph_timeout', default=240., above=0.)
+        self.shaper_graph_dir = config.get(
+            'shaper_graph_dir',
+            default=os.path.dirname(self.input_shaper_journal_path))
+        self.shaper_graph_config_dir = config.get(
+            'shaper_graph_config_dir', default=self._default_graph_config_dir())
 
         self.z_offset_state = 'idle'
         self.z_offset_id = 0
@@ -556,6 +589,18 @@ class NebulaOSCalibration:
         self._input_shaper_type_x = None
         self._input_shaper_freq_x = None
         self._input_shaper_active_journal = None
+        # G109 (Run 20): live phase of the axis being measured and the
+        # result of each measured axis (see PLAN Run 20 fixed interface).
+        self.input_shaper_phase = ''
+        self.input_shaper_axis = ''
+        self.input_shaper_test_freq = None
+        self.input_shaper_graphs_enabled = True
+        self.input_shaper_axes = {}
+        self._shaper_fits = {}
+        self._shaper_csv = None
+        register_output = getattr(self.gcode, 'register_output_handler', None)
+        if register_output is not None:
+            register_output(self._handle_gcode_output)
 
         # G104/G105: progress, last result and calibration history.
         self._auto_step = None          # 1..10 while auto-calibrate runs
@@ -710,6 +755,13 @@ class NebulaOSCalibration:
             'input_shaper_stage': self.input_shaper_stage,
             'input_shaper_error': self.input_shaper_error,
             'input_shaper_result': self.input_shaper_result,
+            # G109 (PLAN Run 20 fixed interface)
+            'input_shaper_phase': self.input_shaper_phase,
+            'input_shaper_axis': self.input_shaper_axis,
+            'input_shaper_test_freq': self.input_shaper_test_freq,
+            'input_shaper_freq_range': self._shaper_freq_range(),
+            'input_shaper_graphs_enabled': self.input_shaper_graphs_enabled,
+            'input_shaper_axes': self.input_shaper_axes,
             # G104/G105 (PLAN Run 19 fixed interface)
             'progress': self._progress(eventtime),
             'last_result': last_result,
@@ -791,12 +843,144 @@ class NebulaOSCalibration:
                 'awaiting_measurement': 3,
                 'awaiting_confirmation': 4}.get(self.esteps_state)
 
+    # ------------------------------------------------------------------
+    # G109 (Run 20): Input Shaper live feedback and graphs
+    # ------------------------------------------------------------------
+    def _default_graph_config_dir(self):
+        try:
+            cfg = self.printer.get_start_args().get('config_file')
+        except Exception:
+            cfg = None
+        if not cfg:
+            return ''
+        return os.path.join(os.path.dirname(os.path.abspath(cfg)), 'input_shaper')
+
+    def _shaper_freq_range(self):
+        try:
+            settings = self.printer.lookup_object('configfile').get_status(
+                None)['settings'].get('resonance_tester', {})
+            lo = float(settings.get('min_freq', 5.))
+            hi = float(self.shaper_freq_end or settings.get('max_freq', 135.))
+        except Exception:
+            return None
+        return [lo, hi]
+
+    def _input_shaper_detail(self):
+        axis = self.input_shaper_axis.upper()
+        phase = self.input_shaper_phase
+        if phase == 'measuring':
+            if self.input_shaper_test_freq is None:
+                return "Shaking %s (about 1-2 minutes)" % (axis,)
+            rng = self._shaper_freq_range()
+            if rng:
+                return "Shaking %s: %.0f Hz (%.0f-%.0f Hz)" % (
+                    axis, self.input_shaper_test_freq, rng[0], rng[1])
+            return "Shaking %s: %.0f Hz" % (axis, self.input_shaper_test_freq)
+        if phase == 'calculating':
+            return "Calculating the best shaper for %s..." % (axis,)
+        if phase == 'graph':
+            return "Drawing the %s graph..." % (axis,)
+        return ''
+
+    def _handle_gcode_output(self, msg):
+        """Every console line; only read while an axis is measured."""
+        if self.input_shaper_phase not in ('measuring', 'calculating'):
+            return
+        m = _RE_TEST_FREQ.search(msg)
+        if m:
+            self.input_shaper_test_freq = float(m.group(1))
+            return
+        if _RE_CALCULATING.search(msg):
+            self.input_shaper_phase = 'calculating'
+            return
+        m = _RE_FITTED.search(msg)
+        if m:
+            self._shaper_fits[m.group(1)] = {
+                'freq': float(m.group(2)), 'vibrations': float(m.group(3)),
+                'smoothing': float(m.group(4)), 'max_accel': None}
+            return
+        m = _RE_MAX_ACCEL.search(msg)
+        if m and m.group(1) in self._shaper_fits:
+            self._shaper_fits[m.group(1)]['max_accel'] = float(m.group(2))
+            return
+        m = _RE_CSV.search(msg)
+        if m:
+            self._shaper_csv = m.group(1)
+
+    def _shaper_axis_info(self, axis, shaper_type, shaper_freq):
+        fit = self._shaper_fits.get(shaper_type) or {}
+        return {'type': shaper_type, 'freq': round(float(shaper_freq), 1),
+                'vibrations': fit.get('vibrations'),
+                'smoothing': fit.get('smoothing'),
+                'max_accel': fit.get('max_accel'),
+                'graph': '', 'graph_error': ''}
+
+    def _wait_child(self, proc, timeout):
+        """Waits for the graph process without blocking Klippy (the
+        reactor keeps running, like upstream's background_process_exec).
+        Returns (returncode, stderr text); kills it after the timeout."""
+        reactor = self.printer.get_reactor()
+        eventtime = reactor.monotonic()
+        deadline = eventtime + timeout
+        while proc.poll() is None:
+            if eventtime > deadline:
+                proc.kill()
+                proc.wait()
+                return None, "took longer than %.0f s" % (timeout,)
+            eventtime = reactor.pause(eventtime + .2)
+        err = proc.stderr.read() if proc.stderr is not None else b''
+        if isinstance(err, bytes):
+            err = err.decode('utf-8', 'replace')
+        return proc.returncode, err.strip()
+
+    def _start_graph_process(self, args):
+        env = dict(os.environ)
+        env['MPLCONFIGDIR'] = '/tmp/nebulaos-matplotlib'
+        cmd = [sys.executable, _GRAPH_SCRIPT] + list(args)
+        nice = shutil.which('nice')
+        if nice:
+            cmd = [nice, '-n', '19'] + cmd
+        return subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE, close_fds=True, env=env)
+
+    def _draw_shaper_graph(self, axis, info):
+        """Fills info['graph'] or info['graph_error']; never raises."""
+        csv = self._shaper_csv
+        if not csv or not os.path.isfile(csv):
+            info['graph_error'] = "no measurement file from SHAPER_CALIBRATE"
+            return
+        screen = os.path.join(self.shaper_graph_dir,
+                              'input_shaper_%s.png' % (axis,))
+        args = [csv, axis, info['type'], '%.1f' % (info['freq'],), screen]
+        if self.shaper_graph_config_dir:
+            args.append(os.path.join(self.shaper_graph_config_dir,
+                                     'shaper_%s.png' % (axis,)))
+        self.input_shaper_phase = 'graph'
+        try:
+            proc = self._start_graph_process(args)
+            rc, err = self._wait_child(proc, self.shaper_graph_timeout)
+        except Exception as e:
+            rc, err = None, _sanitize_error(e)
+        if rc == 0 and os.path.isfile(screen):
+            info['graph'] = screen
+        else:
+            info['graph_error'] = (err or "graph not drawn")[:_MAX_ERROR_LEN]
+            logging.warning("nebulaos_calibration: input shaper %s graph: %s",
+                            axis, info['graph_error'])
+
+    def _reset_shaper_phase(self):
+        self.input_shaper_phase = ''
+        self.input_shaper_axis = ''
+        self.input_shaper_test_freq = None
+
     def _progress(self, eventtime):
         if self.auto_calibrate_state == 'running' and self._auto_step:
             return self._auto_progress(eventtime)
         n = self._input_shaper_step()
         if n is not None:
-            return self._step('input_shaper', INPUT_SHAPER_STEPS, n)
+            return self._step('input_shaper', INPUT_SHAPER_STEPS, n,
+                              self._input_shaper_detail())
         n = self._esteps_step()
         if n is not None:
             return self._step('esteps', ESTEPS_STEPS, n,
@@ -1702,6 +1886,8 @@ class NebulaOSCalibration:
             self._esteps_start(gcmd, extruder_name)
 
     def _esteps_failed(self, exc):
+        # G109: no prompt stays open after a failure
+        self._dismiss_action_prompt()
         failed_step = self._esteps_step() or 1
         self.esteps_state = 'error'
         self.esteps_error = _sanitize_error(exc)
@@ -1763,6 +1949,8 @@ class NebulaOSCalibration:
                 "waiting to extrude (state=%s) - start one first with "
                 "NEBULAOS_ESTEPS_CALIBRATE" % (self.esteps_state,))
         extruder_obj = self._esteps_lookup_extruder(self.esteps_extruder_name)
+        # G109: the "mark the filament" prompt closes when the extrusion starts
+        self._dismiss_action_prompt()
 
         try:
             old_rotation_distance = (
@@ -1882,7 +2070,8 @@ class NebulaOSCalibration:
         "accelerometer - call with no params to home and preflight; call "
         "again with CONTINUE=1 once it's mounted on the TOOLHEAD (measures "
         "X); call a third time with CONTINUE=1 once it's been moved to the "
-        "BED (measures Y, then commits with SAVE_CONFIG+restart)")
+        "BED (measures Y, then commits with SAVE_CONFIG+restart). GRAPHS=0 "
+        "skips the per-axis graphs (default GRAPHS=1)")
 
     def cmd_input_shaper_calibrate(self, gcmd):
         if gcmd.get_int('CONTINUE', 0):
@@ -1912,6 +2101,9 @@ class NebulaOSCalibration:
         self.input_shaper_result = None
         self._input_shaper_type_x = None
         self._input_shaper_freq_x = None
+        self.input_shaper_graphs_enabled = bool(gcmd.get_int('GRAPHS', 1))
+        self.input_shaper_axes = {}
+        self._reset_shaper_phase()
         self._clear_last_result()
         journal = calibration_journal.new_journal(
             self.input_shaper_id, 'input_shaper_calibrate', now)
@@ -1941,6 +2133,7 @@ class NebulaOSCalibration:
             advance('home', time.time())
             self.gcode.run_script_from_command('G28')
         except Exception as e:
+            self._dismiss_action_prompt()
             self.input_shaper_state = 'error'
             self.input_shaper_error = _sanitize_error(e)
             self._set_last_result('input_shaper', False,
@@ -1992,8 +2185,16 @@ class NebulaOSCalibration:
             calibration_journal.write_journal(
                 journal, path=self.input_shaper_journal_path)
 
+        # G109: Continue was pressed - its prompt closes now, not when the
+        # next one opens (the screen shows the live phase instead)
+        self._dismiss_action_prompt()
         try:
             advance(stage, time.time())
+            self.input_shaper_axis = axis
+            self.input_shaper_phase = 'measuring'
+            self.input_shaper_test_freq = None
+            self._shaper_fits = {}
+            self._shaper_csv = None
             self.gcode.run_script_from_command(
                 self._build_shaper_calibrate_script(axis))
             input_shaper_obj = self.printer.lookup_object('input_shaper')
@@ -2005,17 +2206,30 @@ class NebulaOSCalibration:
                     "NEBULAOS_INPUT_SHAPER_CALIBRATE: SHAPER_CALIBRATE "
                     "AXIS=%s did not produce a usable shaper_freq"
                     % (axis.upper(),))
+            info = self._shaper_axis_info(axis, shaper.params.shaper_type,
+                                          shaper.params.shaper_freq)
+            if self.input_shaper_graphs_enabled:
+                self._draw_shaper_graph(axis, info)
+            axes = dict(self.input_shaper_axes)
+            axes[axis] = info
+            self.input_shaper_axes = axes
+            journal['axes'] = axes
+            calibration_journal.write_journal(
+                journal, path=self.input_shaper_journal_path)
+            self._reset_shaper_phase()
 
             if axis == 'x':
                 self._input_shaper_type_x = shaper.params.shaper_type
                 self._input_shaper_freq_x = round(shaper.params.shaper_freq, 3)
                 self.input_shaper_state = 'awaiting_y_mount'
+                lines = ["X axis measured: %s @ %.1fHz."
+                         % (shaper.params.shaper_type,
+                            shaper.params.shaper_freq)]
+                if info['graph'] and self.shaper_graph_config_dir:
+                    lines.append("Graph: config folder, input_shaper/shaper_x.png")
+                lines.append("Move the SAME accelerometer RIGIDLY to the BED now.")
                 self._send_action_prompt(
-                    "Input Shaper Calibration",
-                    ["X axis measured: %s @ %.1fHz."
-                     % (shaper.params.shaper_type,
-                        shaper.params.shaper_freq),
-                     "Move the SAME accelerometer RIGIDLY to the BED now."],
+                    "Input Shaper Calibration", lines,
                     [("Continue",
                       "_NEBULAOS_INPUT_SHAPER_CALIBRATE CONTINUE=1"),
                      ("Cancel",
@@ -2047,11 +2261,14 @@ class NebulaOSCalibration:
                 "will restart"
                 % (self._input_shaper_type_x, self._input_shaper_freq_x,
                    shaper.params.shaper_type, shaper.params.shaper_freq))
+            self._dismiss_action_prompt()
             self.gcode.run_script_from_command('SAVE_CONFIG')
             # See cmd_auto_calibrate's own identical comment/root-cause -
             # returning normally here is correct on this platform.
             return
         except Exception as e:
+            self._reset_shaper_phase()
+            self._dismiss_action_prompt()
             if journal.get('commit_requested'):
                 raise
             failed_step = self._input_shaper_step() or 1
@@ -2076,6 +2293,7 @@ class NebulaOSCalibration:
         self.input_shaper_error = None
         self._input_shaper_type_x = None
         self._input_shaper_freq_x = None
+        self._reset_shaper_phase()
         self._dismiss_action_prompt()
         if journal is not None:
             calibration_journal.mark_cancelled(journal, time.time())
@@ -2315,6 +2533,17 @@ class NebulaOSCalibration:
         if input_shaper_journal is not None:
             self._publish_verified('input_shaper', input_shaper_journal,
                                    INPUT_SHAPER_STEPS)
+        # G109: the last run's per-axis results + graphs (end screen, and the
+        # idle page later) survive the SAVE_CONFIG restart in the journal
+        if not self.input_shaper_axes:
+            last = input_shaper_journal or calibration_journal.read_journal(
+                path=self.input_shaper_journal_path)
+            axes = (last.get('axes') if isinstance(last, dict) and last.get(
+                'state') == calibration_journal.STATE_COMPLETE else None)
+            if isinstance(axes, dict):
+                self.input_shaper_axes = dict(
+                    (a, i) for a, i in axes.items()
+                    if a in ('x', 'y') and isinstance(i, dict))
         if self._history_warning:
             self.gcode.respond_info("nebulaos_calibration: %s"
                                     % (self._history_warning,))

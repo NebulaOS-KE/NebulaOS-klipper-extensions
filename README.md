@@ -52,7 +52,7 @@ update supervisor. See `docs/NEBULAOS_EXTENSIONS_BRANCH_STRATEGY.md` in the firm
 
 ## Modules
 
-`nebulaos-extensions.json` lists 58 managed files: 29 `role: runtime` and 29 `role: test`. All of
+`nebulaos-extensions.json` lists 60 managed files: 30 `role: runtime` and 30 `role: test`. All of
 them are composed (the tests import runtime modules relative to the `extras` package). Runtime
 modules:
 
@@ -67,6 +67,7 @@ modules:
 | **Z offset, contact and calibration** (BLTouch/CR-Touch stays the global probe; the load cell is a secondary contact reference) | |
 | `nebulaos_calibration` | `[nebulaos_calibration]` coordinator for the `NEBULAOS_*` calibration commands (Z offset, auto-calibrate sequence) |
 | `nebulaos_calibration_journal` | Persistent JSON journal of calibration workflow progress |
+| `nebulaos_shaper_graph` | Not a Klipper module: script that `nebulaos_calibration` runs as a nice'd child process after each Input Shaper axis - draws the measured vibration and the chosen shaper from upstream's CSV (screen PNG 480x272 next to the journal, 1200x700 in `config/input_shaper/` for Mainsail, G109) |
 | `nebulaos_load_cell_calibration` | Guided load-cell calibration with a weighed water bottle (G86); `NEBULAOS_LOAD_CELL_MODE` / `NEBULAOS_LOAD_CELL_AUTO_CHECK` (G99) |
 | `nebulaos_load_cell_mode` | The persisted load-cell contact choice auto (default) / manual and the last automatic check (G99, own JSON state file) |
 | `nebulaos_bed_tram` | Guided bed tramming, one corner instruction at a time (G87) |
