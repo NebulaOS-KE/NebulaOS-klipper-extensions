@@ -73,6 +73,36 @@ class RulesTest(unittest.TestCase):
         history.record(state, 'auto_calibrate', 'Z offset 1.7 mm', 6.)
         self.assertIsNone(state['history']['auto_calibrate']['redo'])
 
+    def test_pid_keeps_both_heaters(self):
+        # G120: PID_BED and PID_HOTEND share the one 'pid' key
+        state = history.empty_state()
+        history.record(state, 'pid', 'Hotend tuned at 230 C', 1.)
+        history.record(state, 'pid', 'Bed tuned at 65 C', 2.)
+        entry = state['history']['pid']
+        self.assertEqual(entry['summary'],
+                         'Bed tuned at 65 C; Hotend tuned at 230 C')
+        self.assertEqual(entry['done_at'], 2.)
+        # the same heater again replaces only its own part
+        history.record(state, 'pid',
+                       'Bed PID tuned at 70 C - SAVE_CONFIG to keep', 3.)
+        self.assertEqual(state['history']['pid']['summary'],
+                         'Bed PID tuned at 70 C - SAVE_CONFIG to keep; '
+                         'Hotend tuned at 230 C')
+        # a summary without a known heater replaces everything (as before)
+        history.record(state, 'pid', 'Chamber tuned', 4.)
+        self.assertEqual(state['history']['pid']['summary'], 'Chamber tuned')
+        history.record(state, 'pid', 'Hotend tuned at 230 C', 5.)
+        self.assertEqual(state['history']['pid']['summary'],
+                         'Hotend tuned at 230 C')
+
+    def test_pid_merge_stays_within_the_summary_limit(self):
+        state = history.empty_state()
+        history.record(state, 'pid', 'Bed ' + 'x' * 200, 1.)
+        history.record(state, 'pid', 'Hotend ' + 'y' * 200, 2.)
+        summary = state['history']['pid']['summary']
+        self.assertLessEqual(len(summary), history.MAX_SUMMARY_LEN)
+        self.assertTrue(summary.startswith('Bed '))
+
     def test_axis_twist_marks_auto_calibrate(self):
         state = history.empty_state()
         history.record(state, 'auto_calibrate', 'Z', 1.)

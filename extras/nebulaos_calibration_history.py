@@ -21,6 +21,10 @@
 #                                         "a shim was added at front left"
 #   any flow recorded                  -> its own redo is cleared
 #
+# pid (G120, Run 21): one key for both heaters. A summary that starts with
+# "Bed" or "Hotend" (the screen and the PID_BED/PID_HOTEND macros) replaces
+# only that heater's part: "Bed tuned at 65 C; Hotend tuned at 230 C".
+#
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import copy
 import json
@@ -145,11 +149,35 @@ def mark_redo(state, keys, reason):
     return state
 
 
+PID_HEATERS = ('bed', 'hotend')
+
+
+def _pid_heater(clause):
+    word = clause.split(' ', 1)[0].lower()
+    return word if word in PID_HEATERS else None
+
+
+def merge_pid_summary(old, new):
+    """The new heater's part replaces only its own part of the old summary
+    (Bed first); a summary without a known heater replaces everything."""
+    heater = _pid_heater(new)
+    if heater is None:
+        return new
+    parts = dict((_pid_heater(c), c) for c in old.split('; ')
+                 if _pid_heater(c) is not None)
+    parts[heater] = new
+    return '; '.join(parts[h] for h in PID_HEATERS if h in parts)
+
+
 def record(state, key, summary, now):
     """A flow finished successfully: done now, its own redo cleared, then
     the staleness rules it triggers."""
     if key not in FLOWS:
         raise ValueError("unknown calibration flow %r" % (key,))
+    summary = sanitize_text(summary)
+    if key == 'pid':
+        summary = merge_pid_summary(
+            state['history'].get(key, empty_entry())['summary'], summary)
     state['history'][key] = {'done_at': now,
                              'summary': sanitize_text(summary),
                              'redo': None}
