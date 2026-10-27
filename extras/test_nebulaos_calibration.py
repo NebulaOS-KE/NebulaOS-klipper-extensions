@@ -2868,7 +2868,7 @@ class G109InputShaperFeedbackTest(unittest.TestCase):
 
     def test_axis_result_with_fit_details_and_graph(self):
         gcode, coord = self._build()
-        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({}))
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({'GRAPHS': '1'}))
         coord.cmd_input_shaper_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
         x = coord.get_status(0)['input_shaper_axes']['x']
         self.assertEqual((x['type'], x['freq'], x['vibrations'], x['smoothing'], x['max_accel']),
@@ -2887,9 +2887,19 @@ class G109InputShaperFeedbackTest(unittest.TestCase):
         self.assertEqual(st['input_shaper_axes']['x']['graph'], '')
         self.assertFalse(hasattr(self, 'graph_args'))
 
+    def test_no_graphs_by_default(self):
+        # G113: a Mainsail/console start without GRAPHS draws none
+        gcode, coord = self._build()
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({}))
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
+        st = coord.get_status(0)
+        self.assertFalse(st['input_shaper_graphs_enabled'])
+        self.assertEqual(st['input_shaper_axes']['x']['graph'], '')
+        self.assertFalse(hasattr(self, 'graph_args'))
+
     def test_a_failed_graph_never_fails_the_calibration(self):
         gcode, coord = self._build(graph_ok=False)
-        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({}))
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({'GRAPHS': '1'}))
         coord.cmd_input_shaper_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
         st = coord.get_status(0)
         self.assertEqual(st['input_shaper_state'], 'awaiting_y_mount')
@@ -2898,7 +2908,7 @@ class G109InputShaperFeedbackTest(unittest.TestCase):
 
     def test_no_csv_is_a_graph_error_only(self):
         gcode, coord = self._build(csv=False)
-        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({}))
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({'GRAPHS': '1'}))
         coord.cmd_input_shaper_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
         x = coord.get_status(0)['input_shaper_axes']['x']
         self.assertEqual(x['graph'], '')
@@ -2906,7 +2916,7 @@ class G109InputShaperFeedbackTest(unittest.TestCase):
 
     def test_both_axes_survive_the_restart_and_the_prompt_is_closed_before_save(self):
         gcode, coord = self._build()
-        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({}))
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({'GRAPHS': '1'}))
         coord.cmd_input_shaper_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
         gcode.raw[:] = []
         with self.assertRaises(RestartTriggered):

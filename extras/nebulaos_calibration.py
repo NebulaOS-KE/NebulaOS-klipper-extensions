@@ -2097,8 +2097,8 @@ class NebulaOSCalibration:
         "accelerometer - call with no params to home and preflight; call "
         "again with CONTINUE=1 once it's mounted on the TOOLHEAD (measures "
         "X); call a third time with CONTINUE=1 once it's been moved to the "
-        "BED (measures Y, then commits with SAVE_CONFIG+restart). GRAPHS=0 "
-        "skips the per-axis graphs (default GRAPHS=1)")
+        "BED (measures Y, then commits with SAVE_CONFIG+restart). GRAPHS=1 "
+        "draws a graph of each axis (default GRAPHS=0; the screen asks)")
 
     def cmd_input_shaper_calibrate(self, gcmd):
         if gcmd.get_int('CONTINUE', 0):
@@ -2128,7 +2128,9 @@ class NebulaOSCalibration:
         self.input_shaper_result = None
         self._input_shaper_type_x = None
         self._input_shaper_freq_x = None
-        self.input_shaper_graphs_enabled = bool(gcmd.get_int('GRAPHS', 1))
+        # G113 (Run 21): graphs only when asked - the screen sends GRAPHS=1|0,
+        # a Mainsail/console start draws none (they cost time and RAM)
+        self.input_shaper_graphs_enabled = bool(gcmd.get_int('GRAPHS', 0))
         self.input_shaper_axes = {}
         self._reset_shaper_phase()
         self._clear_last_result()
