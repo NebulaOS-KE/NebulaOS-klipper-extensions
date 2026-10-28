@@ -143,6 +143,10 @@ class ZOffsetProbe:
             logging.warning("%s: %s", self._name, self._mode_warning)
         self._last_contact_rejection_reason = None
         self._last_raw_peak_delta_counts = None
+        self._last_depress_slope = None
+        # G102: the first automatic touch after a passed check records its
+        # depress_slope (see _record_depress_slope)
+        self._slope_pending = False
         self._raw_diag = None
         gcode = self._printer.lookup_object('gcode')
         gcode.register_command(
@@ -531,6 +535,9 @@ class ZOffsetProbe:
             " delta=%.4f depress_slope=%.4f",
             self._name, n_below, n_above, z_contact, raw_z,
             raw_z - z_contact, depress_slope)
+        self._last_depress_slope = depress_slope
+        if raw_mode:
+            self._record_depress_slope(depress_slope)
 
         return z_contact
 
@@ -616,6 +623,7 @@ class ZOffsetProbe:
             'raw_profile_id': self._raw_profile_id,
             'last_contact_rejection_reason': self._last_contact_rejection_reason,
             'last_raw_peak_delta_counts': self._last_raw_peak_delta_counts,
+            'last_depress_slope': self._last_depress_slope,
             'raw_diagnostic': self._raw_diag,
             'last_trigger_time': trig_time,
             'is_calibrated': self._load_cell.is_calibrated(),
@@ -803,12 +811,32 @@ def _record_auto_check(self, ok, reason, reference=None):
     })
     if not ok:
         self._last_contact_rejection_reason = raw_contact.RAW_AUTO_CHECK_FAILED
+    self._slope_pending = ok
     warning = self._save_lc_state()
     logging.info("%s: automatic load cell check %s%s (reference %s)%s",
                  self._name, "passed" if ok else "FAILED",
                  "" if ok else ": " + reason, reference,
                  " - " + warning if warning else "")
     return ok, reason
+
+
+def _record_depress_slope(self, slope):
+    """G102 (Run 21, Tim): how sensitive this load cell is - the counts per
+    mm of press of the first automatic touch after a passed check. Recorded
+    (load_cell_mode.json + klippy.log) for every printer so a plausible
+    range can be set from real data later; nothing is refused on it."""
+    if not self._slope_pending:
+        return
+    self._slope_pending = False
+    self._lc_state['depress_slope'] = float(slope)
+    self._lc_state['depress_slope_at'] = time.time()
+    warning = self._save_lc_state()
+    logging.info("%s: automatic load cell sensitivity %.1f counts/mm "
+                 "(first touch after the check, profile %s, trigger %s "
+                 "counts)%s", self._name, slope, self._raw_profile_id,
+                 (raw_contact.lookup_profile(self._raw_profile_id) or {})
+                 .get('trigger_counts'),
+                 " - " + warning if warning else "")
 
 
 def _auto_status(self):
@@ -830,6 +858,8 @@ def _auto_status(self):
         'auto_ready': auto_kind == raw_contact.ARM_RAW,
         'auto_profile': self._raw_profile_id,
         'auto_reference_counts': self._auto_reference_counts(),
+        'depress_slope': self._lc_state['depress_slope'],
+        'depress_slope_time': self._lc_state['depress_slope_at'],
         'mode_warning': self._mode_warning or None,
     }
 
@@ -839,6 +869,7 @@ ZOffsetProbe.set_load_cell_mode = _set_load_cell_mode
 ZOffsetProbe.run_auto_check = _run_auto_check
 ZOffsetProbe.refresh_auto_reference = _refresh_auto_reference
 ZOffsetProbe._record_auto_check = _record_auto_check
+ZOffsetProbe._record_depress_slope = _record_depress_slope
 ZOffsetProbe.auto_status = _auto_status
 
 

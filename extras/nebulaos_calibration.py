@@ -1699,11 +1699,15 @@ class NebulaOSCalibration:
             run('G28')
             self._auto_calibrate_check_cancel(journal, time.time())
 
-            # Start bed heating early so it soaks during nozzle_clean.
+            # Bed to temperature first, then the nozzle clean (Tim, Run 21,
+            # G102): a bed still heating drifts the load cell and the
+            # automatic drift limit refused the clean more often. The wait
+            # is part of the nozzle clean step on the screen.
+            self._auto_calibrate_advance(journal, 'nozzle_clean', time.time())
             heated[0] = True
             run('M140 S%.1f' % (self.pid_bed_target,))
-
-            self._auto_calibrate_advance(journal, 'nozzle_clean', time.time())
+            run('M190 S%.1f' % (self.pid_bed_target,))
+            self._auto_calibrate_check_cancel(journal, time.time())
             # C5: the wipe/press depth follows the live gcode Z offset - a
             # saved Z offset adjustment (or any other) must not shift it.
             # Live only; the saved adjustment is left alone here.
@@ -1714,8 +1718,8 @@ class NebulaOSCalibration:
             # Confirm exact calibration temperatures. The nozzle is set
             # to z_offset_reference_temp (150C) — nozzle_clean's own
             # hot_start_temp rests at the same value, so this is normally
-            # a confirmation, not a second heat cycle. The bed waits for
-            # pid_bed_target (65C), started before nozzle_clean above.
+            # a confirmation, not a second heat cycle. The bed is already at
+            # pid_bed_target (65C), reached before nozzle_clean above.
             self._auto_calibrate_advance(
                 journal, 'establish_thermal_state', time.time())
             run('M104 S%.1f' % (self.z_offset_reference_temp,))

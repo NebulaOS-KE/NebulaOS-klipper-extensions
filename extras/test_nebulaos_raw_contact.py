@@ -517,6 +517,7 @@ _APPENDED = (('_save_lc_state', '_save_lc_state'),
              ('_run_auto_check', 'run_auto_check'),
              ('_refresh_auto_reference', 'refresh_auto_reference'),
              ('_record_auto_check', '_record_auto_check'),
+             ('_record_depress_slope', '_record_depress_slope'),
              ('_auto_status', 'auto_status'))
 
 
@@ -638,6 +639,7 @@ class RawArmingTest(unittest.TestCase):
         probe._raw_settle_time = 5.
         probe._auto_check_time = 2.
         probe._raw_reference = persisted
+        probe._slope_pending = False
         probe._contact_mode = mode
         probe._raw_profile_id = profile_id
         probe._raw_diag = None
@@ -837,6 +839,30 @@ class RawArmingTest(unittest.TestCase):
         self.assertEqual(probe._mcu_trigger_analog.calls, [])
         # and the touch is now armed around it
         self.assertTrue(probe.contact_ready(rc.CALLER_AUTO_CALIBRATE))
+
+    def test_first_touch_after_a_passed_check_records_depress_slope(self):
+        # G102 (Run 21, Tim): recorded only - in the state file, the status
+        # and klippy.log; the later touches do not overwrite it
+        from . import nebulaos_load_cell_mode as lcm
+        probe = self._probe(_idle(self.REF, n=180), reference=None,
+                            calibrated=False)
+        probe._record_depress_slope(1234.)              # no check yet
+        self.assertIsNone(probe.auto_status()['depress_slope'])
+        self.assertTrue(probe.run_auto_check()[0])
+        with self.assertLogs(level='INFO') as logs:
+            probe._record_depress_slope(52000.5)
+        self.assertIn("sensitivity 52000.5 counts/mm", "\n".join(logs.output))
+        probe._record_depress_slope(48000.)              # second touch
+        st = probe.auto_status()
+        self.assertEqual(st['depress_slope'], 52000.5)
+        self.assertIsNotNone(st['depress_slope_time'])
+        saved, warning = lcm.read_state(probe._mode_path)
+        self.assertEqual((warning, saved['depress_slope']), ('', 52000.5))
+        self.assertTrue(probe.contact_ready(rc.CALLER_AUTO_CALIBRATE))  # no refusal
+        probe._lc_state['auto_check'] = 'never'
+        probe._record_auto_check(False, 'x')             # a failed check: no record
+        probe._record_depress_slope(1.)
+        self.assertEqual(probe.auto_status()['depress_slope'], 52000.5)
 
     def test_hot_reference_refresh_lets_the_touch_proceed(self):
         # cold check passes at REF; heated, the empty bed reads 10000 counts

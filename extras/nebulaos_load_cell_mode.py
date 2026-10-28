@@ -48,7 +48,12 @@ def default_state():
             'auto_check_reason': '',
             'reference_counts': None,
             'checked_at': None,
-            'profile_id': None}
+            'profile_id': None,
+            # G102 (Run 21, Tim): the sensitivity of the first automatic
+            # touch after a passed check (counts per mm of press) - recorded
+            # only, never a refusal (yet)
+            'depress_slope': None,
+            'depress_slope_at': None}
 
 
 def read_state(path):
@@ -103,10 +108,20 @@ def _read_state(path):
     pid = data.get('profile_id')
     if isinstance(pid, str) and state['auto_check'] != CHECK_NEVER:
         state['profile_id'] = pid[:64]
+    slope = data.get('depress_slope')
+    slope_at = data.get('depress_slope_at')
+    if _finite(slope) and _finite(slope_at):
+        state['depress_slope'] = float(slope)
+        state['depress_slope_at'] = slope_at
     if problems:
         return state, "%s: %s - using defaults for it" % (
             path, "; ".join(problems))
     return state, ''
+
+
+def _finite(value):
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value))
 
 
 def write_state(path, state):

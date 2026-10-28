@@ -43,6 +43,19 @@ class StateFileTest(unittest.TestCase):
         with open(self.path) as fh:
             self.assertEqual(json.load(fh)['schema'], lcm.SCHEMA)
 
+    def test_depress_slope_round_trip_and_garbage_ignored(self):
+        # G102: recorded sensitivity survives a restart; a bad value is
+        # dropped without a warning (it is information, not a setting)
+        state = lcm.default_state()
+        state.update(depress_slope=52000.5, depress_slope_at=1761100000.5)
+        lcm.write_state(self.path, state)
+        self.assertEqual(lcm.read_state(self.path)[0]['depress_slope'], 52000.5)
+        self._write_raw(json.dumps({'mode': 'auto', 'depress_slope': 'x',
+                                    'depress_slope_at': True}))
+        read, warning = lcm.read_state(self.path)
+        self.assertEqual((read['depress_slope'], read['depress_slope_at'], warning),
+                         (None, None, ''))
+
     def test_failed_check_keeps_its_reason_and_no_reference(self):
         state = lcm.default_state()
         state.update(auto_check='failed', auto_check_reason='stuck',

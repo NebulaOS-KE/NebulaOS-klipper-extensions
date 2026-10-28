@@ -970,21 +970,22 @@ class AutoCalibrateTest(unittest.TestCase):
 
         script_names = [s.split()[0] for s in gcode.scripts_run]
         self.assertEqual(script_names, [
-            'G28', 'M140', 'SET_GCODE_OFFSET', '_NEBULAOS_NOZZLE_CLEAN',
+            'G28', 'M140', 'M190', 'SET_GCODE_OFFSET', '_NEBULAOS_NOZZLE_CLEAN',
             'M104', 'M190', 'M109', 'G4',
             '_NEBULAOS_Z_OFFSET_CALIBRATE', 'BED_MESH_CALIBRATE',
             'SAVE_CONFIG',
         ])
         self.assertNotIn('PID_CALIBRATE', script_names)
         # C5: live gcode Z offset zeroed (not moved) before the nozzle clean.
-        self.assertEqual(gcode.scripts_run[2], 'SET_GCODE_OFFSET Z=0 MOVE=0')
-        # Bed preheated before nozzle_clean; establish_thermal_state
-        # confirms exact temps (nozzle at z_offset_reference_temp 150C,
-        # bed at pid_bed_target 65C).
+        self.assertEqual(gcode.scripts_run[3], 'SET_GCODE_OFFSET Z=0 MOVE=0')
+        # G102 (Run 21): the bed reaches its temperature BEFORE the nozzle
+        # clean; establish_thermal_state confirms exact temps (nozzle at
+        # z_offset_reference_temp 150C, bed at pid_bed_target 65C).
         self.assertEqual(gcode.scripts_run[1], 'M140 S65.0')
-        self.assertEqual(gcode.scripts_run[4], 'M104 S150.0')
-        self.assertEqual(gcode.scripts_run[5], 'M190 S65.0')
-        self.assertEqual(gcode.scripts_run[6], 'M109 S150.0')
+        self.assertEqual(gcode.scripts_run[2], 'M190 S65.0')
+        self.assertEqual(gcode.scripts_run[5], 'M104 S150.0')
+        self.assertEqual(gcode.scripts_run[6], 'M190 S65.0')
+        self.assertEqual(gcode.scripts_run[7], 'M109 S150.0')
 
         journal = calibration_journal.read_journal(path=self.journal_path)
         self.assertEqual(journal['state'], calibration_journal.STATE_COMMIT_REQUESTED)
@@ -1014,7 +1015,7 @@ class AutoCalibrateTest(unittest.TestCase):
         script_names = [s.split()[0] for s in gcode.scripts_run]
         self.assertEqual(
             script_names,
-            ['G28', 'M140', 'SET_GCODE_OFFSET', '_NEBULAOS_NOZZLE_CLEAN',
+            ['G28', 'M140', 'M190', 'SET_GCODE_OFFSET', '_NEBULAOS_NOZZLE_CLEAN',
              'TURN_OFF_HEATERS'])   # the bed was heating: off again
         self.assertNotIn('PID_CALIBRATE', script_names)
         journal = calibration_journal.read_journal(path=self.journal_path)
@@ -1171,7 +1172,7 @@ class NozzleContaminationFixOrderingTest(unittest.TestCase):
         m140 = [s for s in gcode.scripts_run if s.startswith('M140')]
         m190 = [s for s in gcode.scripts_run if s.startswith('M190')]
         self.assertEqual(m140, ['M140 S65.0'])
-        self.assertEqual(m190, ['M190 S65.0'])
+        self.assertEqual(m190, ['M190 S65.0', 'M190 S65.0'])
 
     def test_z_offset_reference_temp_is_configurable(self):
         printer, gcode, coord = _build_auto_calibrate(
@@ -3174,7 +3175,8 @@ class AutoCalibrateProgressTest(unittest.TestCase):
             steps.setdefault(name, p['step'])
         self.assertEqual(steps['G28'], 2)
         self.assertEqual(steps['_NEBULAOS_NOZZLE_CLEAN'], 3)
-        self.assertEqual(steps['M190'], 4)
+        self.assertEqual(steps['M140'], 3)     # G102: bed wait in the clean step
+        self.assertEqual(steps['M104'], 4)
         self.assertEqual(steps['G4'], 5)
         self.assertEqual(steps['touch'], 7)
         self.assertEqual(steps['BED_MESH_CALIBRATE'], 8)
