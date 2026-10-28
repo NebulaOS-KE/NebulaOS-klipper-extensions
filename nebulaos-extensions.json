@@ -72,6 +72,7 @@
     {"path": "extras/nebulaos_calibration_history.py", "role": "runtime"},
     {"path": "extras/nebulaos_memory.py", "role": "runtime"},
     {"path": "extras/nebulaos_z_adjust.py", "role": "runtime"},
+    {"path": "extras/nebulaos_bed_soak.py", "role": "runtime"},
     {"path": "extras/nebulaos_beeper.py", "role": "runtime"},
     {"path": "extras/nebulaos_shaper_graph.py", "role": "runtime"},
 
@@ -103,6 +104,7 @@
     {"path": "extras/test_nebulaos_calibration_history.py", "role": "test"},
     {"path": "extras/test_nebulaos_memory.py", "role": "test"},
     {"path": "extras/test_nebulaos_z_adjust.py", "role": "test"},
+    {"path": "extras/test_nebulaos_bed_soak.py", "role": "test"},
     {"path": "extras/test_nebulaos_beeper.py", "role": "test"},
     {"path": "extras/test_nebulaos_shaper_graph.py", "role": "test"}
   ],
