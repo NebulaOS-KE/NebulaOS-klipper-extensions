@@ -1046,6 +1046,24 @@ class GuiReadinessTests(ExtensionStateMachineTests):
         with self.assertRaises(Exception):
             ext._handle_ready()  # config error, as before: never silent
 
+    def test_newer_schema_offer_is_reported_once_at_ready(self):
+        # G100 R1: after a rollback, a newer NebulaOS's record is not silent
+        with open(self.eeprom_path, 'r+b') as eeprom:
+            journal.write_page_verified(eeprom, 3, journal.encode_record(
+                journal.SCHEMA_VERSION + 1, journal.FLAG_VALID, 5, 100))
+        self.objects['gcode'] = _FakeGCode()
+        ext = plr.NebulaOSPowerLossRecovery(self.config)
+        ext._handle_ready()
+        self.assertEqual(ext.get_status(0)['state'], plr.STATE_NONE)
+        msgs = [m for m in self.objects['gcode'].messages if 'newer NebulaOS' in m]
+        self.assertEqual(len(msgs), 1)
+
+    def test_no_newer_schema_message_normally(self):
+        self.objects['gcode'] = _FakeGCode()
+        ext = plr.NebulaOSPowerLossRecovery(self.config)
+        ext._handle_ready()
+        self.assertFalse([m for m in self.objects['gcode'].messages if 'newer NebulaOS' in m])
+
     def test_checkpoint_failure_surfaces_last_error(self):
         def boom(candidate):
             raise IOError("simulated I2C failure")

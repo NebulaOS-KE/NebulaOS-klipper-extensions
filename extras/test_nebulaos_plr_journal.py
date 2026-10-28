@@ -139,6 +139,22 @@ class JournalRotationTests(unittest.TestCase):
         self.assertEqual(wrapped.page, plr.JOURNAL_FIRST_PAGE)
         self.assertEqual(wrapped.generation, plr.JOURNAL_PAGE_COUNT + 1)
 
+    def test_newer_schema_present(self):
+        # G100 R1: a valid page of a newer schema is ignored by the scan
+        # but reported; an older/equal schema or a torn page is not.
+        eeprom = fake_eeprom()
+        self.assertFalse(plr.newer_schema_present(eeprom))
+        plr.commit_checkpoint(eeprom, 100)
+        self.assertFalse(plr.newer_schema_present(eeprom))
+        plr.write_page_verified(eeprom, 5, plr.encode_record(plr.SCHEMA_VERSION + 1,
+                                                    plr.FLAG_VALID, 9, 500))
+        self.assertTrue(plr.newer_schema_present(eeprom))
+        self.assertEqual(plr.scan_journal(eeprom).generation, 1)
+        torn = bytearray(plr.encode_record(plr.SCHEMA_VERSION + 1, plr.FLAG_VALID, 9, 500))
+        torn[4] ^= 1
+        plr.write_page_verified(eeprom, 5, bytes(torn))
+        self.assertFalse(plr.newer_schema_present(eeprom))
+
     def test_scan_after_wrap_finds_newest_not_oldest(self):
         eeprom = fake_eeprom()
         current = None

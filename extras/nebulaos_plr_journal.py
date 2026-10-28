@@ -178,6 +178,26 @@ def scan_journal(fileobj):
     return newest
 
 
+def newer_schema_present(fileobj):
+    """G100 R1 (Run 21): True if a page holds a structurally valid record
+    (magic + CRC) of a NEWER schema than this code reads. decode_record()
+    ignores such pages like torn ones; this only lets the caller say so
+    after a rollback to an older NebulaOS, instead of silently showing
+    "no recovery available"."""
+    for page in range(JOURNAL_FIRST_PAGE, JOURNAL_LAST_PAGE + 1):
+        data = read_page(fileobj, page)
+        if data is None or len(data) != PAGE_SIZE:
+            continue
+        header = data[:_HEADER_STRUCT.size]
+        (crc_stored,) = _CRC_STRUCT.unpack(data[_HEADER_STRUCT.size:])
+        if (zlib.crc32(header) & 0xFFFFFFFF) != crc_stored:
+            continue
+        magic, schema_version = _HEADER_STRUCT.unpack(header)[:2]
+        if magic == MAGIC and schema_version > SCHEMA_VERSION:
+            return True
+    return False
+
+
 def next_commit_target(current):
     """Given the current newest Record (or None if the journal is empty),
     returns (next_page, next_generation) for the next commit - advancing

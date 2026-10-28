@@ -685,9 +685,26 @@ class NebulaOSPowerLossRecovery:
         except Exception as exc:
             logging.exception("nebulaos_power_loss_recovery: status read failed")
             self._set_error("status read failed: %s" % exc)
+        self._report_newer_schema()
 
         self.timer_handler = self.reactor.register_timer(
             self._timer_event, self.reactor.NOW)
+
+    def _report_newer_schema(self):
+        """G100 R1: after a rollback, an offer written by a newer NebulaOS
+        is not readable here - say so once (klippy.log + console)."""
+        if self._status_state != STATE_NONE:
+            return
+        try:
+            with self._open_eeprom() as eeprom:
+                newer = journal.newer_schema_present(eeprom)
+        except Exception:
+            return
+        if newer:
+            msg = ("NebulaOS PLR: recovery data from a newer NebulaOS version "
+                   "was ignored (this version cannot read it)")
+            logging.warning(msg)
+            self.printer.lookup_object('gcode').respond_info(msg)
 
     def _ensure_eeprom_accessible(self):
         try:
