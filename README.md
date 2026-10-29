@@ -1,5 +1,7 @@
 # NebulaOS Klipper extensions
 
+> Part of [NebulaOS](https://github.com/NebulaOS-KE/NebulaOS): open firmware for the Creality Ender-3 V3 KE. The project map, releases and downloads are there.
+
 The Klipper extras that [NebulaOS](https://github.com/NebulaOS-KE/NebulaOS-firmware) adds to the
 Creality Ender-3 V3 KE. They are composed into a pristine upstream
 [`Klipper3d/klipper`](https://github.com/Klipper3d/klipper) checkout at boot.
