@@ -29,6 +29,7 @@ jobs:
           git init -q klipper
           git -C klipper fetch -q --depth 1 "$repo" "$pin"
           git -C klipper checkout -q FETCH_HEAD
+          pip install -q -r klipper/scripts/klippy-requirements.txt
       - name: Tests
         run: |
           set -o pipefail
