@@ -686,9 +686,35 @@ class NebulaOSPowerLossRecovery:
             logging.exception("nebulaos_power_loss_recovery: status read failed")
             self._set_error("status read failed: %s" % exc)
         self._report_newer_schema()
+        self._offer_resume_prompt()
 
         self.timer_handler = self.reactor.register_timer(
             self._timer_event, self.reactor.NOW)
+
+    def _offer_resume_prompt(self):
+        """G80 (Run 22): after a power loss, ask in Mainsail (Klipper's
+        action:prompt dialog) whether to resume - once, at the start. The
+        screen asks on its own (PowerPanel). Only for a physical resume:
+        the state-only restore leaves a cold, unhomed printer."""
+        if self._status_state != STATE_RECOVERY_AVAILABLE or not self.physical_resume:
+            return
+        info = self._recovery_info
+        name = os.path.basename(info.get("file") or "") or "the last print"
+        gcode = self.printer.lookup_object('gcode')
+        lines = ("// action:prompt_end",
+                 "// action:prompt_begin Resume print after power loss?",
+                 "// action:prompt_text %s was interrupted at %d %%." % (
+                     name, int(100 * (info.get("progress") or 0.))),
+                 "// action:prompt_text The bed and nozzle heat up, X/Y home, Z is "
+                 "lifted from the height it had; keep the bed clear around the part.",
+                 "// action:prompt_button Resume|NEBULAOS_RESUME_POWER_LOSS "
+                 "ALLOW_UNSAFE=1 PHYSICAL=1|primary",
+                 "// action:prompt_button Discard|NEBULAOS_CLEAR_POWER_LOSS_RECOVERY|error",
+                 "// action:prompt_footer_button Later|RESPOND TYPE=command "
+                 "MSG=action:prompt_end",
+                 "// action:prompt_show")
+        for line in lines:
+            gcode.respond_raw(line)
 
     def _report_newer_schema(self):
         """G100 R1: after a rollback, an offer written by a newer NebulaOS

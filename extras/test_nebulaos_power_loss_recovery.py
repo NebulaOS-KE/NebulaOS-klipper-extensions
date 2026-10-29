@@ -1095,6 +1095,35 @@ class ConfigIdentityAndPhysicalResumeTests(ExtensionStateMachineTests):
         self.ext = plr.NebulaOSPowerLossRecovery(self.config)
         self.ext._handle_ready()
 
+    def _prompt(self):
+        return [m for m in self.objects['gcode'].messages if m.startswith('// action:prompt')]
+
+    def test_resume_is_offered_in_mainsail_once_at_ready(self):
+        # G80 (Run 22): a physical resume asks with a Mainsail prompt
+        self._checkpoint_then_power_loss(physical=True)
+        self.assertEqual(self.ext.get_status(0)['state'], plr.STATE_RECOVERY_AVAILABLE)
+        p = self._prompt()
+        self.assertEqual(p[0], '// action:prompt_end')
+        self.assertEqual(p[1], '// action:prompt_begin Resume print after power loss?')
+        self.assertIn('// action:prompt_button Resume|NEBULAOS_RESUME_POWER_LOSS '
+                      'ALLOW_UNSAFE=1 PHYSICAL=1|primary', p)
+        self.assertIn('// action:prompt_button Discard|NEBULAOS_CLEAR_POWER_LOSS_RECOVERY|error', p)
+        self.assertEqual(p[-1], '// action:prompt_show')
+        self.assertEqual(sum(1 for m in p if m == '// action:prompt_show'), 1)
+        self.assertTrue(any(' was interrupted at ' in m for m in p))
+
+    def test_no_prompt_for_the_state_only_restore_or_without_a_record(self):
+        self._checkpoint_then_power_loss(physical=False)
+        self.assertEqual(self.ext.get_status(0)['state'], plr.STATE_RECOVERY_AVAILABLE)
+        self.assertEqual(self._prompt(), [])
+        self.objects['gcode'] = _FakeGCode()
+        self.ext.cmd_NEBULAOS_PLR_DISCARD(_FakeGCmd())
+        self.objects['gcode'] = _FakeGCode()
+        self.config._values['physical_resume'] = True
+        ext = plr.NebulaOSPowerLossRecovery(self.config)
+        ext._handle_ready()
+        self.assertEqual(self._prompt(), [])
+
     def test_sidecar_records_identity_and_toolhead(self):
         self._tick_and_settle(1.0)
         rec = self._eeprom_record()
