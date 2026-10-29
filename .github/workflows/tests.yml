@@ -1,0 +1,35 @@
+name: tests
+
+# Every test of this repository (scripts/ci-tests.sh), against the host
+# Klipper the firmware image ships: KLIPPER_PIN in NebulaOS-firmware's
+# manifests/dependencies.conf (main).
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Pinned host Klipper
+        run: |
+          set -euo pipefail
+          conf=$(curl -fsSL https://raw.githubusercontent.com/NebulaOS-KE/NebulaOS-firmware/main/manifests/dependencies.conf)
+          repo=$(printf '%s\n' "$conf" | sed -n 's/^KLIPPER_REPO=//p')
+          pin=$(printf '%s\n' "$conf" | sed -n 's/^KLIPPER_PIN=//p')
+          echo "Klipper $repo @ $pin" >> "$GITHUB_STEP_SUMMARY"
+          git init -q klipper
+          git -C klipper fetch -q --depth 1 "$repo" "$pin"
+          git -C klipper checkout -q FETCH_HEAD
+      - name: Tests
+        run: |
+          set -o pipefail
+          scripts/ci-tests.sh klipper | tee -a "$GITHUB_STEP_SUMMARY"
