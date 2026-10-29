@@ -3415,6 +3415,57 @@ class CalibrationRecordTest(unittest.TestCase):
                          'ok')
 
 
+class ControlAutoTune(object):
+    """Stand-in for upstream pid_calibrate.ControlAutoTune (matched by its
+    class name, like the real one)."""
+    def __init__(self, target, peaks):
+        self.calibrate_temp = target
+        self.peaks = peaks
+        self.heating = False
+
+
+class FakePidHeater(object):
+    def __init__(self, control, temp):
+        self.control = control
+        self.temp = temp
+
+    def get_status(self, eventtime):
+        return {'temperature': self.temp, 'target': self.control.calibrate_temp}
+
+
+class PidProgressTest(unittest.TestCase):
+    """G119 (Run 22): PID_CALIBRATE progress from the autotune's own peaks."""
+
+    def _coord(self, heaters):
+        printer, gcode, coord = _build_esteps()
+        printer.add_object('heaters', types.SimpleNamespace(heaters=heaters))
+        return coord
+
+    def test_no_pid_running_no_progress(self):
+        coord = self._coord({'heater_bed': types.SimpleNamespace(control=object())})
+        self.assertIsNone(coord.get_status(0.)['progress'])
+
+    def test_heating_then_cycles_with_time_left(self):
+        ctl = ControlAutoTune(65., [(0., 10.)])
+        coord = self._coord({'heater_bed': FakePidHeater(ctl, 52.4)})
+        p = coord.get_status(0.)['progress']
+        self.assertEqual((p['flow'], p['step'], p['total'], p['key']), ('pid', 1, 2, 'heating'))
+        self.assertEqual(p['detail'], "Bed 52/65 C")
+        ctl.peaks.append((66.0, 400.))                    # first switch (target reached)
+        p = coord.get_status(0.)['progress']
+        self.assertEqual((p['step'], p['detail']), (2, "Bed 52 C, cycle 1 of 6"))
+        ctl.peaks += [(60.1, 490.), (65.8, 580.), (60.2, 670.)]   # 90 s per peak
+        p = coord.get_status(0.)['progress']
+        # 5 peaks: cycle (4+1)//2 = 2; 7 peaks to go x 90 s = 10.5 min -> 10
+        self.assertEqual(p['detail'], "Bed 52 C, cycle 2 of 6, about 10 min left")
+
+    def test_last_cycle_never_goes_past_6(self):
+        peaks = [(0., 0.)] + [(65., 100. + 60 * i) for i in range(11)]
+        coord = self._coord({'extruder': FakePidHeater(ControlAutoTune(230., peaks), 229.6)})
+        p = coord.get_status(0.)['progress']
+        self.assertEqual(p['detail'], "Hotend 230 C, cycle 6 of 6, about 1 min left")
+
+
 class GuidedFlowProgressTest(unittest.TestCase):
     def test_esteps_progress_and_result(self):
         printer, gcode, coord = _build_esteps(FakeExtruderObj(rotation_distance=7.5))

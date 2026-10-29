@@ -145,6 +145,17 @@ ESTEPS_STEPS = (
     ('confirm', "Confirm the new value", ""),
     ('commit', "Saving (Klipper restarts)", ""),
 )
+# G119 (Run 22): PID_CALIBRATE progress. Upstream pid_calibrate.py prints
+# nothing while it runs; its ControlAutoTune (the heater's control while it
+# runs) heats to the target, then switches the heater 11 times around it and
+# stops at 12 recorded peaks (the first is recorded at the start). Read only -
+# upstream is not changed.
+PID_STEPS = (
+    ('heating', "Heating up", "Check the heater, then try again."),
+    ('cycles', "Measuring", "Keep the printer away from drafts, then try again."),
+)
+PID_TOTAL_PEAKS = 12
+PID_CYCLES = 6
 _MAX_LINE = calibration_history.MAX_SUMMARY_LEN
 
 # G109 (Run 20): what upstream SHAPER_CALIBRATE prints (resonance_tester.py /
@@ -1013,7 +1024,43 @@ class NebulaOSCalibration:
             return self._step('esteps', ESTEPS_STEPS, n,
                               self._temps(eventtime, bed=False)
                               if n == 1 else '')
+        return self._pid_progress(eventtime)
+
+    def _pid_autotune(self):
+        """(heater name, heater, ControlAutoTune) while PID_CALIBRATE runs."""
+        pheaters = self.printer.lookup_object('heaters', None)
+        for name, heater in getattr(pheaters, 'heaters', {}).items():
+            control = getattr(heater, 'control', None)
+            if type(control).__name__ == 'ControlAutoTune':
+                return name, heater, control
         return None
+
+    def _pid_progress(self, eventtime):
+        found = self._pid_autotune()
+        if found is None:
+            return None
+        name, heater, control = found
+        label = "Bed" if name == 'heater_bed' else "Hotend"
+        try:
+            peaks = list(control.peaks)
+            target = float(control.calibrate_temp)
+            temp = heater.get_status(eventtime)['temperature']
+        except Exception:
+            return None
+        if len(peaks) <= 1:
+            return self._step('pid', PID_STEPS, 1,
+                              "%s %.0f/%.0f C" % (label, temp, target))
+        switches = len(peaks) - 1
+        cycle = min(PID_CYCLES, (switches + 1) // 2)
+        detail = "cycle %d of %d" % (cycle, PID_CYCLES)
+        if len(peaks) >= 3:
+            # the peaks' own times: no mix of clocks
+            per_peak = (peaks[-1][1] - peaks[1][1]) / (len(peaks) - 2)
+            left = max(0, PID_TOTAL_PEAKS - len(peaks)) * per_peak
+            if per_peak > 0:
+                detail += ", about %d min left" % (max(1, int(round(left / 60.))),)
+        return self._step('pid', PID_STEPS, 2,
+                          "%s %.0f C, %s" % (label, temp, detail))
 
     def _set_auto_step(self, n):
         self._auto_step = n
