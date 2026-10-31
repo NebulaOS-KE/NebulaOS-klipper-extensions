@@ -18,7 +18,9 @@
 import collections
 import io
 import json
+import shlex
 import os
+import re
 import shutil
 import tempfile
 import unittest
@@ -75,8 +77,27 @@ def _full_sidecar_state(generation=1, file_position=1000):
         _toolhead_status(), {'target': 200.0, 'bed_target': 60.0,
                               'pressure_advance': 0.04, 'smooth_time': 0.04},
         {'profile_name': 'default'},
-        {'objects': ['obj1', 'obj2'], 'excluded_objects': ['obj1']},
+        {'objects': _OBJECTS, 'excluded_objects': ['OBJ1']},
         {'speed': 1.0})
+
+
+# Upstream exclude_object's status "objects": dicts, as a slicer defines them
+# (Run 23 power-cut test: the resume wrote the dict itself into NAME=).
+_OBJECTS = [
+    {'name': 'OBJ1', 'center': [110, 110],
+     'polygon': [[79.9995, 100.816], [80.1405, 100.118], [140.0, 125.5]]},
+    {'name': 'OBJ2'},
+]
+
+
+def _klipper_params(line):
+    """(command, params) the way upstream gcode.py reads an extended
+    command: shlex with whitespace_split, every argument KEY=VALUE."""
+    cmd, _, raw = line.partition(' ')
+    s = shlex.shlex(raw, posix=True)
+    s.whitespace_split = True
+    s.commenters = '#;'
+    return cmd, {k.upper(): v for k, v in (a.split('=', 1) for a in s)}
 
 
 class MeaningfulProgressTests(unittest.TestCase):
@@ -129,7 +150,7 @@ class SidecarStateBuildTests(unittest.TestCase):
         self.assertEqual(state['thermal']['bed_target'], 60.0)
         self.assertEqual(state['extruder']['pressure_advance'], 0.04)
         self.assertEqual(state['bed_mesh']['profile_name'], 'default')
-        self.assertEqual(state['exclude_object']['objects'], ['obj1', 'obj2'])
+        self.assertEqual(state['exclude_object']['objects'], _OBJECTS)
         self.assertEqual(state['fan']['speed'], 1.0)
 
     def test_json_serializable(self):
@@ -362,10 +383,34 @@ class ResumeGcodeReconstructionTests(unittest.TestCase):
     def test_exclude_object_restoration(self):
         state = _full_sidecar_state()
         lines = plr.build_resume_gcode_lines(state)
-        self.assertIn("EXCLUDE_OBJECT_DEFINE NAME=obj1", lines)
-        self.assertIn("EXCLUDE_OBJECT_DEFINE NAME=obj2", lines)
-        self.assertIn("EXCLUDE_OBJECT NAME=obj1", lines)
-        self.assertNotIn("EXCLUDE_OBJECT NAME=obj2", lines)
+        self.assertIn("EXCLUDE_OBJECT_DEFINE NAME=OBJ1 CENTER=110,110 POLYGON="
+                      "[[79.9995,100.816],[80.1405,100.118],[140.0,125.5]]", lines)
+        self.assertIn("EXCLUDE_OBJECT_DEFINE NAME=OBJ2", lines)
+        self.assertIn("EXCLUDE_OBJECT NAME=OBJ1", lines)
+        self.assertNotIn("EXCLUDE_OBJECT NAME=OBJ2", lines)
+
+    def test_exclude_object_define_round_trips_through_klipper_parsing(self):
+        # What upstream cmd_EXCLUDE_OBJECT_DEFINE rebuilds from the line.
+        for obj in _OBJECTS + [{'name': 'A B', 'center': [1.5, 2], 'EXTRA': 'x'}]:
+            cmd, params = _klipper_params(plr.exclude_object_define_line(obj))
+            self.assertEqual(cmd, 'EXCLUDE_OBJECT_DEFINE')
+            rebuilt = {'name': params.pop('NAME')}
+            if 'CENTER' in params:
+                rebuilt['center'] = json.loads('[%s]' % params.pop('CENTER'))
+            if 'POLYGON' in params:
+                rebuilt['polygon'] = json.loads(params.pop('POLYGON'))
+            rebuilt.update(params)
+            self.assertEqual(rebuilt, obj)
+
+    def test_every_resume_line_parses_as_klipper_gcode(self):
+        state = _full_sidecar_state()
+        lines = plr.build_physical_resume_lines(state, 5.0, 3.0, 250.0,
+                                                ['default'])
+        for line in plr.build_resume_gcode_lines(state, ['default']) + lines:
+            if re.match(r'^[GMT][0-9]', line):
+                continue  # traditional G/M commands are not KEY=VALUE
+            cmd, params = _klipper_params(line)  # ValueError: malformed
+            self.assertTrue(re.match(r'^[A-Z_][A-Z0-9_]*$', cmd), line)
 
     def test_bed_mesh_clear_when_no_profile(self):
         state = plr.build_sidecar_state(
@@ -851,6 +896,24 @@ class ExtensionStateMachineTests(unittest.TestCase):
         self.assertTrue(any(l.startswith("M23 ") for l in lines))
         self.assertTrue(any(l.startswith("M26 ") for l in lines))
         self.assertFalse(self.ext._resume_in_progress)  # cleared afterward
+
+    def test_failed_resume_unloads_the_file_and_turns_the_nozzle_off(self):
+        # Run 23 power-cut test: a line refused after M23 left the file
+        # loaded (screen stuck on a print that never ran) and the nozzle hot.
+        self._tick_and_settle(1.0)
+        self.print_stats_status['state'] = 'standby'  # after power loss
+        gcode = self.objects['gcode']
+
+        def refuse(line):
+            gcode.run_lines.append(line)
+            if line.startswith("M26 "):
+                raise Exception("Malformed command")
+        gcode.run_script_from_command = refuse
+        with self.assertRaises(Exception):
+            self.ext.cmd_NEBULAOS_PLR_RESUME(_FakeGCmd({'ALLOW_UNSAFE': 1}))
+        self.assertEqual(gcode.run_lines[-2:], ["M104 S0", "SDCARD_RESET_FILE"])
+        self.assertIsNone(self.ext._resume_armed)
+        self.assertFalse(self.ext._resume_in_progress)
 
     def test_resume_allow_unsafe_cannot_bypass_integrity_failure(self):
         self._tick_and_settle(1.0)

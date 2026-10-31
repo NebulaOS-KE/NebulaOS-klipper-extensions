@@ -35,6 +35,7 @@ import hashlib
 import json
 import logging
 import os
+import shlex
 
 from . import nebulaos_plr_journal as journal
 
@@ -385,6 +386,39 @@ def light_recovery_check(eeprom_record, sidecar_state, resolved_file_path,
     return STATE_RECOVERY_AVAILABLE, ""
 
 
+def _gcode_value(value):
+    """One extended-G-code parameter value. Klipper splits the parameters
+    with shlex, so a value with whitespace or quotes must be quoted."""
+    text = "%s" % (value,)
+    if text and not any(c.isspace() or c in "'\"\\#;" for c in text):
+        return text
+    return shlex.quote(text)
+
+
+def exclude_object_define_line(obj):
+    """The EXCLUDE_OBJECT_DEFINE that recreates one entry of upstream
+    exclude_object's status "objects" (Run 23 power-cut test): each entry is
+    a dict - name, optional center [x, y], optional polygon [[x, y], ...] and
+    any other parameter the slicer gave, under its upper-case key - never the
+    bare name. CENTER and POLYGON are written the way upstream reads them
+    back (json.loads('[%s]' % CENTER), json.loads(POLYGON)), without spaces."""
+    if not isinstance(obj, dict):
+        return "EXCLUDE_OBJECT_DEFINE NAME=%s" % _gcode_value(obj)
+    parts = ["EXCLUDE_OBJECT_DEFINE NAME=%s" % _gcode_value(obj["name"])]
+    center = obj.get("center")
+    if center is not None:
+        parts.append("CENTER=%s" % ",".join(
+            json.dumps(c) for c in center))
+    polygon = obj.get("polygon")
+    if polygon is not None:
+        parts.append("POLYGON=%s" % json.dumps(polygon, separators=(",", ":")))
+    for key in sorted(obj):
+        if key in ("name", "center", "polygon"):
+            continue
+        parts.append("%s=%s" % (key.upper(), _gcode_value(obj[key])))
+    return " ".join(parts)
+
+
 def build_resume_gcode_lines(state, saved_mesh_profiles=None):
     """Builds the standard-command restoration sequence from the mission's
     "Public Klipper Resume Path" section. Pure string assembly - no gcode
@@ -410,10 +444,10 @@ def build_resume_gcode_lines(state, saved_mesh_profiles=None):
     lines = []
     lines.append("M23 %s" % file_info["path"])
 
-    for name in state["exclude_object"].get("objects", []):
-        lines.append("EXCLUDE_OBJECT_DEFINE NAME=%s" % name)
+    for obj in state["exclude_object"].get("objects", []):
+        lines.append(exclude_object_define_line(obj))
     for name in state["exclude_object"].get("excluded_objects", []):
-        lines.append("EXCLUDE_OBJECT NAME=%s" % name)
+        lines.append("EXCLUDE_OBJECT NAME=%s" % _gcode_value(name))
 
     lines.append("M26 S%d" % state["file_position"])
 
@@ -1273,6 +1307,7 @@ class NebulaOSPowerLossRecovery:
                 self.gcode.run_script_from_command(line)
         except Exception:
             self._resume_armed = None
+            self._undo_failed_resume()
             raise
         finally:
             self._resume_in_progress = False
@@ -1291,6 +1326,19 @@ class NebulaOSPowerLossRecovery:
                 "No motion was performed and M24 was NOT issued - verify the "
                 "physical position is safe, then resume printing manually."
                 % validated["generation"])
+
+    def _undo_failed_resume(self):
+        """A resume that stopped part-way (Run 23 power-cut test: a refused
+        line after M23) must not leave the file loaded - the screen and
+        Mainsail then show a print that never runs - nor the nozzle hot over
+        the part. The bed stays on to keep the part attached for a retry;
+        the record is untouched, so Resume is offered again."""
+        for line in ("M104 S0", "SDCARD_RESET_FILE"):
+            try:
+                self.gcode.run_script_from_command(line)
+            except Exception:
+                logging.exception("nebulaos_power_loss_recovery: %s after a "
+                                  "failed resume", line)
 
     def cmd_NEBULAOS_PLR_SET_Z(self, gcmd):
         """Declares Z homed at the recorded height. Only valid inside a
