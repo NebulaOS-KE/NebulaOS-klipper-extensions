@@ -93,7 +93,7 @@ this reference keeps them apart.
 | | |
 |---|---|
 | Source commit | `ed99372` |
-| Shipped by firmware | the firmware manifest pins `a2e7634`; this reference describes `ed99372`, which is newer. The PLR resume changes are documented here but are **not in the current firmware build** |
+| Shipped by firmware | **yes** - the firmware manifest advanced to `ed99372` in firmware `832314d`, so this reference describes exactly what ships |
 | Test suite | 29 of 31 suites, **899 tests, all passing** |
 | Modules with a test | 21 of 30 |
 | Hardware verification | **none** - see below |
