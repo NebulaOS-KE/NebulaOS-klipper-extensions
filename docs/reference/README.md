@@ -66,6 +66,24 @@ as reassurance:
   temperatures.
 - **Hardware behaviour.** Nothing here was run on a printer.
 
+## One module declares its own hardware gap
+
+`nozzle_clear.py` - the native nozzle-wipe routine behind `_NEBULAOS_NOZZLE_CLEAN` - carries a
+note in its own header stating that the module **had not been exercised on real hardware** when
+that note was written, and that it was enabled for a Phase 1.8B integration candidate by
+source-level activation.
+
+Read the flag carefully, because its name inverts: `HARDWARE_BEHAVIOR_BLOCKED = False` means
+the routine is **not** blocked and does run. The guard raises only when the flag is `True`.
+
+This matters because the routine is a motion and contact sequence: it heats, probes two
+randomised points on the wipe pad, and drags the nozzle between them under load. It is the only
+module in this repository carrying such a note.
+
+Whether it has since been qualified on hardware is not something this reference can establish -
+the note says "as of this commit" about the commit it was written in, not about `a2e7634`.
+Treat it as a question for the project owner rather than a current statement of fact.
+
 ## Verification state
 
 | | |
