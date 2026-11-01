@@ -10,11 +10,13 @@ a publishing destination.
 
 | Page | What it is |
 |---|---|
-| [COMMANDS.md](COMMANDS.md) | Every G-code command these extensions register, with its module, kind, test coverage and description, plus the parameters each module reads |
+| [COMMANDS.md](COMMANDS.md) | Summary table: every command with its module, kind, test coverage and description |
+| [COMMANDS-DETAIL.md](COMMANDS-DETAIL.md) | One section per command: handler, help text, parameters with types/defaults/valid ranges, errors raised, side effects, example invocation |
 | [CONFIG.md](CONFIG.md) | Every configuration option, with its literal default and constraints |
 
-Both are **generated** by `documentation/agent/tools/gen_extensions_reference.py` in the
-central NebulaOS repository, parsed with Python's `ast`. Do not edit them by hand - a
+All three are **generated** by tools in the central NebulaOS repository
+(`gen_extensions_reference.py`, `gen_extensions_commands_detail.py`), parsed with Python's
+`ast`. Do not edit them by hand - a
 regeneration will overwrite the edit, and the point of generating them is that no default is
 transcribed by a human.
 
@@ -46,6 +48,23 @@ stock Klipper:
    `_NEBULAOS_BED_TRAM`. A reference built only from this repository cannot see those, and
    `COMMANDS.md` says so rather than presenting itself as the complete list of what a user can
    type.
+
+## What the detail pages do not contain
+
+`COMMANDS-DETAIL.md` derives everything from the handler the registration points at, so a
+parameter cannot be attributed to the wrong command. Four things the mission asks for are
+deliberately absent, and each command section says so rather than leaving silence to be read
+as reassurance:
+
+- **Expected output.** Most handlers reply through `respond_info` with runtime values, so the
+  text depends on machine state. An example response would be invented.
+- **Preconditions** beyond the guards visible in the handler. A command may also depend on
+  calibration state or configuration the handler does not check.
+- **Safety warnings.** Whether a command is dangerous is a judgement about physical
+  consequence, not a fact in the file. Commands are instead flagged **Runs G-code: yes**,
+  which is the closest honest proxy - it means the command can move the machine or change
+  temperatures.
+- **Hardware behaviour.** Nothing here was run on a printer.
 
 ## Verification state
 
