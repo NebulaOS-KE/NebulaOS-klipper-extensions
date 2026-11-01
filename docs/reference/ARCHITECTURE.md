@@ -4,7 +4,7 @@
 
 # How the extensions work
 
-A developer's guide to `NebulaOS-klipper-extensions` at commit `a2e7634`: what this
+A developer's guide to `NebulaOS-klipper-extensions` at commit `ed99372`: what this
 repository is, how its code reaches a running printer, and how the pieces fit together.
 
 For exhaustive lists, see [COMMANDS-DETAIL.md](COMMANDS-DETAIL.md) and
@@ -234,7 +234,7 @@ cd extras
 python3 -m unittest extras.test_nebulaos_beeper
 ```
 
-At `a2e7634`: **29 of 31 suites, 899 tests, all passing.** The two not in that run
+At `ed99372`: **29 of 31 suites, 899 tests, all passing.** The two not in that run
 (`test_nebulaos_compat`, `test_nebulaos_temperature_mcu`) import real Klipper modules and need
 the pinned Klipper composed in, exactly as `scripts/ci-tests.sh` documents. They are a
 different run, not failures.

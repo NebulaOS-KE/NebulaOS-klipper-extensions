@@ -1,6 +1,6 @@
 # NebulaOS Klipper extensions - developer reference
 
-Technical reference for `NebulaOS-klipper-extensions`, at commit `a2e7634`.
+Technical reference for `NebulaOS-klipper-extensions`, at commit `ed99372`.
 
 This repository's GitHub wiki is **disabled**, so this reference lives in the repository
 itself. That is the better place anyway: the mission treats Git as authoritative and a wiki as
@@ -70,36 +70,30 @@ as reassurance:
   temperatures.
 - **Hardware behaviour.** Nothing here was run on a printer.
 
-## A stale note in `nozzle_clear.py`
+## `nozzle_clear` is live and has been run on hardware
 
-`nozzle_clear.py` - the native nozzle-wipe routine behind `_NEBULAOS_NOZZLE_CLEAN` - carries a
-header note saying the module **had not been exercised on real hardware**, and that it was
-enabled for a Phase 1.8B integration candidate by source-level activation.
+Worth stating, because the flag name inverts and reads like its opposite:
+`HARDWARE_BEHAVIOR_BLOCKED = False` means the routine is **not** blocked and does run. The guard
+raises only when it is `True`.
 
-**That note is out of date.** The project owner reports that `_NEBULAOS_NOZZLE_CLEAN` has run on
-the development printer more than once, and the code agrees that it would: auto calibration
-invokes it directly, at `nebulaos_calibration.py:1762`, as part of its sequence. So anyone
-running auto calibration has exercised this routine.
+`_NEBULAOS_NOZZLE_CLEAN` is step 3 of the auto-calibration sequence in
+`nebulaos_calibration.py`, so anyone running auto calibration exercises it. The project owner
+reports it has run on the development printer several times.
 
-Two things worth separating, because they have different standing:
+The module's header previously stated it had never been exercised on hardware. That note was
+stale and has been corrected in the source at `ed99372`; disregard it if you are reading an
+older checkout.
 
-- **Code-verified here:** the call site exists and auto calibration runs `_NEBULAOS_NOZZLE_CLEAN`.
-- **Reported by the owner, not observed by this reference:** that those runs happened on a real
-  printer and behaved correctly. This documentation has no printer access.
-
-The header comment is expected to be corrected in the extensions repository. Until it is, read
-it as historical.
-
-A note on the flag name, since it inverts and is easy to misread:
-`HARDWARE_BEHAVIOR_BLOCKED = False` means the routine is **not** blocked and does run. The
-guard raises only when it is `True`.
+As elsewhere here: the call site is code-verified, while the hardware runs are the owner's
+report rather than this documentation's observation. Those are different kinds of evidence and
+this reference keeps them apart.
 
 ## Verification state
 
 | | |
 |---|---|
-| Source commit | `a2e7634` |
-| Shipped by firmware | **yes** - the manifest pins exactly this commit |
+| Source commit | `ed99372` |
+| Shipped by firmware | the firmware manifest pins `a2e7634`; this reference describes `ed99372`, which is newer. The PLR resume changes are documented here but are **not in the current firmware build** |
 | Test suite | 29 of 31 suites, **899 tests, all passing** |
 | Modules with a test | 21 of 30 |
 | Hardware verification | **none** - see below |
