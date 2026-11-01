@@ -7,22 +7,14 @@
 # eliminates the last runtime dependency on the PRTouch MCU protocol for the
 # CRTENSE_NOZZLE_CLEAR command path.
 #
-# HARDWARE_BEHAVIOR_BLOCKED: intentionally set to False for the Phase 1.8B integration
-# candidate (source-level activation only - see NebulaOS workspace
-# _project/missions/phase1.8b-pre-build-review.md and its integration-candidate
-# follow-up for the full decision record). This module still has NOT been exercised on
-# real hardware as of this commit: the nebulaos_z_offset_probe uses a fundamentally
-# different sensor processing pipeline (upstream Klipper's HX711 -> LoadCell ->
-# trigger_analog -> LCBestFit) compared to PRTouch's own custom MCU-side hold-count
-# trigger logic. The physical sensor is the same (HX711 on PA4/PC6), but the trigger
-# thresholds, filtering, and contact detection algorithm differ. Known, accepted risks
-# pending the hardware qualification gate of this same candidate:
-#   - Different effective trigger height (could push too hard or not make contact)
-#   - Different noise response on the wipe pad surface (different from bed probing)
-#   - No retries parameter (PRTouch used retries=5 for wipe-pad touches)
-# This flag being False means "the source is ready to be tested," not "this has been
-# proven safe on real hardware" - that proof is a separate, owner-attended hardware
-# gate, not a source-code state.
+# HARDWARE_BEHAVIOR_BLOCKED is False: the routine is live. It runs as
+# _NEBULAOS_NOZZLE_CLEAN, step 3 of the auto-calibration
+# (nebulaos_calibration.py), and has been run on ke-dev several times (Tim,
+# 2026-11-01). The probe pipeline differs from PRTouch's (upstream Klipper's
+# HX711 -> LoadCell -> trigger_analog -> LCBestFit instead of PRTouch's MCU-side
+# hold-count trigger; same HX711 on PA4/PC6), so trigger height, noise on the
+# wipe pad and the missing retries (PRTouch: retries=5) are what to look at if
+# a wipe ever misbehaves.
 #
 # NozzleClearConfig is parameter-identical to prtouch_nozzle.ClearNozzleConfig: same
 # config keys, same defaults, same bounds. The only difference is in the probe interface
@@ -36,11 +28,8 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import random
 
-# Phase 1.8B integration candidate: source-level activation. clear_nozzle() itself
-# checks this constant before proceeding (see its own guard below) - flipping it here
-# is what makes this the live CRTENSE_NOZZLE_CLEAR implementation once built. Hardware
-# qualification (the actual physical wipe-pad test) is a separate, owner-attended gate
-# that has NOT happened as of this commit - see the module docstring above.
+# clear_nozzle() checks this constant before proceeding (see its own guard
+# below); False is the live state - see the header above.
 HARDWARE_BEHAVIOR_BLOCKED = False
 
 

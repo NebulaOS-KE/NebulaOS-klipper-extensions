@@ -77,7 +77,8 @@ def _full_sidecar_state(generation=1, file_position=1000):
         _toolhead_status(), {'target': 200.0, 'bed_target': 60.0,
                               'pressure_advance': 0.04, 'smooth_time': 0.04},
         {'profile_name': 'default'},
-        {'objects': _OBJECTS, 'excluded_objects': ['OBJ1']},
+        {'objects': _OBJECTS, 'excluded_objects': ['OBJ1'],
+         'current_object': 'OBJ2'},
         {'speed': 1.0})
 
 
@@ -402,6 +403,29 @@ class ResumeGcodeReconstructionTests(unittest.TestCase):
             rebuilt.update(params)
             self.assertEqual(rebuilt, obj)
 
+    def test_resume_restarts_the_object_being_printed(self):
+        # Run 23 power-cut test: EXCLUDE_OBJECT_END NAME=... does not match
+        # the current object NAME=None
+        lines = plr.build_resume_gcode_lines(_full_sidecar_state(), ['default'])
+        self.assertIn('EXCLUDE_OBJECT_START NAME=OBJ2', lines)
+        self.assertLess(lines.index('EXCLUDE_OBJECT_START NAME=OBJ2'),
+                        next(i for i, l in enumerate(lines) if l.startswith('M26 ')))
+        state = _full_sidecar_state()
+        state['exclude_object']['current_object'] = None
+        self.assertFalse(any(l.startswith('EXCLUDE_OBJECT_START')
+                             for l in plr.build_resume_gcode_lines(state, ['default'])))
+        del state['exclude_object']['current_object']  # a record from before
+        self.assertFalse(any(l.startswith('EXCLUDE_OBJECT_START')
+                             for l in plr.build_resume_gcode_lines(state, ['default'])))
+
+    def test_physical_resume_restarts_the_timelapse_watcher_only_when_asked(self):
+        state = _full_sidecar_state()
+        plain = plr.build_physical_resume_lines(state, 5.0, 3.0, 250.0, ['default'])
+        self.assertNotIn('_NEBULAOS_TIMELAPSE ACTION=START', plain)
+        lines = plr.build_physical_resume_lines(state, 5.0, 3.0, 250.0, ['default'],
+                                                timelapse_watcher=True)
+        self.assertEqual(lines[-2:], ['_NEBULAOS_TIMELAPSE ACTION=START', 'M24'])
+
     def test_every_resume_line_parses_as_klipper_gcode(self):
         state = _full_sidecar_state()
         lines = plr.build_physical_resume_lines(state, 5.0, 3.0, 250.0,
@@ -594,6 +618,9 @@ class _FakeReactor(object):
 
     def monotonic(self):
         return 0.0
+
+    def pause(self, waketime):
+        return waketime
 
 
 class _FakePrinter(object):
@@ -1281,11 +1308,35 @@ class ConfigIdentityAndPhysicalResumeTests(ExtensionStateMachineTests):
         self.assertEqual(lines[-1], 'M24')
         self.assertEqual(sum(1 for l in lines if l.startswith('G28')), 1)
         self.assertNotIn('G28', [l for l in lines if l.startswith('G28 Z')])
-        self.assertEqual([l for l in lines if l.startswith('M104')], ['M104 S210'])
+        # Run 23 (Tim): the nozzle heats only once parked off the part -
+        # the bed first, with the nozzle off.
+        self.assertFalse(any(l.startswith(('M104', 'M140')) for l in lines))
+        self.assertEqual(idx('M190 S60'), 0)
+        self.assertEqual([l for l in lines if l.startswith('M109')], ['M109 S210'])
         # The print M24 starts keeps the record it resumed.
         self.print_stats_status['state'] = 'printing'
         self.ext._tick(50.0)
         self.assertIsNotNone(self._eeprom_record())
+
+    def test_physical_resume_keeps_the_timelapse(self):
+        # Run 23 (Tim): the resumed print's video includes the frames from
+        # before the power loss; the layer watcher starts again.
+        frames = os.path.join(self.tmpdir, 'timelapse-frames') + '/'
+        os.makedirs(frames)
+        for i in (1, 2):
+            open(os.path.join(frames, 'frame%06d.jpg' % i), 'w').close()
+        self.config._values['timelapse_frame_path'] = frames
+        self.objects['gcode_macro _NEBULAOS_TIMELAPSE'] = object()
+        self._checkpoint_then_power_loss(physical=True)
+        self.ext.cmd_NEBULAOS_PLR_RESUME(_FakeGCmd({'ALLOW_UNSAFE': 1, 'PHYSICAL': 1}))
+        lines = self.objects['gcode'].run_lines
+        self.assertEqual(lines[-2:], ['_NEBULAOS_TIMELAPSE ACTION=START', 'M24'])
+        self.assertEqual(os.listdir(frames), [])  # aside before the M23
+        open(os.path.join(frames, 'frame000001.jpg'), 'w').close()  # after the resume
+        self.print_stats_status['filename'] = self.ext._resume_armed[1]
+        self.ext.cmd_NEBULAOS_PLR_TIMELAPSE_MERGE(_FakeGCmd({}))
+        self.assertEqual(sorted(os.listdir(frames)),
+                         ['frame000001.jpg', 'frame000002.jpg', 'frame000003.jpg'])
 
     def test_set_z_is_internal_and_homes_z_only(self):
         with self.assertRaises(Exception):
@@ -1571,6 +1622,72 @@ class CandidatePromotionTests(ExtensionStateMachineTests):
         self.assertEqual(seen_generations,
                           list(range(seen_generations[0],
                                      seen_generations[0] + 4)))
+
+
+class TimelapseFramesTests(unittest.TestCase):
+    """Run 23 (Tim): a resumed print keeps the frames from before the
+    power loss in its timelapse."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.frames = os.path.join(self.tmp, 'timelapse-frames') + '/'
+        os.makedirs(self.frames)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def _shoot(self, *labels):
+        # what moonraker-timelapse does: frame000001.jpg, ... from 1
+        start = len(plr._timelapse_frames(self.frames))
+        for i, label in enumerate(labels, start + 1):
+            with open(os.path.join(self.frames, 'frame%06d.jpg' % i), 'w') as f:
+                f.write(label)
+
+    def _video(self):
+        names = sorted(os.listdir(self.frames))
+        self.assertEqual(names, ['frame%06d.jpg' % i for i in range(1, len(names) + 1)])
+        video = []
+        for n in names:
+            with open(os.path.join(self.frames, n)) as f:
+                video.append(f.read())
+        return video
+
+    def _moonraker_file_selected(self):
+        for path in plr._timelapse_frames(self.frames):
+            os.remove(path)
+
+    def test_frames_before_the_power_loss_come_first(self):
+        self._shoot('a1', 'a2', 'a3')
+        self.assertEqual(plr.timelapse_set_aside_frames(self.frames, 'p.gcode'), 3)
+        self._moonraker_file_selected()
+        self._shoot('b1', 'b2')
+        self.assertEqual(plr.timelapse_merge_frames(self.frames, 'p.gcode'), 3)
+        self.assertEqual(self._video(), ['a1', 'a2', 'a3', 'b1', 'b2'])
+        self.assertFalse(os.path.exists(plr._timelapse_aside_dir(self.frames)))
+
+    def test_two_power_losses(self):
+        self._shoot('a1', 'a2')
+        plr.timelapse_set_aside_frames(self.frames, 'p.gcode')
+        self._moonraker_file_selected()
+        self._shoot('b1')
+        plr.timelapse_set_aside_frames(self.frames, 'p.gcode')
+        self._moonraker_file_selected()
+        self._shoot('c1', 'c2')
+        plr.timelapse_merge_frames(self.frames, 'p.gcode')
+        self.assertEqual(self._video(), ['a1', 'a2', 'b1', 'c1', 'c2'])
+
+    def test_frames_of_another_print_are_dropped(self):
+        self._shoot('a1')
+        plr.timelapse_set_aside_frames(self.frames, 'old.gcode')
+        self._shoot('n1', 'n2')
+        self.assertEqual(plr.timelapse_merge_frames(self.frames, 'new.gcode'), 0)
+        self.assertEqual(self._video(), ['n1', 'n2'])
+        self.assertFalse(os.path.exists(plr._timelapse_aside_dir(self.frames)))
+
+    def test_nothing_to_keep(self):
+        self.assertEqual(plr.timelapse_set_aside_frames(self.frames, 'p.gcode'), 0)
+        self.assertFalse(os.path.exists(plr._timelapse_aside_dir(self.frames)))
+        self.assertEqual(plr.timelapse_merge_frames(self.frames, 'p.gcode'), 0)
 
 
 if __name__ == '__main__':
