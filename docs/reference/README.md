@@ -10,11 +10,15 @@ a publishing destination.
 
 | Page | What it is |
 |---|---|
+| [ARCHITECTURE.md](ARCHITECTURE.md) | **Start here.** What this repository is, how its code reaches a running printer, the compatibility contract, how a calibration actually runs, how state is persisted |
 | [COMMANDS.md](COMMANDS.md) | Summary table: every command with its module, kind, test coverage and description |
 | [COMMANDS-DETAIL.md](COMMANDS-DETAIL.md) | One section per command: handler, help text, parameters with types/defaults/valid ranges, errors raised, side effects, example invocation |
 | [CONFIG.md](CONFIG.md) | Every configuration option, with its literal default and constraints |
 
-All three are **generated** by tools in the central NebulaOS repository
+`ARCHITECTURE.md` is hand-written: explanation cannot be extracted. Every factual claim in it
+names the file it came from, so any sentence can be re-checked.
+
+The other three are **generated** by tools in the central NebulaOS repository
 (`gen_extensions_reference.py`, `gen_extensions_commands_detail.py`), parsed with Python's
 `ast`. Do not edit them by hand - a
 regeneration will overwrite the edit, and the point of generating them is that no default is
