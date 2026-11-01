@@ -31,6 +31,7 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 from __future__ import annotations
 
+import glob
 import hashlib
 import json
 import logging
@@ -179,6 +180,9 @@ def build_sidecar_state(generation, file_info, file_position,
         "exclude_object": {
             "objects": exclude_object_status.get("objects", []),
             "excluded_objects": exclude_object_status.get("excluded_objects", []),
+            # The object being printed at the checkpoint (Run 23: without it
+            # the resumed file's EXCLUDE_OBJECT_END did not match).
+            "current_object": exclude_object_status.get("current_object"),
         },
     }
     if firmware_retraction_status is not None:
@@ -448,6 +452,9 @@ def build_resume_gcode_lines(state, saved_mesh_profiles=None):
         lines.append(exclude_object_define_line(obj))
     for name in state["exclude_object"].get("excluded_objects", []):
         lines.append("EXCLUDE_OBJECT NAME=%s" % _gcode_value(name))
+    current_object = state["exclude_object"].get("current_object")
+    if current_object:
+        lines.append("EXCLUDE_OBJECT_START NAME=%s" % _gcode_value(current_object))
 
     lines.append("M26 S%d" % state["file_position"])
 
@@ -504,16 +511,19 @@ class PhysicalResumeRefused(Exception):
 
 
 def build_physical_resume_lines(state, z_lift, prime_length, z_max,
-                                saved_mesh_profiles):
+                                saved_mesh_profiles, timelapse_watcher=False):
     """The physical resume (opt-in, [nebulaos_power_loss_recovery]
     physical_resume: True; NOT hardware-qualified until the supervised
     power-cut test). Same idea as Creality's stock resume - home X/Y only,
     trust that Z did not move while unpowered - with these differences:
-    the bed is heated first (keeps the part attached), Z is declared at its
-    recorded kinematic height and LIFTED before any XY move (stock moves XY
-    at print height), the nozzle is heated and primed at the X/Y endstop
-    park position off the bed, and the configuration identity was already
-    proven equal by validate_recovery().
+    the bed is heated first (keeps the part attached) with the nozzle off,
+    Z is declared at its recorded kinematic height and LIFTED before any XY
+    move (stock moves XY at print height), the nozzle is heated only at the
+    X/Y endstop park position off the bed (Run 23, Tim: heating it over the
+    part marked it and oozed onto it) and primed there, and the
+    configuration identity was already proven equal by validate_recovery().
+    timelapse_watcher: restart NebulaOS's timelapse layer watcher
+    (_NEBULAOS_TIMELAPSE, started by START_PRINT, which a resume skips).
 
     Ordering constraint from upstream safe_z_home: G28 with Z unhomed resets
     Z to 0 and clears its homing - so Z is declared homed at its recorded
@@ -550,9 +560,6 @@ def build_physical_resume_lines(state, z_lift, prime_length, z_max,
 
     lines = []
     if bed > 0:
-        lines.append("M140 S%g" % bed)
-    lines.append("M104 S%g" % hotend)
-    if bed > 0:
         lines.append("M190 S%g" % bed)
     lines.append("_NEBULAOS_PLR_SET_Z Z=%.4f" % kin_z)
     lines.append("G91")
@@ -575,8 +582,81 @@ def build_physical_resume_lines(state, z_lift, prime_length, z_max,
     lines.append("G92 E%g" % ge)
     lines.append("G90" if gcode_state["absolute_coordinates"] else "G91")
     lines.append("M82" if gcode_state["absolute_extrude"] else "M83")
+    if timelapse_watcher:
+        lines.append("_NEBULAOS_TIMELAPSE ACTION=START")
     lines.append("M24")
     return lines
+
+
+# Timelapse frames across a power loss (Run 23, Tim: keep the whole video).
+# moonraker-timelapse (upstream, unmodified) empties its frame directory on
+# every "File selected" - the resume's M23 too - and numbers new frames from
+# 1 again; its render reads frame000001.jpg, frame000002.jpg, ... without a
+# gap. So the resume moves the frames from before the power loss aside, and
+# END_PRINT / CANCEL_PRINT merge them back in front of the new ones, before
+# Moonraker renders. The aside directory names the print it belongs to.
+TIMELAPSE_ASIDE_SUFFIX = "-plr"
+TIMELAPSE_ASIDE_TAG = "print.txt"
+
+
+def _timelapse_frames(directory):
+    return sorted(glob.glob(os.path.join(directory, "frame*.jpg")))
+
+
+def _timelapse_aside_dir(frame_dir):
+    return frame_dir.rstrip("/") + TIMELAPSE_ASIDE_SUFFIX
+
+
+def _timelapse_aside_print(aside):
+    try:
+        with open(os.path.join(aside, TIMELAPSE_ASIDE_TAG)) as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _timelapse_drop_aside(aside):
+    for path in glob.glob(os.path.join(aside, "*")):
+        os.remove(path)
+    os.rmdir(aside)
+
+
+def timelapse_merge_frames(frame_dir, print_path):
+    """The frames set aside for print_path go in front of the frames in
+    frame_dir, all renumbered from 1 without a gap. An aside directory of
+    another print is stale and dropped. Returns the number of frames put
+    back."""
+    aside = _timelapse_aside_dir(frame_dir)
+    if not os.path.isdir(aside):
+        return 0
+    if _timelapse_aside_print(aside) != print_path:
+        _timelapse_drop_aside(aside)
+        return 0
+    old = _timelapse_frames(aside)
+    new = _timelapse_frames(frame_dir)
+    # highest first, so no rename lands on a frame not yet moved
+    for i in range(len(new), 0, -1):
+        os.rename(new[i - 1], os.path.join(frame_dir, "frame%06d.jpg" % (len(old) + i)))
+    for i, path in enumerate(old, 1):
+        os.rename(path, os.path.join(frame_dir, "frame%06d.jpg" % i))
+    _timelapse_drop_aside(aside)
+    return len(old)
+
+
+def timelapse_set_aside_frames(frame_dir, print_path):
+    """Before the resume's M23: every frame of print_path so far (a second
+    power loss included) goes to the aside directory. Returns the count."""
+    timelapse_merge_frames(frame_dir, print_path)
+    frames = _timelapse_frames(frame_dir)
+    if not frames:
+        return 0
+    aside = _timelapse_aside_dir(frame_dir)
+    os.makedirs(aside)
+    with open(os.path.join(aside, TIMELAPSE_ASIDE_TAG), "w") as f:
+        f.write(print_path)
+    for path in frames:
+        os.rename(path, os.path.join(aside, os.path.basename(path)))
+    return len(frames)
 
 
 # ---------------------------------------------------------------------------
@@ -634,6 +714,10 @@ class NebulaOSPowerLossRecovery:
             'resume_z_lift', DEFAULT_RESUME_Z_LIFT, minval=1., maxval=20.)
         self.prime_length = config.getfloat(
             'prime_length', DEFAULT_PRIME_LENGTH, minval=0., maxval=50.)
+        # moonraker-timelapse's frame_path: set, a resume keeps the frames
+        # from before the power loss in the video (see
+        # timelapse_set_aside_frames). Empty: not touched.
+        self.timelapse_frame_path = config.get('timelapse_frame_path', '')
 
         self.executor = None
         self.timer_handler = None
@@ -681,6 +765,10 @@ class NebulaOSPowerLossRecovery:
         self.gcode.register_command(
             "_NEBULAOS_PLR_LOAD_MESH", self.cmd_NEBULAOS_PLR_LOAD_MESH,
             desc="Internal to NEBULAOS_PLR_RESUME")
+        self.gcode.register_command(
+            "_NEBULAOS_PLR_TIMELAPSE_MERGE", self.cmd_NEBULAOS_PLR_TIMELAPSE_MERGE,
+            desc="END_PRINT/CANCEL_PRINT: put the timelapse frames from "
+                 "before a power loss back in front")
 
     # -- setup -------------------------------------------------------------
 
@@ -927,6 +1015,7 @@ class NebulaOSPowerLossRecovery:
             if current == armed[1]:
                 self._last_action = "resumed"
                 return
+        self._timelapse_drop_stale()
         try:
             record = self._io(self._read_record_blocking)
         except Exception as exc:
@@ -1285,7 +1374,8 @@ class NebulaOSPowerLossRecovery:
             try:
                 lines = build_physical_resume_lines(
                     validated, self.resume_z_lift, self.prime_length, z_max,
-                    list(profiles))
+                    list(profiles), timelapse_watcher=self.printer.lookup_object(
+                        'gcode_macro _NEBULAOS_TIMELAPSE', None) is not None)
             except PhysicalResumeRefused as exc:
                 raise gcmd.error("NebulaOS PLR: physical resume refused: %s"
                                  % exc.reason)
@@ -1302,6 +1392,7 @@ class NebulaOSPowerLossRecovery:
         self._resume_armed = (validated["generation"],
                               validated["file"]["path"])
         self._resume_in_progress = True
+        self._timelapse_set_aside(validated["file"]["path"])
         try:
             for line in lines:
                 self.gcode.run_script_from_command(line)
@@ -1339,6 +1430,60 @@ class NebulaOSPowerLossRecovery:
             except Exception:
                 logging.exception("nebulaos_power_loss_recovery: %s after a "
                                   "failed resume", line)
+        # The timelapse frames stay aside: Moonraker may still be emptying
+        # the frame directory for the M23. A retry merges them first.
+
+    def _timelapse_set_aside(self, print_path):
+        if not self.timelapse_frame_path:
+            return
+        try:
+            n = timelapse_set_aside_frames(self.timelapse_frame_path, print_path)
+            if n:
+                logging.info("nebulaos_power_loss_recovery: %d timelapse "
+                             "frames set aside for the resume", n)
+        except OSError:
+            logging.exception("nebulaos_power_loss_recovery: setting the "
+                              "timelapse frames aside")
+
+    def _timelapse_merge(self, print_path):
+        if not self.timelapse_frame_path:
+            return 0
+        try:
+            return timelapse_merge_frames(self.timelapse_frame_path, print_path)
+        except OSError:
+            logging.exception("nebulaos_power_loss_recovery: merging the "
+                              "timelapse frames")
+            return 0
+
+    def _timelapse_drop_stale(self):
+        """A new print: frames set aside for a resume that never finished
+        (cancelled before END_PRINT/CANCEL_PRINT ran, or discarded) are no
+        longer part of any video."""
+        if not self.timelapse_frame_path:
+            return
+        aside = _timelapse_aside_dir(self.timelapse_frame_path)
+        try:
+            if os.path.isdir(aside):
+                _timelapse_drop_aside(aside)
+        except OSError:
+            logging.exception("nebulaos_power_loss_recovery: dropping stale "
+                              "timelapse frames")
+
+    def cmd_NEBULAOS_PLR_TIMELAPSE_MERGE(self, gcmd):
+        """END_PRINT and CANCEL_PRINT, before Moonraker renders: the frames
+        from before a power loss go back in front of the resumed print's."""
+        if not self.timelapse_frame_path or not os.path.isdir(
+                _timelapse_aside_dir(self.timelapse_frame_path)):
+            return
+        # a frame the layer watcher asked for just before may still be
+        # written (Moonraker's snapshot times out after 2 s)
+        reactor = self.printer.get_reactor()
+        reactor.pause(reactor.monotonic() + 3.0)
+        filename = self.print_stats.get_status(reactor.monotonic()).get("filename", "")
+        n = self._timelapse_merge(filename)
+        if n:
+            gcmd.respond_info("NebulaOS PLR: %d timelapse frames from before "
+                              "the power loss put back in front" % n)
 
     def cmd_NEBULAOS_PLR_SET_Z(self, gcmd):
         """Declares Z homed at the recorded height. Only valid inside a
