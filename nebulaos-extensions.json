@@ -1,6 +1,6 @@
 {
   "compat_schema_version": 1,
-  "extensions_version": "0.9.0",
+  "extensions_version": "1.0.0",
   "nebulaos_api_level": 1,
 
   "required_klipper_symbols": [
