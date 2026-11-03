@@ -31,14 +31,19 @@ On the printer that is **Settings -> Printer -> Restart Klipper**, or
 print - speed, flow, Z offset, pressure advance - are not configuration options and
 are not in this file.
 
-## What each section is for
+## Where the explanations come from
 
-The purpose text below each heading is the module's own header comment, written by
-its author. Individual options carry no inline comments in this repository, so a
-per-option purpose cannot be extracted - and inferring one from an option's name
-would be invention dressed as documentation. The module is the honest unit of
-explanation: the header says what the thing is for, the table says what you can
-set.
+The text below each heading is the module's own header comment, written by its
+author. The **Purpose** column is hand-written, by reading the module that uses
+the option - not extracted, because this repository carries no inline comments
+above its options, and not inferred from the option's name, which would be
+invention dressed as documentation.
+
+Where an option is passed straight to a stepper driver register field, the purpose
+says so and names the field rather than explaining what the field does. That is
+the boundary of what can be established from this source: the driver's own
+datasheet is the authority on the field, and paraphrasing it from memory here
+would be the same invention in a more convincing costume.
 
 ## Some options are accepted and then ignored
 
@@ -75,22 +80,22 @@ Klipper TMC Autotune (autotune_tmc.py)
 
 | Option | Purpose | Type | Default | Constraints |
 |---|---|---|---|---|
-| `extra_hysteresis` | - | int | `0` (`EXTRA_HYSTERESIS`) | minval 0, maxval 8 |
-| `motor` | - | string | **required** | - |
+| `extra_hysteresis` | Added to the computed chopper hysteresis before `hstrt` and `hend` are written. The module computes hysteresis from the motor constants, the voltage, the run current, the blank time and `toff`; this is the manual nudge on top, 0-8. | int | `0` (`EXTRA_HYSTERESIS`) | minval 0, maxval 8 |
+| `motor` | Which motor this stepper is, by the name of a `[motor_constants <name>]` section (the vendored `motor_database.cfg` supplies them). Required: every tuned value is computed from that motor's electrical constants, so without it there is nothing to tune from. Klipper refuses to start if the name is not defined, and a deprecated alias produces a runtime warning naming the replacement. The KE's stock motors are `creality-42-34` (X/Y) and `creality-42-40` (Z). | string | **required** | - |
 | `overvoltage_vth` | *From the source comment:* A zero threshold asserts the overvoltage condition continuously, and values above the TMC2240 absolute maximum cannot protect it in time. Leaving the option unset preserves the driver's hardware default. | float | `none` (`OVERVOLTAGE_VTH`) | above 0.0, maxval 41.0 |
-| `pwm_freq_target` | - | float | computed | minval 10000.0, maxval 100000.0 |
-| `sedn` | - | int | `2` (`SEDN`) | minval 0, maxval 3 |
-| `seimin` | - | int | `1` (`SEIMIN`) | minval 0, maxval 1 |
-| `semax` | - | int | `4` (`SEMAX`) | minval 0, maxval 15 |
-| `semin` | - | int | `2` (`SEMIN`) | minval 0, maxval 15 |
-| `seup` | - | int | `3` (`SEUP`) | minval 0, maxval 3 |
-| `sg4_thrs` | - | int | computed | minval 0, maxval 255 |
-| `sgt` | - | int | `1` (`SGT`) | minval -64, maxval 63 |
-| `tbl` | - | int | `1` (`TBL`) | minval 0, maxval 3 |
-| `toff` | - | int | `0` (`TOFF`) | minval 0, maxval 15 |
-| `tpfd` | - | int | `none` | minval 0, maxval 15 |
-| `tuning_goal` | - | string | `auto` (`TUNING_GOAL`) | - |
-| `voltage` | - | float | `24.0` (`VOLTAGE`) | above 0.0, maxval 60.0 |
+| `pwm_freq_target` | Target chopper frequency in Hz. Sets how many clock cycles one chopper cycle gets, which is what `toff` and `tpfd` are derived from when they are left to the module. The default is per driver type - 55 kHz for the 2130/2208/2209, 20 kHz for the 2240/2660/5160, which the source says run very hot at high frequencies. | float | computed | minval 10000.0, maxval 100000.0 |
+| `sedn` | CoolStep current decrement step, written to the driver's `sedn` field. Range 0-3. | int | `2` (`SEDN`) | minval 0, maxval 3 |
+| `seimin` | CoolStep minimum-current selector, written to the driver's `seimin` field. 0 or 1. | int | `1` (`SEIMIN`) | minval 0, maxval 1 |
+| `semax` | CoolStep upper threshold, written to the driver's `semax` field. Range 0-15. | int | `4` (`SEMAX`) | minval 0, maxval 15 |
+| `semin` | CoolStep lower threshold, written to the driver's `semin` field. Range 0-15. | int | `2` (`SEMIN`) | minval 0, maxval 15 |
+| `seup` | CoolStep current increment step, written to the driver's `seup` field. Range 0-3. | int | `3` (`SEUP`) | minval 0, maxval 3 |
+| `sg4_thrs` | StallGuard4 threshold. Written to `sg4_thrs` on a driver that has StallGuard4 (and `sg4_filt_en` is enabled with it), or to `sgthrs` on a 2209. The default is per driver: 40 generally, but **0 on the TMC2240**, which makes Klipper use the SGT homing path - the one compatible with the SpreadCycle and CoolStep configuration autotune writes. Set it explicitly on a 2240 to opt into SG4 homing. | int | computed | minval 0, maxval 255 |
+| `sgt` | StallGuard2 threshold, written to the driver's `sgt` field as part of the CoolStep setup. Range -64 to 63. | int | `1` (`SGT`) | minval -64, maxval 63 |
+| `tbl` | Comparator blank time, written to the driver's `tbl` field as an index: 0-3 selects 16/24/32/40 clock cycles on the 2208 and 2209, and 16/24/36/54 on the others. The module overrides a configured `0` to `1` when `toff` ends up at 1, because a 16-cycle blank time does not work in that combination. Also an input to the hysteresis calculation. | int | `1` (`TBL`) | minval 0, maxval 3 |
+| `toff` | Slow-decay time, written to the driver's `toff` field. `0`, the default, means **compute it**: the module sizes it so the two slow-decay phases take about half a chopper cycle at `pwm_freq_target`. It is also an input to the hysteresis calculation. | int | `0` (`TOFF`) | minval 0, maxval 15 |
+| `tpfd` | Passive fast-decay time, written to the driver's `tpfd` field. Unset by default, which means **compute it** from whatever is left of the chopper cycle after the blank and slow-decay phases. | int | `none` | minval 0, maxval 15 |
+| `tuning_goal` | What to optimise for: `silent` (StealthChop at all speeds), `performance` (SpreadCycle at all speeds), `autoswitch` (StealthChop low, SpreadCycle when needed - the module labels this experimental), or `auto`, the default. `auto` resolves at connect time to silent for a motor with holding torque above 0.3 Nm that is not in the module's performance list, and performance otherwise. | string | `auto` (`TUNING_GOAL`) | - |
+| `voltage` | The stepper supply voltage, in volts. Not written to the driver: it is an input to the hysteresis, `pwmofs` and `pwmgrad` calculations, so a wrong value makes every derived value wrong. The module raises a config error when a computed PWM value will not fit its 8-bit field and names raising or lowering the voltage as the fix. On a TMC2240 it is also checked against `overvoltage_vth`. | float | `24.0` (`VOLTAGE`) | above 0.0, maxval 60.0 |
 
 ## `[calibrate_shaper_config]`
 
@@ -269,7 +274,7 @@ Tested by `extras/test_nebulaos_power_loss_recovery.py`.
 | `min_z_for_start` | Height below which no checkpoint is taken, so a cut in the first moments of a print does not offer a useless recovery. | float | `0.6` (`DEFAULT_MIN_Z_FOR_START`) | minval 0.0 |
 | `physical_resume` | Whether a resume actually restarts printing. **Off by default**: with it off, NEBULAOS_PLR_RESUME restores state only. The source records that it stays off until it has passed a supervised power-cut test print on the machine in question. | bool | `false` | - |
 | `poll_interval` | Seconds between checks of print state while deciding whether to checkpoint. | float | `0.75` (`DEFAULT_POLL_INTERVAL`) | above 0.0 |
-| `prime_length` | - | float | `8.0` (`DEFAULT_PRIME_LENGTH`) | minval 0.0, maxval 50.0 |
+| `prime_length` | Millimetres of filament extruded at the park position during a physical resume, after the nozzle has reached temperature and before the toolhead returns to the print. It primes away the ooze and the gap left by the power cut, as `G1 E<prime_length> F300` in relative extrusion, and the extruder position is restored afterwards so the resumed file's E coordinates still line up. `0` disables the prime; the maximum is 50. | float | `8.0` (`DEFAULT_PRIME_LENGTH`) | minval 0.0, maxval 50.0 |
 | `resume_z_lift` | How far to lift Z before moving back to the interrupted position, so the nozzle does not drag across the part. | float | `5.0` (`DEFAULT_RESUME_Z_LIFT`) | minval 1.0, maxval 20.0 |
 | `sidecar_dir` | Directory for the larger JSON checkpoint files, written and fsynced before the EEPROM record so a power cut cannot leave the two disagreeing. | string | `/usr/data/nebulaos/printer_data/plr` (`DEFAULT_SIDECAR_DIR`) | - |
 | `timelapse_frame_path` | Directory moonraker-timelapse keeps its frames in. Set it to preserve a timelapse across a power cut: on resume the frames from before the cut are set aside, and _NEBULAOS_PLR_TIMELAPSE_MERGE puts them back in front, renumbered without a gap, before Moonraker renders. Empty disables the handling, and the timelapse is lost on resume. | string | `""` | - |
