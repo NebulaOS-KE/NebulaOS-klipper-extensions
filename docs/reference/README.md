@@ -12,6 +12,7 @@ a publishing destination.
 | Page | What it is |
 |---|---|
 | [ARCHITECTURE.md](ARCHITECTURE.md) | **Start here.** What this repository is, how its code reaches a running printer, the compatibility contract, how a calibration actually runs, how state is persisted |
+| [MODULES.md](MODULES.md) | One section per file in `extras/`: what it is, the commands it registers, the options it reads, which tests refer to it, and who wrote it when it is vendored |
 | [COMMANDS.md](COMMANDS.md) | Summary table: every command with its module, kind, test coverage and description |
 | [COMMANDS-DETAIL.md](COMMANDS-DETAIL.md) | One section per command: handler, help text, parameters with types/defaults/valid ranges, errors raised, side effects, example invocation |
 | [CONFIG.md](CONFIG.md) | Every configuration option, with its literal default and constraints |
