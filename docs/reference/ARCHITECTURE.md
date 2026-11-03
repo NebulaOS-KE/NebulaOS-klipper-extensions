@@ -4,7 +4,8 @@
 
 # How the extensions work
 
-A developer's guide to `NebulaOS-klipper-extensions` at commit `ed99372`: what this
+A developer's guide to `NebulaOS-klipper-extensions` at commit `f498796` - the NebulaOS 1.0.0
+release pin: what this
 repository is, how its code reaches a running printer, and how the pieces fit together.
 
 For exhaustive lists, see [COMMANDS-DETAIL.md](COMMANDS-DETAIL.md) and
@@ -88,10 +89,10 @@ must **not** reappear. It exists so that a retired API cannot quietly return.
 
 Three numbers in the manifest version the contract itself:
 
-| Field | At `a2e7634` | Meaning |
+| Field | At `f498796` | Meaning |
 |---|---|---|
 | `compat_schema_version` | `1` | Version of the manifest format |
-| `extensions_version` | `0.9.0` | Version of this extension set |
+| `extensions_version` | `1.0.0` | Version of this extension set |
 | `nebulaos_api_level` | `1` | Version of the interface other components rely on |
 
 **This is the design decision worth taking away.** The cost of not forking is that your
@@ -206,6 +207,49 @@ command. Anyone arriving from stock Klipper will expect the upstream semantics a
 told otherwise - which is why
 [COMMANDS-DETAIL.md](COMMANDS-DETAIL.md) marks them explicitly.
 
+## The physical resume, and why its order is what it is
+
+`nebulaos_power_loss_recovery.py` can do more than re-arm a file position: with
+`physical_resume: True` (which the shipped `machine.cfg` sets) it brings the printer back to the
+interrupted state itself. The sequence in `build_physical_resume_lines` is constrained at almost
+every step, and changing it casually will break something that is not obvious:
+
+1. **Bed first, nozzle off** (`M190` with no preceding `M104`). The bed keeps the part stuck
+   down, and the nozzle must not be hot yet - see below.
+2. **`_NEBULAOS_PLR_SET_Z` declares Z at its recorded kinematic height, then lifts.** This is an
+   ordering constraint from upstream's `safe_z_home`: a `G28` with Z unhomed resets Z to 0 and
+   clears its homing, so Z has to be declared before X/Y are homed, and lifted before any XY
+   move. Stock Creality's resume moves XY at print height instead.
+3. **X/Y home, then the nozzle heats and primes at the park position.** A power-cut test on the
+   development printer found the earlier order heating the nozzle *while it still sat over the
+   part*, which marked it and oozed onto it. That is the whole reason heating is split in two.
+4. **Exclude-object state is replayed**, including `current_object` - without it the resumed
+   file's `EXCLUDE_OBJECT_END` had nothing to match.
+5. **The timelapse watcher is restarted** (`_NEBULAOS_TIMELAPSE ACTION=START`) when the macro
+   exists, because a resume skips `START_PRINT`, which is what normally starts it.
+
+`validate_recovery()` has already proven the configuration identity equal before any of this
+runs; a mismatch raises `PhysicalResumeRefused` rather than moving the toolhead.
+
+### Timelapse frames across a resume
+
+A small piece of file juggling that exists entirely because of an upstream behaviour:
+moonraker-timelapse empties its frame directory on every *"File selected"* - which the resume's
+own `M23` triggers - and renumbers from 1, and its render reads `frame000001.jpg` onward without
+tolerating a gap.
+
+So `timelapse_set_aside_frames` moves the pre-cut frames to a sibling directory tagged with the
+print's path *before* the `M23`, and `_NEBULAOS_PLR_TIMELAPSE_MERGE` - called from `END_PRINT`
+and `CANCEL_PRINT` - renumbers both sets back into one sequence. An aside directory belonging to
+a different print is stale and is dropped rather than merged into the wrong video.
+
+Two details worth not re-deriving: the merge renames the *new* frames highest-first, so no rename
+lands on a frame not yet moved; and after a failed resume the frames deliberately stay aside,
+because Moonraker may still be emptying the directory - a retry merges them first.
+
+This is off unless `timelapse_frame_path` is set. The shipped `machine.cfg` sets it to
+moonraker-timelapse's own `frame_path`, so on a real printer it is on.
+
 ## Adding a module
 
 What the repository's own structure requires:
@@ -234,7 +278,7 @@ cd extras
 python3 -m unittest extras.test_nebulaos_beeper
 ```
 
-At `ed99372`: **29 of 31 suites, 899 tests, all passing.** The two not in that run
+At `f498796`: **29 of 31 suites, 912 tests, all passing.** The two not in that run
 (`test_nebulaos_compat`, `test_nebulaos_temperature_mcu`) import real Klipper modules and need
 the pinned Klipper composed in, exactly as `scripts/ci-tests.sh` documents. They are a
 different run, not failures.

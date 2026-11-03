@@ -1,6 +1,7 @@
 # NebulaOS Klipper extensions - developer reference
 
-Technical reference for `NebulaOS-klipper-extensions`, at commit `ed99372`.
+Technical reference for `NebulaOS-klipper-extensions`, at commit `f498796` - the pin NebulaOS
+1.0.0 ships.
 
 This repository's GitHub wiki is **disabled**, so this reference lives in the repository
 itself. That is the better place anyway: the mission treats Git as authoritative and a wiki as
@@ -81,7 +82,7 @@ raises only when it is `True`.
 reports it has run on the development printer several times.
 
 The module's header previously stated it had never been exercised on hardware. That note was
-stale and has been corrected in the source at `ed99372`; disregard it if you are reading an
+stale and has been corrected in the source at `f498796`; disregard it if you are reading an
 older checkout.
 
 As elsewhere here: the call site is code-verified, while the hardware runs are the owner's
@@ -92,9 +93,9 @@ this reference keeps them apart.
 
 | | |
 |---|---|
-| Source commit | `ed99372` |
-| Shipped by firmware | **yes** - the firmware manifest advanced to `ed99372` in firmware `832314d`, so this reference describes exactly what ships |
-| Test suite | 29 of 31 suites, **899 tests, all passing** |
+| Source commit | `f498796` |
+| Shipped by firmware | **yes** - `KLIPPER_EXTENSIONS_PIN=f498796` on branch `production` in the firmware manifest at `70ad0b0`, the NebulaOS 1.0.0 release, so this reference describes exactly what ships |
+| Test suite | 29 of 31 suites, **912 tests, all passing** (re-run at this commit on 2026-11-03) |
 | Modules with a test | 21 of 30 |
 | Hardware verification | **none** - see below |
 
