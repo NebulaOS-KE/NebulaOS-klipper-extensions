@@ -1,6 +1,6 @@
 # NebulaOS load-cell contact mode: the user's persisted choice (G99)
 #
-# Tim's decision 2026-10-22: automatic load-cell contact is the default for
+# the owner's decision 2026-10-22: automatic load-cell contact is the default for
 # everyone. The user can switch between
 #   auto   - automatic contact (raw ADC counts, qualified profile
 #            nebulaos_raw_contact.KE_STOCK_V1); needs a passed automatic
@@ -49,7 +49,7 @@ def default_state():
             'reference_counts': None,
             'checked_at': None,
             'profile_id': None,
-            # G102 (Run 21, Tim): the sensitivity of the first automatic
+            # G102 (Run 21): the sensitivity of the first automatic
             # touch after a passed check (counts per mm of press) - recorded
             # only, never a refusal (yet)
             'depress_slope': None,

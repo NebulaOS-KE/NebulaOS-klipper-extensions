@@ -1308,7 +1308,7 @@ class ConfigIdentityAndPhysicalResumeTests(ExtensionStateMachineTests):
         self.assertEqual(lines[-1], 'M24')
         self.assertEqual(sum(1 for l in lines if l.startswith('G28')), 1)
         self.assertNotIn('G28', [l for l in lines if l.startswith('G28 Z')])
-        # Run 23 (Tim): the nozzle heats only once parked off the part -
+        # Run 23: the nozzle heats only once parked off the part -
         # the bed first, with the nozzle off.
         self.assertFalse(any(l.startswith(('M104', 'M140')) for l in lines))
         self.assertEqual(idx('M190 S60'), 0)
@@ -1319,7 +1319,7 @@ class ConfigIdentityAndPhysicalResumeTests(ExtensionStateMachineTests):
         self.assertIsNotNone(self._eeprom_record())
 
     def test_physical_resume_keeps_the_timelapse(self):
-        # Run 23 (Tim): the resumed print's video includes the frames from
+        # Run 23: the resumed print's video includes the frames from
         # before the power loss; the layer watcher starts again.
         frames = os.path.join(self.tmpdir, 'timelapse-frames') + '/'
         os.makedirs(frames)
@@ -1625,7 +1625,7 @@ class CandidatePromotionTests(ExtensionStateMachineTests):
 
 
 class TimelapseFramesTests(unittest.TestCase):
-    """Run 23 (Tim): a resumed print keeps the frames from before the
+    """Run 23: a resumed print keeps the frames from before the
     power loss in its timelapse."""
 
     def setUp(self):

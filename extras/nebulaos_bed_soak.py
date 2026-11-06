@@ -1,4 +1,4 @@
-# NebulaOS bed warp soak switch, remembered (Run 21, Tim 2026-10-28)
+# NebulaOS bed warp soak switch, remembered (Run 21, 2026-10-28)
 #
 # [output_pin Bed_Warp_Stabilisation] (firmware print.cfg) is the Mainsail
 # switch START_PRINT reads when the slicer passes no BED_SOAK: on = soak the

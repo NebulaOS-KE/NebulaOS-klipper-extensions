@@ -14,7 +14,7 @@
 # A missing file is an empty history; a corrupt one is an empty history plus
 # a warning (load() returns it) - never a start failure.
 #
-# Staleness rules (Tim 2026-10-23, PLAN Run 19):
+# Staleness rules (2026-10-23, PLAN Run 19):
 #   axis_twist recorded                -> auto_calibrate.redo
 #                                         "Axis Twist changed"
 #   bed tram shim at front left        -> load_cell.redo + auto_calibrate.redo

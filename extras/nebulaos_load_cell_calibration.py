@@ -32,7 +32,7 @@
 #
 # Nothing here moves or heats the printer. Nothing is saved before step 6.
 #
-# G99 (Tim 2026-10-22): automatic load-cell contact is the default. This
+# G99 (2026-10-22): automatic load-cell contact is the default. This
 # object also owns the user's choice (Calibration > Load Cell):
 #   NEBULAOS_LOAD_CELL_MODE [MODE=auto|manual]  persist the choice (no
 #       restart; no MODE: report). Manual = this bottle calibration, used
@@ -94,7 +94,7 @@ class NebulaOSLoadCellCalibration:
         self.printer = config.get_printer()
         self.reactor = self.printer.get_reactor()
         self.gcode = self.printer.lookup_object('gcode')
-        # Agreed with Tim (Run 13): a 1.5 L bottle weighed on a kitchen
+        # Agreed (Run 13): a 1.5 L bottle weighed on a kitchen
         # scale; only 1000-5000 g are accepted.
         self.min_grams = config.getfloat('min_grams', 1000., minval=500.)
         self.max_grams = config.getfloat('max_grams', 5000.,
@@ -510,7 +510,7 @@ class NebulaOSLoadCellCalibration:
             lc.set_calibration(self.counts_per_gram, self.tare_counts)
             lc.tare(self.tare_counts)
             # G99: a saved bottle calibration means Manual - "the manual
-            # value is used until automatic is selected again" (Tim).
+            # value is used until automatic is selected again".
             probe = self._probe()
             if probe is not None:
                 warning = probe.set_load_cell_mode(raw_contact.USER_MANUAL)

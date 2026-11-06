@@ -1,4 +1,4 @@
-# G99 (Tim 2026-10-22): the nozzle clean follows the user's load cell mode
+# G99 (2026-10-22): the nozzle clean follows the user's load cell mode
 # like every other nozzle touch - automatic (raw counts, ke-stock-v1) by
 # default, "also automatically, untested". _NEBULAOS_NOZZLE_CLEAN refuses
 # BEFORE heating or moving when the touch would be refused anyway (manual

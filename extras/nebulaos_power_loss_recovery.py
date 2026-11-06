@@ -519,7 +519,7 @@ def build_physical_resume_lines(state, z_lift, prime_length, z_max,
     the bed is heated first (keeps the part attached) with the nozzle off,
     Z is declared at its recorded kinematic height and LIFTED before any XY
     move (stock moves XY at print height), the nozzle is heated only at the
-    X/Y endstop park position off the bed (Run 23, Tim: heating it over the
+    X/Y endstop park position off the bed (Run 23, owner: heating it over the
     part marked it and oozed onto it) and primed there, and the
     configuration identity was already proven equal by validate_recovery().
     timelapse_watcher: restart NebulaOS's timelapse layer watcher
@@ -588,7 +588,7 @@ def build_physical_resume_lines(state, z_lift, prime_length, z_max,
     return lines
 
 
-# Timelapse frames across a power loss (Run 23, Tim: keep the whole video).
+# Timelapse frames across a power loss (Run 23, owner: keep the whole video).
 # moonraker-timelapse (upstream, unmodified) empties its frame directory on
 # every "File selected" - the resume's M23 too - and numbers new frames from
 # 1 again; its render reads frame000001.jpg, frame000002.jpg, ... without a

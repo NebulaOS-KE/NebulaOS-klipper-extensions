@@ -1746,7 +1746,7 @@ class NebulaOSCalibration:
             run('G28')
             self._auto_calibrate_check_cancel(journal, time.time())
 
-            # Bed to temperature first, then the nozzle clean (Tim, Run 21,
+            # Bed to temperature first, then the nozzle clean (Run 21,
             # G102): a bed still heating drifts the load cell and the
             # automatic drift limit refused the clean more often. The wait
             # is part of the nozzle clean step on the screen.

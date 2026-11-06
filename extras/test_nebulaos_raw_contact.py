@@ -7,7 +7,7 @@
 # - upstream LCBestFit (the pinned source, class extracted and run) gives
 #   the same contact Z from raw counts as from grams on the same samples,
 #   and is invariant to the sensor gain
-# - the qualified-profile registry (G99: ke-stock-v1, Tim 2026-10-22) and
+# - the qualified-profile registry (G99: ke-stock-v1, 2026-10-22) and
 #   the per-mode arming rule, the same for every caller
 # - raw arming on the fake probe: health window, settle loop, reference
 #   drift, safety window; the automatic check (G99)
@@ -219,7 +219,7 @@ class RealTraceReplayTest(unittest.TestCase):
         # the raw counts FALL (polarity -1), by 15000-25000 counts (about
         # 180-290 g with this unit's calibration) at the peak of each touch.
         # A known weight on the front-left screw also reads negative
-        # (Tim, 2026-10-19: 1531 g bottle -> -1695 g). The small positive
+        # (2026-10-19: 1531 g bottle -> -1695 g). The small positive
         # deltas in these traces are rebound/noise, not the contact.
         # Measured, not assumed.
         for trace in self.traces:
@@ -267,7 +267,7 @@ class RealTraceTriggerReplayTest(unittest.TestCase):
 
 class QualifiedProfileGateTest(unittest.TestCase):
     def test_only_the_ke_stock_profile_is_qualified(self):
-        # G99 (Tim 2026-10-22): ke-stock-v1 is the only registry entry
+        # G99 (2026-10-22): ke-stock-v1 is the only registry entry
         self.assertEqual(sorted(rc.QUALIFIED_PROFILES), ['ke-stock-v1'])
         self.assertIsNone(rc.lookup_profile('ke-v1'))
         self.assertEqual(rc.DEFAULT_PROFILE_ID, 'ke-stock-v1')
@@ -282,7 +282,7 @@ class QualifiedProfileGateTest(unittest.TestCase):
                     'max_idle_sigma', 'max_idle_drift_per_s', 'expected_sps',
                     'sps_tolerance'):
             self.assertEqual(p[key], cand[key], key)
-        self.assertIn('Tim', p['evidence'])
+        self.assertIn('decision 2026-10-22', p['evidence'])
 
     def test_ke_dev_idle_and_contacts_fit_the_profile(self):
         # measured: idle sigma 110 counts, 90.6 SPS; contact peaks
@@ -841,7 +841,7 @@ class RawArmingTest(unittest.TestCase):
         self.assertTrue(probe.contact_ready(rc.CALLER_AUTO_CALIBRATE))
 
     def test_first_touch_after_a_passed_check_records_depress_slope(self):
-        # G102 (Run 21, Tim): recorded only - in the state file, the status
+        # G102 (Run 21): recorded only - in the state file, the status
         # and klippy.log; the later touches do not overwrite it
         from . import nebulaos_load_cell_mode as lcm
         probe = self._probe(_idle(self.REF, n=180), reference=None,

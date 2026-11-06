@@ -370,7 +370,7 @@ class ZCompensate:
 
     def _require_contact_ready(self, command_name):
         """G99: the touches follow the user's load cell mode (automatic by
-        default, untested on the wipe pad - Tim's decision 2026-10-22).
+        default, untested on the wipe pad - the owner's decision 2026-10-22).
         Refuse BEFORE heating or moving when the touch would be refused
         anyway (manual without the bottle calibration, automatic without a
         passed automatic check). A probe without plan_arming: unchanged
