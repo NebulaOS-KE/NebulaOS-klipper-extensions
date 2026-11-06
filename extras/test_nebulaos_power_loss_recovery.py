@@ -1294,13 +1294,12 @@ class ConfigIdentityAndPhysicalResumeTests(ExtensionStateMachineTests):
         self.ext.cmd_NEBULAOS_PLR_RESUME(_FakeGCmd({'ALLOW_UNSAFE': 1, 'PHYSICAL': 1}))
         lines = self.objects['gcode'].run_lines
         idx = lambda prefix: next(i for i, l in enumerate(lines) if l.startswith(prefix))
-        self.assertLess(idx('M190 S60'), idx('_NEBULAOS_PLR_SET_Z'))
+        self.assertLess(idx('M109 S210'), idx('_NEBULAOS_PLR_SET_Z'))
         self.assertEqual(lines[idx('_NEBULAOS_PLR_SET_Z')], '_NEBULAOS_PLR_SET_Z Z=10.0000')
         self.assertLess(idx('_NEBULAOS_PLR_SET_Z'), idx('G1 Z5.000'))
         self.assertFalse(any(l.startswith('SET_KINEMATIC_POSITION') for l in lines))
         self.assertLess(idx('G1 Z5.000'), idx('G28 X Y'))
-        self.assertLess(idx('G28 X Y'), idx('M109 S210'))
-        self.assertLess(idx('M109 S210'), idx('G1 E8.000'))
+        self.assertLess(idx('G28 X Y'), idx('G1 E8.000'))
         self.assertLess(idx('SET_GCODE_OFFSET'), idx('G1 X1.0000 Y2.0000'))
         self.assertLess(idx('G1 E8.000'), idx('G1 X1.0000 Y2.0000'))
         self.assertLess(idx('G1 X1.0000 Y2.0000'), idx('G1 Z10.0000'))
@@ -1308,11 +1307,12 @@ class ConfigIdentityAndPhysicalResumeTests(ExtensionStateMachineTests):
         self.assertEqual(lines[-1], 'M24')
         self.assertEqual(sum(1 for l in lines if l.startswith('G28')), 1)
         self.assertNotIn('G28', [l for l in lines if l.startswith('G28 Z')])
-        # Run 23: the nozzle heats only once parked off the part -
-        # the bed first, with the nozzle off.
-        self.assertFalse(any(l.startswith(('M104', 'M140')) for l in lines))
-        self.assertEqual(idx('M190 S60'), 0)
+        # Run 24 (owner, reverts Run 23): bed and nozzle heat together, to
+        # their targets, before anything moves - a cold nozzle in the part
+        # pulls it off the bed on the lift.
+        self.assertEqual(lines[:4], ['M140 S60', 'M104 S210', 'M190 S60', 'M109 S210'])
         self.assertEqual([l for l in lines if l.startswith('M109')], ['M109 S210'])
+        self.assertEqual([l for l in lines if l.startswith('M190')], ['M190 S60'])
         # The print M24 starts keeps the record it resumed.
         self.print_stats_status['state'] = 'printing'
         self.ext._tick(50.0)
