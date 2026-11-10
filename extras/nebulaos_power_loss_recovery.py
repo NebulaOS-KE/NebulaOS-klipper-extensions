@@ -516,12 +516,15 @@ def build_physical_resume_lines(state, z_lift, prime_length, z_max,
     physical_resume: True; NOT hardware-qualified until the supervised
     power-cut test). Same idea as Creality's stock resume - home X/Y only,
     trust that Z did not move while unpowered - with these differences:
-    the bed is heated first (keeps the part attached) with the nozzle off,
+    bed and nozzle heat together to their recorded targets before anything
+    moves (Run 24, owner: a cold nozzle held in the part pulls it off the bed
+    on the lift - this reverts Run 23's "nozzle heats only once parked"; the
+    two do not reach their targets at the same moment, which is accepted),
     Z is declared at its recorded kinematic height and LIFTED before any XY
-    move (stock moves XY at print height), the nozzle is heated only at the
-    X/Y endstop park position off the bed (Run 23, Tim: heating it over the
-    part marked it and oozed onto it) and primed there, and the
-    configuration identity was already proven equal by validate_recovery().
+    move (stock moves XY at print height), the nozzle is primed at the X/Y
+    endstop park position off the bed (any ooze from heating over the part
+    goes there, not into the print), and the configuration identity was
+    already proven equal by validate_recovery().
     timelapse_watcher: restart NebulaOS's timelapse layer watcher
     (_NEBULAOS_TIMELAPSE, started by START_PRINT, which a resume skips).
 
@@ -559,14 +562,19 @@ def build_physical_resume_lines(state, z_lift, prime_length, z_max,
     gx, gy, gz, ge = gcode_state["gcode_position"]
 
     lines = []
+    # Both heaters start at once, then wait for both: the nozzle softens
+    # the plastic it sits in before the lift.
+    if bed > 0:
+        lines.append("M140 S%g" % bed)
+    lines.append("M104 S%g" % hotend)
     if bed > 0:
         lines.append("M190 S%g" % bed)
+    lines.append("M109 S%g" % hotend)
     lines.append("_NEBULAOS_PLR_SET_Z Z=%.4f" % kin_z)
     lines.append("G91")
     lines.append("G1 Z%.3f F600" % lift)
     lines.append("G90")
     lines.append("G28 X Y")
-    lines.append("M109 S%g" % hotend)
     # State restore without the parts the procedure sets itself (heaters
     # done above; coordinate modes and E are set after the moves).
     skip = ("G90", "G91", "M82", "M83", "M104 ", "M140 ", "G92 E")
@@ -588,7 +596,7 @@ def build_physical_resume_lines(state, z_lift, prime_length, z_max,
     return lines
 
 
-# Timelapse frames across a power loss (Run 23, Tim: keep the whole video).
+# Timelapse frames across a power loss (Run 23, owner: keep the whole video).
 # moonraker-timelapse (upstream, unmodified) empties its frame directory on
 # every "File selected" - the resume's M23 too - and numbers new frames from
 # 1 again; its render reads frame000001.jpg, frame000002.jpg, ... without a

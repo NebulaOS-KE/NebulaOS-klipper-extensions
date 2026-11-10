@@ -9,8 +9,8 @@
 #
 # HARDWARE_BEHAVIOR_BLOCKED is False: the routine is live. It runs as
 # _NEBULAOS_NOZZLE_CLEAN, step 3 of the auto-calibration
-# (nebulaos_calibration.py), and has been run on ke-dev several times (Tim,
-# 2026-11-01). The probe pipeline differs from PRTouch's (upstream Klipper's
+# (nebulaos_calibration.py), and has been run on ke-dev several times
+# (2026-11-01). The probe pipeline differs from PRTouch's (upstream Klipper's
 # HX711 -> LoadCell -> trigger_analog -> LCBestFit instead of PRTouch's MCU-side
 # hold-count trigger; same HX711 on PA4/PC6), so trigger height, noise on the
 # wipe pad and the missing retries (PRTouch: retries=5) are what to look at if

@@ -16,7 +16,7 @@
 #   NEBULAOS_Z_ADJUST             report the saved value
 #
 # What OpenKE did (save-zoffset.cfg: save_variables + a loader macro), with
-# two differences (Tim 2026-10-21): the file is written atomically (tmp in
+# two differences (2026-10-21): the file is written atomically (tmp in
 # the same directory + fsync + rename + directory fsync), never with
 # Klipper's save_variables (which rewrites in place and refuses to start
 # Klipper on a half-written file); and an unreadable file is 0 plus a

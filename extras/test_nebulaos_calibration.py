@@ -2267,7 +2267,7 @@ class RawContactCompareTest(unittest.TestCase):
 
 
 # ----------------------------------------------------------------------
-# G99 (Tim 2026-10-22): automatic load-cell contact is the default. The
+# G99 (2026-10-22): automatic load-cell contact is the default. The
 # coordinator follows the probe's mode: automatic runs the no-motion check
 # first and arms raw; manual needs the bottle calibration (as before).
 # ----------------------------------------------------------------------

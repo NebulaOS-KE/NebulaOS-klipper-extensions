@@ -1,4 +1,4 @@
-# NebulaOS guided bed tramming (G87, simplified version agreed with Tim)
+# NebulaOS guided bed tramming (G87, simplified version agreed)
 #
 # One instruction at a time, the same prompts on the screen and in Mainsail:
 #   measure the four corners (upstream SCREWS_TILT_CALCULATE, 3 samples,
@@ -66,7 +66,7 @@ def deviations(zs, mount, base_index=0):
 
 def signed_deviations(zs, mount, base_index=0):
     """(signed mm per corner, index of the reference corner) - what the
-    user sees (Tim 2026-10-21). rigid: relative to the highest corner
+    user sees (2026-10-21). rigid: relative to the highest corner
     (0.00, the others negative: how much lower they are); adjustable:
     relative to the base corner (+ higher, - lower)."""
     if mount == RIGID:

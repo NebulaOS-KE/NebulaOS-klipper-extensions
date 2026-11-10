@@ -412,7 +412,7 @@ class NebulaOSBeeper:
             lambda pt: self._enqueue_at_print_time(pt, segments))
 
     def _timer_event(self, eventtime):
-        # Run 19 ke-dev (Tim: touch clicks "half come through, sound
+        # Run 19 ke-dev (owner: touch clicks "half come through, sound
         # different"): the reactor fires timers late on a busy Klippy. A
         # segment that has not started yet is never dropped for being late:
         # it is played for its full length from now (_shift).

@@ -133,7 +133,7 @@ class HelperTest(unittest.TestCase):
 
 class RigidFlowTest(TramTestBase):
     def test_spec_example_one_corner_at_a_time(self):
-        # Tim's example: FL +0.15, FR 0, RR +0.12, RL +0.03 (shim needed)
+        # An example: FL +0.15, FR 0, RR +0.12, RL +0.03 (shim needed)
         obj, gcode, tilt = self.build(
             [[0.00, 0.15, 0.03, 0.12],      # FL lowest
              [0.09, 0.15, 0.03, 0.12],      # FL got 0.10 -> 0.06 left: OK
@@ -145,7 +145,7 @@ class RigidFlowTest(TramTestBase):
         lines, buttons = gcode.last_prompt()
         self.assertIn('Front left: -0.15 mm. Add a 0.10 mm shim to raise it.',
                       lines)
-        # Signed, relative to the highest corner (Tim 2026-10-21).
+        # Signed, relative to the highest corner (2026-10-21).
         self.assertIn('Front left: -0.15 mm - ADJUST', lines)
         self.assertIn('Front right: 0.00 mm - highest', lines)
         self.assertIn('Rear right: -0.12 mm - later', lines)

@@ -8,7 +8,7 @@
 #       compared with the calibrated grams fit on the SAME real samples.
 #   B - the qualified-profile registry raw contact needs before it may move.
 #
-# G99 (Tim 2026-10-22, final - overrides the brief's "qualify first" rule and
+# G99 (2026-10-22, final - overrides the brief's "qualify first" rule and
 # the G83b-auto qualification deferral): automatic (raw-count) load-cell
 # contact is the DEFAULT for every user, with the profile "ke-stock-v1"
 # below. The user choice auto|manual is persisted by
@@ -112,7 +112,7 @@ NOT_CALIBRATED = 'load_cell_not_calibrated'
 # comes from here; an id named in a config file is not enough by itself.
 #
 # ke-stock-v1 - Creality Ender-3 V3 KE, stock under-bed HX711 (front-left
-# screw), upstream hx71x at 80 SPS configured. Tim's decision 2026-10-22
+# screw), upstream hx71x at 80 SPS configured. the owner's decision 2026-10-22
 # (G99, final): automatic contact is the default for everyone with these
 # values. Evidence: two supervised NEBULAOS_RAW_CONTACT_COMPARE runs on
 # ke-dev 2026-10-21 (TRIGGER_COUNTS=6400 POLARITY=-1 SAMPLES=3): automatic vs
@@ -140,7 +140,7 @@ QUALIFIED_PROFILES = {
         'max_idle_sigma': 640.,              # 6400 / 10
         'max_idle_drift_per_s': 800.,        # 6400 / 8
         'evidence': "ke-dev supervised compares 2026-10-21 (within 0.006 mm "
-                    "of the calibrated method); Tim's decision 2026-10-22 "
+                    "of the calibrated method); the owner's decision 2026-10-22 "
                     "(G99): default for everyone",
     },
 }
@@ -230,7 +230,7 @@ def resolve_arming(mode, caller, calibrated, profile_id=None,
     mode: the user mode ('auto' | 'manual'; the config names raw_contact /
     calibrated_force are accepted as their equivalents). G99: the same rule
     for EVERY caller (the Run 14 "auto-calibrate / nozzle clean never raw"
-    rule is lifted by Tim's decision 2026-10-22).
+    rule is lifted by the owner's decision 2026-10-22).
     - manual: the unit's grams calibration, else a refusal (bottle popup);
     - auto: a qualified profile + an unloaded reference from a passed
       automatic check, else a refusal. Never falls back to the other mode

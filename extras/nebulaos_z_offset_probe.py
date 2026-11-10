@@ -31,7 +31,7 @@
 # infrastructure); only the minimal ascent-collection and fit-analysis logic
 # is adapted here.
 #
-# G99 (Tim 2026-10-22): every touch follows the user's load cell mode -
+# G99 (2026-10-22): every touch follows the user's load cell mode -
 # automatic (raw ADC counts, qualified profile ke-stock-v1; the default) or
 # manual (the bottle calibration in grams). A caller without its own plan
 # (the nozzle clean) gets the plan for its mode here. Options (all with
@@ -95,7 +95,7 @@ class ZOffsetProbe:
         self._best_fit = LCBestFit(self._printer)
 
         # G83b weight-free contact (docs/NEBULAOS_RAW_CONTACT_BRIEF.md in the
-        # firmware repo). G99 (Tim 2026-10-22): automatic contact is the
+        # firmware repo). G99 (2026-10-22): automatic contact is the
         # default for everyone. contact_detection_mode 'auto' (default)
         # follows the user's persisted choice auto|manual
         # (nebulaos_load_cell_mode, NEBULAOS_LOAD_CELL_MODE);
@@ -821,7 +821,7 @@ def _record_auto_check(self, ok, reason, reference=None):
 
 
 def _record_depress_slope(self, slope):
-    """G102 (Run 21, Tim): how sensitive this load cell is - the counts per
+    """G102 (Run 21): how sensitive this load cell is - the counts per
     mm of press of the first automatic touch after a passed check. Recorded
     (load_cell_mode.json + klippy.log) for every printer so a plausible
     range can be set from real data later; nothing is refused on it."""
