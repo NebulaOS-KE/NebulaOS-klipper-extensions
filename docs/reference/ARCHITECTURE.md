@@ -4,9 +4,10 @@
 
 # How the extensions work
 
-A developer's guide to `NebulaOS-klipper-extensions` at commit `f498796` - the NebulaOS 1.0.0
-release pin: what this
-repository is, how its code reaches a running printer, and how the pieces fit together.
+A developer's guide to `NebulaOS-klipper-extensions` at commit `178a0c2` - the NebulaOS 1.0.2
+release pin, and also the tip of both `main` and `production`, so this describes exactly what
+ships: what this repository is, how its code reaches a running printer, and how the pieces fit
+together.
 
 For exhaustive lists, see [COMMANDS-DETAIL.md](COMMANDS-DETAIL.md) and
 [CONFIG.md](CONFIG.md). This page is the part those cannot give you - why the design is shaped
@@ -89,10 +90,10 @@ must **not** reappear. It exists so that a retired API cannot quietly return.
 
 Three numbers in the manifest version the contract itself:
 
-| Field | At `f498796` | Meaning |
+| Field | At `178a0c2` | Meaning |
 |---|---|---|
 | `compat_schema_version` | `1` | Version of the manifest format |
-| `extensions_version` | `1.0.0` | Version of this extension set |
+| `extensions_version` | `1.0.0` | Version of this extension set - **not** the NebulaOS release number, which is 1.0.2 at this same commit |
 | `nebulaos_api_level` | `1` | Version of the interface other components rely on |
 
 **This is the design decision worth taking away.** The cost of not forking is that your
@@ -214,15 +215,25 @@ told otherwise - which is why
 interrupted state itself. The sequence in `build_physical_resume_lines` is constrained at almost
 every step, and changing it casually will break something that is not obvious:
 
-1. **Bed first, nozzle off** (`M190` with no preceding `M104`). The bed keeps the part stuck
-   down, and the nozzle must not be hot yet - see below.
+1. **Both heaters start together, and both are waited for** - `M140` and `M104` first, then
+   `M190` and `M109`, before anything moves. The nozzle is sitting *in* the plastic it was
+   printing: lifting Z with it cold pulls the part off the bed. They do not reach their targets
+   at the same moment, and that is accepted.
 2. **`_NEBULAOS_PLR_SET_Z` declares Z at its recorded kinematic height, then lifts.** This is an
    ordering constraint from upstream's `safe_z_home`: a `G28` with Z unhomed resets Z to 0 and
    clears its homing, so Z has to be declared before X/Y are homed, and lifted before any XY
    move. Stock Creality's resume moves XY at print height instead.
-3. **X/Y home, then the nozzle heats and primes at the park position.** A power-cut test on the
-   development printer found the earlier order heating the nozzle *while it still sat over the
-   part*, which marked it and oozed onto it. That is the whole reason heating is split in two.
+3. **X/Y home, then the nozzle primes at the park position**, off the bed at the X/Y endstop.
+   Priming there, rather than over the part, is what keeps ooze out of the print - including
+   the ooze from heating in step 1.
+
+   **This order was reversed once, deliberately, and the history is worth knowing.** Until
+   `ed99372` the nozzle heated only after parking, because a power-cut test on the development
+   printer found that heating it *over the part* marked the part and oozed onto it. `178a0c2`
+   reverted that: a cold nozzle held in the part pulls the part off the bed the moment Z lifts,
+   which is the worse of the two failures. Priming at the park position keeps the benefit that
+   the earlier order was reaching for. If you are reading an older document that says "bed
+   first, nozzle off", it described `ed99372`.
 4. **Exclude-object state is replayed**, including `current_object` - without it the resumed
    file's `EXCLUDE_OBJECT_END` had nothing to match.
 5. **The timelapse watcher is restarted** (`_NEBULAOS_TIMELAPSE ACTION=START`) when the macro
@@ -274,11 +285,16 @@ that promise for your module alone.
 Per module, the way the repository's own CI does it:
 
 ```sh
-cd extras
+cd <repository root>
 python3 -m unittest extras.test_nebulaos_beeper
 ```
 
-At `f498796`: **29 of 31 suites, 912 tests, all passing.** The two not in that run
+(From the repository root, not from `extras/` - the module path is `extras.<name>`, which is
+also how `scripts/ci-tests.sh` invokes it.)
+
+At `178a0c2`: **29 of 31 suites, 912 tests, all passing**, re-run 2026-11-10, plus
+`test_nebulaos_compat.ManagedModulePresenceTest` (5 tests), the part of that suite which is a
+property of this tree rather than of Klipper. The two not in that run
 (`test_nebulaos_compat`, `test_nebulaos_temperature_mcu`) import real Klipper modules and need
 the pinned Klipper composed in, exactly as `scripts/ci-tests.sh` documents. They are a
 different run, not failures.

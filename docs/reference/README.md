@@ -1,7 +1,8 @@
 # NebulaOS Klipper extensions - developer reference
 
-Technical reference for `NebulaOS-klipper-extensions`, at commit `f498796` - the pin NebulaOS
-1.0.0 ships.
+Technical reference for `NebulaOS-klipper-extensions`, at commit `178a0c2` - the pin NebulaOS
+1.0.2 ships, which is also the tip of `main` and of `production`. All three agree, so this
+reference describes the shipped code with no pin gap to carry.
 
 This repository's GitHub wiki is **disabled**, so this reference lives in the repository
 itself. That is the better place anyway: the mission treats Git as authoritative and a wiki as
@@ -83,8 +84,8 @@ raises only when it is `True`.
 reports it has run on the development printer several times.
 
 The module's header previously stated it had never been exercised on hardware. That note was
-stale and has been corrected in the source at `f498796`; disregard it if you are reading an
-older checkout.
+stale and has been corrected in the source; disregard it if you are reading an older
+checkout.
 
 As elsewhere here: the call site is code-verified, while the hardware runs are the owner's
 report rather than this documentation's observation. Those are different kinds of evidence and
@@ -94,9 +95,9 @@ this reference keeps them apart.
 
 | | |
 |---|---|
-| Source commit | `f498796` |
-| Shipped by firmware | **yes** - `KLIPPER_EXTENSIONS_PIN=f498796` on branch `production` in the firmware manifest at `70ad0b0`, the NebulaOS 1.0.0 release, so this reference describes exactly what ships |
-| Test suite | 29 of 31 suites, **912 tests, all passing** (re-run at this commit on 2026-11-03) |
+| Source commit | `178a0c2` |
+| Shipped by firmware | **yes** - `KLIPPER_EXTENSIONS_PIN=178a0c2559de20bc23719471727051162cc53a90` on branch `production` in the firmware manifest at `3bdf3ff` (tag `v1.0.2`), and the same commit is the tip of `main` and of `production` |
+| Test suite | 29 of 31 suites, **912 tests, all passing** (re-run at this commit on 2026-11-10), plus `test_nebulaos_compat.ManagedModulePresenceTest` (5) |
 | Modules with a test | 21 of 30 |
 | Hardware verification | **none** - see below |
 
