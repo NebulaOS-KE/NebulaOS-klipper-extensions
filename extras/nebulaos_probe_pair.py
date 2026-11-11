@@ -60,15 +60,25 @@
 #   real factory default of exactly 0.000, which is a "not yet
 #   calibrated" marker, not a physical claim that probe and nozzle
 #   trigger at the same Z):
-#     commanded_floor_z = starting_nozzle_z - bootstrap_contact_envelope_mm
-#     starting_nozzle_z is the toolhead's own actual, known, currently-
-#     measured Z right before the descent begins - not a prediction at
-#     all, just "how far below where the nozzle already safely is are we
-#     willing to blindly search." bootstrap_contact_envelope_mm is a
-#     SEPARATE config value from down_min_z (never silently reused as one)
-#     and requires its own explicit hardware qualification before a
-#     virgin printer's first automatic Z-offset calibration can run at
-#     all - there is no invented default for it either.
+#     commanded_floor_z = raw_probe_trigger_z - bootstrap_contact_envelope_mm
+#     raw_probe_trigger_z is the FRESH CR-Touch reading taken moments
+#     earlier at this same (x, y) - a measurement of where the bed is,
+#     not a prediction. What is unknown is only how far the nozzle sits
+#     above the CR-Touch's trigger point (the very z_offset being
+#     measured, plus the load cell's own trigger depth), so the envelope
+#     is "how far below the measured bed may the nozzle search."
+#     bootstrap_contact_envelope_mm is a SEPARATE config value from
+#     down_min_z (never silently reused as one); touch_probe() still
+#     clamps every contact to the absolute stepper floor (position_min /
+#     down_min_z) underneath it.
+#
+#     Issue #9 (2026-11-11): this floor used to be
+#     starting_nozzle_z - bootstrap_contact_envelope_mm, i.e. relative to
+#     the hover height (horizontal_move_z 5.0 - 8.0 = Z -3.0), which left
+#     only ~3mm below the bed. Two field units (silicone bed spacers)
+#     needed their load cell to trigger at Z -3.4 to -3.5 and failed
+#     every first calibration with "No trigger on probe after full
+#     movement".
 #
 # Both established_contact_margin_mm and bootstrap_contact_envelope_mm are
 # read from the CALLER (nebulaos_calibration.py's own config - a
@@ -96,6 +106,31 @@ from . import probe as probe_module
 # correct. Small enough that no genuine calibration result could ever
 # land inside it by chance.
 _CREDIBLE_Z_OFFSET_EPSILON_MM = 0.0005
+
+# Upstream homing.py's message when a probing move reaches its target
+# without the endstop (here: the load cell) triggering.
+_NO_TRIGGER_MESSAGE = "No trigger on probe after full movement"
+
+
+def _no_contact_message(x, y, commanded_floor_z, contact_mode,
+                        raw_probe_trigger_z, predicted_nozzle_contact_z):
+    """What a user sees (console and the screen's "Why:") when the nozzle
+    reached its search limit without the load cell triggering - instead of
+    upstream's bare "No trigger on probe after full movement"."""
+    if contact_mode == 'established':
+        where = ("%.1f mm past where the saved probe Z offset puts the bed"
+                 % (predicted_nozzle_contact_z - commanded_floor_z,))
+        hint = (" If it keeps happening, the saved probe Z offset may be "
+                "far from the real one.")
+    else:
+        where = ("%.1f mm below where the CR-Touch measured the bed"
+                 % (raw_probe_trigger_z - commanded_floor_z,))
+        hint = ""
+    return ("The nozzle did not touch the bed: it went down to Z=%.2f at "
+            "X=%.1f Y=%.1f (%s) without the load cell detecting contact. "
+            "Make sure the nozzle tip is clean and nothing is under it, then "
+            "try again.%s" % (commanded_floor_z, x, y, where, hint))
+
 
 ContactSample = collections.namedtuple('ContactSample', [
     'sample_index', 'starting_z', 'commanded_floor_z',
@@ -274,12 +309,10 @@ def measure_probe_nozzle_pair(printer, x, y, probe_x_offset, probe_y_offset,
             "envelope, refusing nozzle contact" % (x, y, raw_probe_trigger_z))
 
     # Move the NOZZLE (toolhead origin, no offset) to the exact same
-    # physical (x, y) before computing/using either envelope formula -
-    # the BOOTSTRAP case's own floor is relative to the nozzle's real
-    # position at this point, not the probe's.
+    # physical (x, y) as the CR-Touch reading - both envelope formulas are
+    # relative to that reading (see this module's header).
     hover()
     toolhead.manual_move([x, y, None], travel_speed)
-    starting_nozzle_z = toolhead.get_position()[2]
 
     if is_established:
         contact_mode = 'established'
@@ -289,7 +322,7 @@ def measure_probe_nozzle_pair(printer, x, y, probe_x_offset, probe_y_offset,
     else:
         contact_mode = 'bootstrap'
         predicted_nozzle_contact_z = None
-        commanded_floor_z = starting_nozzle_z - bootstrap_contact_envelope_mm
+        commanded_floor_z = raw_probe_trigger_z - bootstrap_contact_envelope_mm
 
     contact_id = reactor.monotonic()
     samples = []
@@ -323,6 +356,10 @@ def measure_probe_nozzle_pair(printer, x, y, probe_x_offset, probe_y_offset,
                 force_at_trigger_g=None, tare_counts=None,
                 predicted_to_raw_trigger_depth=None,
                 remaining_margin_to_floor=None))
+            if _NO_TRIGGER_MESSAGE in str(e):
+                raise printer.command_error(_no_contact_message(
+                    x, y, commanded_floor_z, contact_mode,
+                    raw_probe_trigger_z, predicted_nozzle_contact_z))
             raise
 
         status = z_offset_probe.get_status(reactor.monotonic())

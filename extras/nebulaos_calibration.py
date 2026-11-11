@@ -291,54 +291,31 @@ class NebulaOSCalibration:
         self.established_contact_margin_mm = config.getfloat(
             'established_contact_margin_mm', default=1.0,
             minval=0.01, maxval=5.)
-        # bootstrap_contact_envelope_mm: how far below the nozzle's own
-        # actual, known, currently-measured starting Z (horizontal_move_z,
-        # default 5.0mm) a BOOTSTRAP/virgin calibration run (no credible
-        # prior) may blindly search. A SEPARATE value from down_min_z -
-        # never silently reused as one.
+        # bootstrap_contact_envelope_mm: how far below the FRESH CR-Touch
+        # reading at the reference point a BOOTSTRAP/virgin calibration
+        # run (no credible prior, e.g. z_offset 0.000) may search with the
+        # nozzle. A SEPARATE value from down_min_z - never silently reused
+        # as one. touch_probe() still clamps every contact to the absolute
+        # stepper floor (position_min) underneath it.
         #
-        # Phase 2 mission §8 qualification (2026-09-02): 8.0mm, derived
-        # from this unit's own measured z_offset history (1.6-2.3mm across
-        # cold/hot sessions this mission) plus real margin - a genuinely
-        # virgin unit (probe_z_offset=0.000 at homing) needs to search
-        # from horizontal_move_z=5.0mm down to roughly -(1.6 to 2.3)mm in
-        # that frame, i.e. 6.6-7.3mm of real depth; 8.0mm leaves ~0.7-1.4mm
-        # of margin beyond this unit's own worst observed case for
-        # ordinary unit-to-unit assembly variance, while the resulting
-        # commanded_floor_z (5.0-8.0=-3.0mm) still leaves 2mm of
-        # independent margin before the absolute stepper floor
-        # (position_min=-5.0mm on this printer).
-        #
-        # Physically qualified via NEBULAOS_Z_OFFSET_CALIBRATE
-        # SIMULATE_BOOTSTRAP=1 (see that command's own docstring): 6 real
-        # BOOTSTRAP-mode nozzle contacts on hardware that already has a
-        # trusted ESTABLISHED calibration, WITHOUT ever reading, mutating,
-        # or risking that real calibration - 5 at ENVELOPE=7.0mm, all
-        # succeeding with results (1.014-1.161mm) closely agreeing with an
-        # ESTABLISHED-mode measurement taken moments earlier in the same
-        # session (1.014-2.06mm range that same session) - cross-
-        # validating that the BOOTSTRAP formula/motion path measures the
-        # same real physical quantity correctly. A 6th run at a
-        # deliberately excessive ENVELOPE=12.0mm (commanded_floor_z=-7.0mm,
-        # beyond position_min) completed identically and safely: real
-        # contact triggered at ~1.16mm long before any floor was
-        # approached, and touch_probe()'s own contact_floor=max(z_floor,
-        # minimum_allowed_z) clamp means the ACTUAL floor a probing move
-        # could ever reach is structurally bounded by the independent
-        # absolute z_floor regardless of how generous
-        # bootstrap_contact_envelope_mm is - confirming this constant
-        # cannot itself cause a deeper-than-intended search even if
-        # mis-qualified. Full evidence:
+        # Issue #9 (2026-11-11): 5.0mm below the CR-Touch reading. Before,
+        # this was 8.0mm below the hover height (horizontal_move_z 5.0), so
+        # the floor sat at Z -3.0 whatever the bed reading was - qualified
+        # on ke-dev, whose nozzle sits 1.6-2.3mm above its CR-Touch trigger
+        # point. Two field units with silicone bed spacers sit ~2.6-3.2mm
+        # above it, and their load cell triggers ~0.35mm past contact, at
+        # Z -3.4 to -3.5: every first calibration stopped short at -3.0.
+        # 5.0mm covers that with ~1.5mm to spare; on the KE the stepper
+        # floor (position_min -5) is reached first anyway. This only
+        # decides where an untouched search gives up - the load cell's
+        # trigger and force safety limit stop the nozzle on contact.
+        # Earlier qualification of the mechanism (SIMULATE_BOOTSTRAP=1,
+        # 2026-09-02, including a deliberately excessive envelope that
+        # stayed clamped to the stepper floor):
         # _evidence/phase2-live-full-stack-closure-20260902-180602/
-        # 03-bootstrap-simulation-qualification/. Not yet tested with an
-        # actual, deeper real virgin-unit contact point (this unit's own
-        # current ESTABLISHED calibration only lets the simulation reach
-        # its OWN, comparatively shallow, contact point) - the mechanism,
-        # formula, and safety clamping are proven; the specific 8.0mm
-        # number is a geometry-and-margin-based estimate for a genuinely
-        # virgin unit, not itself hardware-proven at full depth.
+        # 03-bootstrap-simulation-qualification/.
         self.bootstrap_contact_envelope_mm = config.getfloat(
-            'bootstrap_contact_envelope_mm', default=8.0,
+            'bootstrap_contact_envelope_mm', default=5.0,
             minval=0.5, maxval=30.)
         # Measurement-quality and repeatability acceptance bounds (§7/§9/
         # §10).
@@ -358,12 +335,23 @@ class NebulaOSCalibration:
         #                           (~3.7x headroom)
         #   repeatability stddev:   0.01973mm observed vs 0.06mm bound
         #                           (~3x headroom)
+        #
+        # Issue #9 (2026-11-11): max_abs_fit_delta raised 0.3 -> 0.5mm. Two
+        # field units with silicone bed spacers (a softer mount: the load
+        # cell reaches its trigger later) showed |fit_delta| 0.27-0.36mm on
+        # all of 89 touches, every one rejected at 0.3, while their
+        # repeatability was excellent (e.g. -0.150/-0.159/-0.165). The
+        # bound is a plausibility check on the fit's correction, applied
+        # after the nozzle has lifted - the saved value is the fitted
+        # contact, not the raw trigger. 0.5 still rejects the recorded
+        # 1.106mm incident by a factor of two, and the repeatability
+        # bounds below are unchanged.
         # min_accepted_samples=2 (of pro_cnt=3): every one of the 22 runs
         # in this dataset accepted all 3 samples; no evidence to justify
         # a different value. No longer requires a qualification-only
         # printer.cfg override for any of the four.
         self.max_abs_fit_delta = config.getfloat(
-            'max_abs_fit_delta', default=0.3, minval=0.001, maxval=10.)
+            'max_abs_fit_delta', default=0.5, minval=0.001, maxval=10.)
         self.min_accepted_samples = config.getint(
             'min_accepted_samples', default=2, minval=1)
         self.max_repeatability_range = config.getfloat(
@@ -1225,12 +1213,20 @@ class NebulaOSCalibration:
             # (measure_probe_nozzle_pair's own final hover()) before this
             # check runs.
             if not measurement.accepted:
+                # Issue #9: say WHY the touches were rejected - a bare
+                # "no_accepted_samples" left users (and us) guessing.
+                sample_reasons = [
+                    s.rejection_reason
+                    for s in measurement.repeatability.samples
+                    if s.rejection_reason]
                 raise self.printer.command_error(
                     "NEBULAOS_Z_OFFSET_CALIBRATE: measurement rejected - "
-                    "%s (samples: %d taken, %d accepted)" %
+                    "%s (samples: %d taken, %d accepted%s)" %
                     (measurement.rejection_reason,
                      measurement.repeatability.sample_count,
-                     measurement.repeatability.accepted_count))
+                     measurement.repeatability.accepted_count,
+                     "; first rejected: %s" % (sample_reasons[0],)
+                     if sample_reasons else ""))
 
             new_offset = measurement.probe_z_offset
 

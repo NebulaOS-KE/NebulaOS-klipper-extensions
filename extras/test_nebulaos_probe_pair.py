@@ -21,8 +21,9 @@
 #                          - established_contact_margin_mm
 #   BOOTSTRAP - factory z_offset=0.000 (or anything within epsilon) is
 #   NOT a credible physical prior:
-#     commanded_floor_z = starting_nozzle_z - bootstrap_contact_envelope_mm
-#     fails closed unless bootstrap_contact_envelope_mm is explicitly
+#     commanded_floor_z = raw_probe_trigger_z - bootstrap_contact_envelope_mm
+#     (relative to the fresh CR-Touch reading since issue #9, not to the
+#     hover height) - fails closed unless bootstrap_contact_envelope_mm is explicitly
 #     configured - never silently falls back to down_min_z.
 #
 # Run from klippy/: python3 -m unittest extras.test_nebulaos_probe_pair -v
@@ -115,10 +116,15 @@ class FakeZOffsetProbe:
     minimum_allowed_z it was given), and makes the triple available via
     get_status() exactly like the real object does."""
 
-    def __init__(self, contacts):
+    def __init__(self, contacts, enforce_floor=False):
         # contacts: list of (fitted_z, raw_z, fit_delta) tuples, or a
         # single tuple reused for every call, or an Exception to raise.
+        # enforce_floor: behave like the real probing move - a contact
+        # whose raw trigger lies below minimum_allowed_z is never reached,
+        # and upstream homing raises "No trigger on probe after full
+        # movement" instead.
         self._contacts = contacts
+        self._enforce_floor = enforce_floor
         self.calls = []
         self._i = 0
         self._last = None
@@ -135,6 +141,9 @@ class FakeZOffsetProbe:
         if isinstance(item, Exception):
             raise item
         fitted_z, raw_z, fit_delta = item
+        if (self._enforce_floor and minimum_allowed_z is not None
+                and raw_z < minimum_allowed_z):
+            raise Exception("No trigger on probe after full movement")
         # Synthetic but deterministic force telemetry, distinct per call
         # (index-derived) so tests can tell samples apart without needing
         # a 4th tuple element for every existing fixture.
@@ -177,11 +186,12 @@ class _Base(unittest.TestCase):
                  max_abs_fit_delta=1.0, min_accepted_samples=None,
                  max_repeatability_range=None, max_repeatability_stddev=None,
                  pro_cnt=1, x=100., y=100., probe_x_offset=0.,
-                 probe_y_offset=27., down_min_z=10., toolhead=None):
+                 probe_y_offset=27., down_min_z=10., toolhead=None,
+                 enforce_floor=False):
         toolhead = toolhead if toolhead is not None else FakeToolhead()
         gcode = FakeGCode()
         printer = FakePrinter(toolhead, gcode)
-        z_probe = FakeZOffsetProbe(contacts)
+        z_probe = FakeZOffsetProbe(contacts, enforce_floor=enforce_floor)
         orig = _patch_run_single_probe(probe_trigger_z)
         try:
             return pairmod.measure_probe_nozzle_pair(
@@ -348,7 +358,7 @@ class BootstrapEnvelopeTest(_Base):
                           toolhead=toolhead)
         self.assertIn('bootstrap_contact_envelope_mm', str(ctx.exception))
 
-    def test_bootstrap_floor_is_relative_to_starting_nozzle_z_not_a_prediction(self):
+    def test_bootstrap_floor_is_relative_to_the_cr_touch_reading(self):
         toolhead = FakeToolhead(position=(0., 0., 8., 0.))
         result, z_probe, _th = self._measure(
             REAL_RAW_PROBE_TRIGGER_Z, [(-5.0, -5.0, 0.0)],
@@ -356,22 +366,134 @@ class BootstrapEnvelopeTest(_Base):
             toolhead=toolhead)
         self.assertEqual(result.contact_mode, 'bootstrap')
         self.assertIsNone(result.predicted_nozzle_contact_z)
-        # horizontal_move_z=8. in _Base - the nozzle hovers there before
-        # the bootstrap descent begins.
-        expected_floor = 8.0 - 10.0
+        # Issue #9: measured from the fresh CR-Touch reading at this point,
+        # not from the hover height (horizontal_move_z=8. in _Base).
+        expected_floor = REAL_RAW_PROBE_TRIGGER_Z - 10.0
         self.assertAlmostEqual(result.commanded_floor_z, expected_floor, places=9)
         self.assertEqual(z_probe.calls[0]['minimum_allowed_z'], expected_floor)
+        self.assertNotAlmostEqual(result.commanded_floor_z, 8.0 - 10.0, places=2)
+
+    def test_bootstrap_floor_follows_the_bed_reading(self):
+        # A bed that reads 0.3mm lower moves the floor 0.3mm lower too.
+        high, _z, _th = self._measure(
+            0.0, [(-1.0, -1.0, 0.0)], probe_z_offset=0.0,
+            bootstrap_contact_envelope_mm=5.0)
+        low, _z, _th = self._measure(
+            -0.3, [(-1.0, -1.0, 0.0)], probe_z_offset=0.0,
+            bootstrap_contact_envelope_mm=5.0)
+        self.assertAlmostEqual(high.commanded_floor_z, -5.0, places=9)
+        self.assertAlmostEqual(low.commanded_floor_z, -5.3, places=9)
 
     def test_bootstrap_succeeds_when_envelope_is_configured(self):
-        # horizontal_move_z=8. (the _Base default) - envelope=10.0 gives a
-        # floor of -2.0, so the fake contact must trigger at or above -2.0
-        # to be accepted (this fixture's raw/fitted Z stays comfortably
-        # inside the envelope, exactly like a real, in-bounds trigger would).
+        # envelope=10.0 below the CR-Touch reading (0.025) gives a floor of
+        # -9.975; this fixture's raw/fitted Z stays comfortably inside it,
+        # exactly like a real, in-bounds trigger would.
         result, _z, _th = self._measure(
             REAL_RAW_PROBE_TRIGGER_Z, [(-1.0, -1.0, 0.0)],
             probe_z_offset=0.0, bootstrap_contact_envelope_mm=10.0)
         self.assertTrue(result.accepted)
         self.assertEqual(result.contact_mode, 'bootstrap')
+
+
+# ======================================================================
+# Issue #9 (2026-11-11): two field units (silicone bed spacers) failed
+# every first Z-offset calibration. Values below are from their logs.
+# ======================================================================
+
+# NebulaOS 1.0.2 defaults before the fix: floor at hover 5.0 - 8.0 = -3.0;
+# max_abs_fit_delta 0.3. After: 5.0 below the CR-Touch reading; 0.5.
+ISSUE9_CR_TOUCH_Z = -0.06          # "bed will contact at z=-0.060000"
+ISSUE9_TOUCHES = [                 # (fitted z_contact, raw trigger, delta)
+    (-3.0841, -3.4025, -0.3184),
+    (-3.1435, -3.4425, -0.2990),
+    (-3.1325, -3.4400, -0.3075),
+]
+SECOND_UNIT_TOUCHES = [            # z_offset 3.000 workaround, all rejected
+    (-0.1504, -0.4900, -0.3396),
+    (-0.1593, -0.4850, -0.3257),
+    (-0.1651, -0.4775, -0.3124),
+]
+
+
+class Issue9FieldUnitTest(_Base):
+    def _issue9(self, envelope, max_abs_fit_delta, toolhead=None):
+        return self._measure(
+            ISSUE9_CR_TOUCH_Z, list(ISSUE9_TOUCHES), probe_z_offset=0.0,
+            bootstrap_contact_envelope_mm=envelope,
+            max_abs_fit_delta=max_abs_fit_delta, pro_cnt=3,
+            min_accepted_samples=2, max_repeatability_range=0.15,
+            max_repeatability_stddev=0.06, enforce_floor=True,
+            x=20., y=25., toolhead=toolhead)
+
+    def test_first_calibration_now_reaches_the_bed(self):
+        result, z_probe, _th = self._issue9(5.0, 0.5)
+        self.assertEqual(result.contact_mode, 'bootstrap')
+        self.assertAlmostEqual(result.commanded_floor_z, -5.06, places=9)
+        self.assertTrue(result.accepted, result.rejection_reason)
+        self.assertEqual(result.repeatability.accepted_count, 3)
+        mean = sum(t[0] for t in ISSUE9_TOUCHES) / 3.
+        self.assertAlmostEqual(result.probe_z_offset,
+                               ISSUE9_CR_TOUCH_Z - mean, places=9)
+        self.assertGreater(result.probe_z_offset, 3.0)
+        self.assertLess(result.probe_z_offset, 3.1)
+
+    def test_a_floor_at_minus_3_never_reaches_it_and_says_why(self):
+        # What 1.0.2 effectively did: floor -3.0 (here: 2.94 below the
+        # CR-Touch reading). The raw trigger at -3.40 is never reached; the
+        # user now gets an explanation instead of upstream's bare message.
+        toolhead = FakeToolhead()
+        with self.assertRaises(CommandError) as ctx:
+            self._measure(
+                ISSUE9_CR_TOUCH_Z, list(ISSUE9_TOUCHES), probe_z_offset=0.0,
+                bootstrap_contact_envelope_mm=2.94, max_abs_fit_delta=0.5,
+                pro_cnt=3, min_accepted_samples=2,
+                max_repeatability_range=0.15, max_repeatability_stddev=0.06,
+                enforce_floor=True, x=20., y=25., toolhead=toolhead)
+        msg = str(ctx.exception)
+        self.assertIn('The nozzle did not touch the bed', msg)
+        self.assertIn('Z=-3.00', msg)
+        self.assertIn('X=20.0 Y=25.0', msg)
+        self.assertIn('2.9 mm below where the CR-Touch measured the bed', msg)
+        self.assertNotIn('No trigger on probe', msg)
+
+    def test_the_old_fit_delta_bound_rejects_these_touches(self):
+        result, _z, _th = self._issue9(5.0, 0.3)
+        self.assertFalse(result.accepted)
+        self.assertIn('excessive_fit_delta',
+                      result.repeatability.samples[0].rejection_reason)
+
+    def test_second_unit_touches_pass_at_the_new_bound(self):
+        # z_offset 3.000 (ESTABLISHED), CR-Touch at -0.23 in that frame.
+        kwargs = dict(probe_z_offset=3.0, established_contact_margin_mm=1.0,
+                      pro_cnt=3, min_accepted_samples=2,
+                      max_repeatability_range=0.15,
+                      max_repeatability_stddev=0.06, enforce_floor=True,
+                      x=20., y=25.)
+        old, _z, _th = self._measure(3.0 - 0.23, list(SECOND_UNIT_TOUCHES),
+                                     max_abs_fit_delta=0.3, **kwargs)
+        self.assertFalse(old.accepted)
+        self.assertEqual(old.rejection_reason, 'no_accepted_samples')
+        new, _z, _th = self._measure(3.0 - 0.23, list(SECOND_UNIT_TOUCHES),
+                                     max_abs_fit_delta=0.5, **kwargs)
+        self.assertTrue(new.accepted, new.rejection_reason)
+        self.assertLess(new.repeatability.range, 0.02)
+
+    def test_established_no_contact_message_points_at_the_saved_offset(self):
+        with self.assertRaises(CommandError) as ctx:
+            self._measure(
+                2.0, [(-5.0, -5.0, 0.0)], probe_z_offset=1.8,
+                established_contact_margin_mm=1.0, enforce_floor=True)
+        msg = str(ctx.exception)
+        self.assertIn('The nozzle did not touch the bed', msg)
+        self.assertIn('1.0 mm past where the saved probe Z offset puts the bed', msg)
+        self.assertIn('saved probe Z offset may be far from the real one', msg)
+
+    def test_other_contact_errors_are_not_reworded(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            self._measure(
+                0.0, [RuntimeError("Load cell sensor error")],
+                probe_z_offset=0.0, bootstrap_contact_envelope_mm=5.0)
+        self.assertEqual(str(ctx.exception), "Load cell sensor error")
 
 
 # ======================================================================

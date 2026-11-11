@@ -457,6 +457,36 @@ class LoadCellRejectionGatingTest(unittest.TestCase):
         self.assertEqual(configfile.set_calls, [])
         self.assertEqual(coord.z_offset_state, 'measurement_quality_failure')
 
+    def test_rejection_names_the_reason_of_the_rejected_touches(self):
+        # Issue #9: "no_accepted_samples" alone did not say why.
+        z_probe = FakeZOffsetProbe(is_calibrated=True)
+        probe_obj = FakeProbeObj(z_offset=0.25)
+        zc = FakeZCompensate(110., 111.)
+        printer, gcode, coord = _build(z_probe, probe_obj, zc)
+        sample = nebulaos_probe_pair.ContactSample(
+            sample_index=0, starting_z=5.0, commanded_floor_z=-1.0,
+            raw_trigger_z=-0.49, fitted_contact_z=-0.15, fit_delta=-0.34,
+            fit_valid=True, motion_safe=True, accepted=False,
+            rejection_reason='excessive_fit_delta(0.3396>0.3000)',
+            peak_force_g=None, peak_force_time=None, force_at_trigger_g=None,
+            tare_counts=None, predicted_to_raw_trigger_depth=None,
+            remaining_margin_to_floor=None)
+
+        def fake_measure(printer_, x, y, *a, **kw):
+            m = _rejected_measurement(x, y, reason='no_accepted_samples')
+            return m._replace(repeatability=m.repeatability._replace(
+                samples=[sample, sample, sample], sample_count=3))
+        orig = nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair
+        nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = fake_measure
+        try:
+            with self.assertRaises(fake.CommandError) as ctx:
+                coord.cmd_z_offset_calibrate(fake.FakeGCmd({}))
+        finally:
+            nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = orig
+        msg = str(ctx.exception)
+        self.assertIn('no_accepted_samples (samples: 3 taken, 0 accepted; '
+                      'first rejected: excessive_fit_delta(0.3396>0.3000))', msg)
+
     def test_capability_unqualified_error_sets_distinct_state(self):
         z_probe = FakeZOffsetProbe(is_calibrated=True)
         zc = FakeZCompensate(110., 111.)
@@ -508,7 +538,8 @@ class LoadCellRejectionGatingTest(unittest.TestCase):
         # contact_margin_mm/max_abs_fit_delta/min_accepted_samples/
         # max_repeatability_range/max_repeatability_stddev/bootstrap_
         # contact_envelope_mm now all have real qualified defaults (1.0,
-        # 0.3, 2, 0.15, 0.06, 8.0) and no longer require a
+        # 0.3, 2, 0.15, 0.06, 8.0 - issue #9 since: 0.5 and 5.0 below the
+        # CR-Touch reading) and no longer require a
         # qualification-only printer.cfg override to run a calibration at
         # all, in either ESTABLISHED or BOOTSTRAP mode.
         z_probe = FakeZOffsetProbe(is_calibrated=True)
@@ -526,11 +557,11 @@ class LoadCellRejectionGatingTest(unittest.TestCase):
         finally:
             nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = orig
         self.assertAlmostEqual(seen['established_contact_margin_mm'], 1.0, places=9)
-        self.assertAlmostEqual(seen['max_abs_fit_delta'], 0.3, places=9)
+        self.assertAlmostEqual(seen['max_abs_fit_delta'], 0.5, places=9)  # issue #9
         self.assertEqual(seen['min_accepted_samples'], 2)
         self.assertAlmostEqual(seen['max_repeatability_range'], 0.15, places=9)
         self.assertAlmostEqual(seen['max_repeatability_stddev'], 0.06, places=9)
-        self.assertAlmostEqual(seen['bootstrap_contact_envelope_mm'], 8.0, places=9)
+        self.assertAlmostEqual(seen['bootstrap_contact_envelope_mm'], 5.0, places=9)  # issue #9
         self.assertEqual(coord.z_offset_state, 'complete')
 
     def test_diagnostics_recorded_in_status_after_success(self):
