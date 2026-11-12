@@ -1,6 +1,7 @@
-<!-- Hand-written. Unlike COMMANDS*.md and CONFIG.md in this directory, this page
-     is not generated - it explains, and explanation cannot be extracted. Every
-     factual claim names the file it came from so it can be re-checked. -->
+<!-- Hand-written. Unlike the Commands, Commands-Detail, Configuration and Modules
+     pages in this wiki, this page is not generated - it explains, and explanation
+     cannot be extracted. Every factual claim names the file it came from so it can
+     be re-checked. -->
 
 # How the extensions work
 
@@ -9,9 +10,10 @@ release pin, and also the tip of both `main` and `production`, so this describes
 ships: what this repository is, how its code reaches a running printer, and how the pieces fit
 together.
 
-For exhaustive lists, see [COMMANDS-DETAIL.md](COMMANDS-DETAIL.md) and
-[CONFIG.md](CONFIG.md). This page is the part those cannot give you - why the design is shaped
-this way.
+For exhaustive lists, see [Commands](Commands), [Commands in detail](Commands-Detail),
+[Configuration](Configuration) and [Modules](Modules); for how to run the suites,
+[Testing](Testing). This page is the part those cannot give you - why the design is shaped this
+way.
 
 ## The one thing to understand first
 
@@ -144,7 +146,7 @@ Three things follow from that shape:
 **The public name may not be in this repository.** `NEBULAOS_BED_TRAM` is a macro in the
 firmware's `calibration.cfg`; this repository registers `_NEBULAOS_BED_TRAM`. A command
 reference built from this repository alone cannot see those macros, and
-[COMMANDS-DETAIL.md](COMMANDS-DETAIL.md) says so rather than presenting itself as the complete
+[Commands in detail](Commands-Detail) says so rather than presenting itself as the complete
 list of what a user can type.
 
 **The underscore is a real convention, not decoration.** It marks a command as a step or an
@@ -206,7 +208,7 @@ Worth knowing before debugging either, because they do not behave as stock Klipp
 Both are registered by first calling `register_command(name, None)`, which removes the upstream
 command. Anyone arriving from stock Klipper will expect the upstream semantics and should be
 told otherwise - which is why
-[COMMANDS-DETAIL.md](COMMANDS-DETAIL.md) marks them explicitly.
+[Commands in detail](Commands-Detail) marks them explicitly.
 
 ## The physical resume, and why its order is what it is
 
@@ -280,38 +282,11 @@ read in `__init__` or `load_config` and never re-read, which is what makes the s
 *every option needs a Klipper restart* true. Re-reading config at runtime would quietly break
 that promise for your module alone.
 
-## Running the tests
-
-Per module, the way the repository's own CI does it:
-
-```sh
-cd <repository root>
-python3 -m unittest extras.test_nebulaos_beeper
-```
-
-(From the repository root, not from `extras/` - the module path is `extras.<name>`, which is
-also how `scripts/ci-tests.sh` invokes it.)
-
-At `178a0c2`: **29 of 31 suites, 912 tests, all passing**, re-run 2026-11-10, plus
-`test_nebulaos_compat.ManagedModulePresenceTest` (5 tests), the part of that suite which is a
-property of this tree rather than of Klipper. The two not in that run
-(`test_nebulaos_compat`, `test_nebulaos_temperature_mcu`) import real Klipper modules and need
-the pinned Klipper composed in, exactly as `scripts/ci-tests.sh` documents. They are a
-different run, not failures.
-
-Two traps that produce confidently wrong answers:
-
-- **Strip ANSI before matching `OK`.** `unittest` colours that line when it has a TTY, so
-  `grep '^OK'` never matches and every suite looks like it failed. CI is unaffected, having no
-  TTY. A first run here reported 29 of 29 failing, entirely because of this.
-- **Do not use `unittest discover`.** It reports dozens of errors on this suite that are
-  rootdir and import artifacts. `test_tmcstatus` fails under discovery and passes perfectly as
-  a module.
-
 ## What this page does not cover
 
 - **Hardware behaviour.** Nothing here was observed on a printer.
 - **The firmware side** - how composition is invoked, where `calibration.cfg` lives, how the
-  screen reaches Klipper. See the firmware repository's `docs/reference/`.
+  screen reaches Klipper. See the
+  [firmware wiki](https://github.com/NebulaOS-KE/NebulaOS-firmware/wiki).
 - **Upstream Klipper.** Deliberately. If NebulaOS does not change it, upstream's own
   documentation is better than a paraphrase here.

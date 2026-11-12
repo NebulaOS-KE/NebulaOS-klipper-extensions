@@ -12,6 +12,14 @@ file. NebulaOS runs unmodified upstream Klipper (pinned as `KLIPPER_PIN` in the 
 `coreflake1/NebulaOS-klipper` fork is history only. This repository was split out of it with
 `git filter-repo`, so `git log`/`git blame` still work, but commit SHAs differ.
 
+## Developer documentation
+
+The full developer reference is this repository's
+**[wiki](https://github.com/NebulaOS-KE/NebulaOS-klipper-extensions/wiki)**: the architecture,
+all 50 commands with their parameters and defaults, 156 configuration options, 30 modules, and
+how to run the tests. The pages are kept as Markdown in the repository's top-level
+[`wiki/`](wiki) directory and published from there.
+
 ## Composition contract
 
 [`nebulaos-extensions.json`](nebulaos-extensions.json) is the authoritative, machine-readable
