@@ -3,6 +3,8 @@
 **[Home](Home)**
 
 - [Architecture](Architecture)
+- [Power-loss recovery](Power-Loss-Recovery)
+- [Z-offset calibration](Z-Offset-Calibration)
 - [Modules](Modules)
 - [Commands](Commands)
 - [Commands in detail](Commands-Detail)
