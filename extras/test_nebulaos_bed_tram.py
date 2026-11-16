@@ -238,6 +238,29 @@ class AdjustableFlowTest(TramTestBase):
         self.assertEqual(obj.state, tram.COMPLETE)
         self.assertFalse(obj.load_cell_corner_changed)
 
+    def test_direction_is_upstreams_word_for_word(self):
+        # Issue #18: the screen and Mainsail must never disagree. Mainsail
+        # shows upstream's results[...]['sign']; the wizard must show the
+        # same direction for both signs, whatever screw_thread says, and
+        # never work one out itself.
+        for upstream_sign, words in (('CW', 'clockwise'),
+                                     ('CCW', 'counter-clockwise')):
+            obj, gcode, tilt = self.build(
+                [[0.0, 0.0, -0.125, 0.02], [0.0, 0.0, 0.0, 0.02]],
+                mount='adjustable')
+            measure = tilt.measure
+
+            def forced(sign=upstream_sign, measure=measure):
+                measure()
+                for r in tilt.results.values():
+                    r['sign'] = sign
+            tilt.measure = forced
+            self.tram_cmd(obj)
+            self.assertEqual(obj.action['sign'], upstream_sign)
+            lines, _ = gcode.last_prompt()
+            self.assertTrue(any(l.endswith(' turn %s.' % (words,))
+                                for l in lines), (upstream_sign, lines))
+
 
 class SignedDeviationTest(TramTestBase):
     def test_rigid_signed_against_the_highest_corner(self):
