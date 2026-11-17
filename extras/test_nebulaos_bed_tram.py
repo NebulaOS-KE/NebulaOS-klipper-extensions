@@ -422,7 +422,7 @@ class ClearTheScrewsTest(TramTestBase):
         obj, gcode, tilt = self.build([[0., -0.3, 0., 0.]], mount='rigid')
         self.tram_cmd(obj)
         self.assertEqual(obj.state, tram.AWAITING_ADJUSTMENT)
-        self.assertEqual(self.toolhead.manual_moves, [([112.0, 169.5], 50.)])
+        self.assertEqual(self.toolhead.manual_moves[0], ([112.0, 169.5], 50.))
 
     def test_after_every_measurement_also_the_last(self):
         obj, gcode, tilt = self.build(
@@ -430,7 +430,8 @@ class ClearTheScrewsTest(TramTestBase):
         self.tram_cmd(obj)
         self.tram_cmd(obj, CONFIRM=1)
         self.assertEqual(obj.state, tram.COMPLETE)
-        self.assertEqual(len(self.toolhead.manual_moves), 2)
+        self.assertEqual([m[0] for m in self.toolhead.manual_moves],
+                         [[112.0, 169.5], [None, None, 100.]] * 2)
 
     def test_no_move_when_the_measurement_failed(self):
         obj, gcode, tilt = self.build([[0., None, 0., 0.]], mount='rigid')
@@ -508,3 +509,73 @@ class CalibrationHistoryTest(TramTestBase):
                                       mount='rigid')
         self.tram_cmd(obj)
         self.assertEqual(obj.state, tram.COMPLETE)
+
+
+class LiftAfterMeasuringTest(TramTestBase):
+    """1.0.4: after measuring, the nozzle goes up so the bed plate comes off
+    and the screws are easy to reach."""
+    def test_goes_up_to_100_mm_after_the_xy_move(self):
+        obj, gcode, tilt = self.build([[0., -0.3, 0., 0.]], mount='rigid')
+        self.tram_cmd(obj)
+        self.assertEqual(self.toolhead.manual_moves,
+                         [([112.0, 169.5], 50.), ([None, None, 100.], 50.)])
+
+    def test_height_is_configurable(self):
+        obj, gcode, tilt = self.build([[0., -0.3, 0., 0.]], mount='rigid',
+                                      clear_z=30)
+        self.tram_cmd(obj)
+        self.assertEqual(self.toolhead.manual_moves[-1][0], [None, None, 30.])
+
+    def test_stays_below_the_z_limit(self):
+        obj, gcode, tilt = self.build([[0., -0.3, 0., 0.]], mount='rigid')
+        status = self.toolhead.get_status
+        self.toolhead.get_status = lambda t: dict(status(t),
+                                                  axis_maximum=[220., 220., 40., 0.])
+        self.tram_cmd(obj)
+        self.assertEqual(self.toolhead.manual_moves[-1][0], [None, None, 35.])
+
+    def test_never_moves_down(self):
+        obj, gcode, tilt = self.build([[0., -0.3, 0., 0.]], mount='rigid')
+        self.toolhead.set_position_z(150.)
+        self.tram_cmd(obj)
+        self.assertEqual(self.toolhead.manual_moves, [([112.0, 169.5], 50.)])
+
+
+class MeasuringStateTest(TramTestBase):
+    """1.0.4: while homing and probing, the status says 'measuring', so the
+    screen shows at once that the tap started something."""
+    def test_measuring_while_the_corners_are_probed(self):
+        obj, gcode, tilt = self.build([[0., -0.3, 0., 0.]])
+        self.tram_cmd(obj)
+        self.assertEqual(obj.state, tram.AWAITING_MOUNT)
+        seen = []
+        measure = tilt.measure
+        def spy():
+            seen.append(obj.get_status(0.)['state'])
+            seen.append(obj.get_status(0.)['busy'])
+            measure()
+        tilt.measure = spy
+        self.tram_cmd(obj, MOUNT='rigid')
+        self.assertEqual(seen, [tram.MEASURING, True])
+        self.assertEqual(obj.state, tram.AWAITING_ADJUSTMENT)
+
+    def test_also_when_measuring_again(self):
+        obj, gcode, tilt = self.build(
+            [[0., -0.3, 0., 0.], [0., 0., 0., 0.]], mount='rigid')
+        self.tram_cmd(obj)
+        seen = []
+        measure = tilt.measure
+        tilt.measure = lambda: (seen.append(obj.state), measure())
+        self.tram_cmd(obj, CONFIRM=1)
+        self.assertEqual(seen, [tram.MEASURING])
+        self.assertEqual(obj.state, tram.COMPLETE)
+
+    def test_error_after_a_failed_measurement(self):
+        obj, gcode, tilt = self.build([[0., None, 0., 0.]], mount='rigid')
+        def incomplete():
+            tilt.calls += 1
+            tilt.results = {'screw1': {'z': 0.}}
+        tilt.measure = incomplete
+        with self.assertRaises(Exception):
+            self.tram_cmd(obj)
+        self.assertEqual(obj.state, tram.ERROR)

@@ -44,11 +44,14 @@ MOUNTS = (RIGID, ADJUSTABLE)
 IDLE = 'idle'
 AWAITING_MOUNT = 'awaiting_mount'
 AWAITING_ADJUSTMENT = 'awaiting_adjustment'
+# 1.0.4: homing and probing the corners (minutes) - shown at once, so a tap
+# on a mount or "measure again" visibly starts something.
+MEASURING = 'measuring'
 COMPLETE = 'complete'
 STOPPED = 'stopped'
 CANCELLED = 'cancelled'
 ERROR = 'error'
-ACTIVE = (AWAITING_MOUNT, AWAITING_ADJUSTMENT)
+ACTIVE = (AWAITING_MOUNT, MEASURING, AWAITING_ADJUSTMENT)
 
 DEFAULT_STATE_PATH = journal.DEFAULT_JOURNAL_DIR + "/bed_tram.json"
 
@@ -122,6 +125,9 @@ class NebulaOSBedTram:
         self.min_improvement = config.getfloat('min_improvement', 0.02,
                                                above=0.)
         self.samples = config.getint('samples', 3, minval=1, maxval=10)
+        # 1.0.4: after measuring, the nozzle waits this high (mm) so the
+        # bed plate comes off and the screws are easy to reach.
+        self.clear_z = config.getfloat('clear_z', 100., minval=0., maxval=200.)
         self.state_path = config.get('state_path', DEFAULT_STATE_PATH)
         self.mount = self._load_mount()
         self.run_id = 0
@@ -331,17 +337,31 @@ class NebulaOSBedTram:
         """Issue #24: SCREWS_TILT_CALCULATE ends with the nozzle over the
         last screw (rear left), where it blocks that screw. Move it to the
         middle of the rear edge, between the rear screws, so every screw can
-        be reached. Same height, a position the measurement already passes."""
+        be reached (same height, a position the measurement already passes),
+        then up to clear_z so the bed plate comes off easily. The next
+        measurement starts by moving down to its own probing height."""
         coords = [coord for coord, name in getattr(tilt, 'screws', ())]
         if not coords:
             return
         xs = [c[0] for c in coords]
         ys = [c[1] for c in coords]
-        speed = getattr(getattr(tilt, 'probe_helper', None), 'speed', 50.)
+        helper = getattr(tilt, 'probe_helper', None)
+        speed = getattr(helper, 'speed', 50.)
         toolhead.manual_move([(min(xs) + max(xs)) / 2., max(ys)], speed)
+        z = self.clear_z
+        z_max = toolhead.get_status(self.reactor.monotonic()).get(
+            'axis_maximum')
+        if z_max is not None:
+            z = min(z, z_max[2] - 5.)
+        if z > toolhead.get_position()[2]:
+            # travel speed; Klipper limits it to max_z_velocity
+            toolhead.manual_move([None, None, z], speed)
 
     def _measure_and_decide(self):
         self._refuse_if_printing()
+        self.state = MEASURING
+        self.message = None
+        self.gcode.respond_raw("// action:prompt_end")
         try:
             corners = self._measure()
         except Exception as e:
