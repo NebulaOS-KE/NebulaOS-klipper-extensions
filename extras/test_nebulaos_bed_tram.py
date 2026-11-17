@@ -579,3 +579,24 @@ class MeasuringStateTest(TramTestBase):
         with self.assertRaises(Exception):
             self.tram_cmd(obj)
         self.assertEqual(obj.state, tram.ERROR)
+
+
+class ToleranceRetriesTest(TramTestBase):
+    """1.0.4: a noisy corner is probed again (upstream
+    SAMPLES_TOLERANCE_RETRIES) instead of failing the measurement."""
+    def measure_script(self, obj, gcode):
+        self.tram_cmd(obj)
+        return [s for s in gcode.scripts_run
+                if s.startswith('SCREWS_TILT_CALCULATE')][0]
+
+    def test_three_retries_by_default(self):
+        obj, gcode, tilt = self.build([[0., -0.3, 0., 0.]], mount='rigid')
+        self.assertEqual(self.measure_script(obj, gcode),
+                         "SCREWS_TILT_CALCULATE SAMPLES=3 SAMPLES_RESULT=median"
+                         " SAMPLES_TOLERANCE_RETRIES=3")
+
+    def test_configurable(self):
+        obj, gcode, tilt = self.build([[0., -0.3, 0., 0.]], mount='rigid',
+                                      tolerance_retries=0)
+        self.assertTrue(self.measure_script(obj, gcode).endswith(
+            " SAMPLES_TOLERANCE_RETRIES=0"))

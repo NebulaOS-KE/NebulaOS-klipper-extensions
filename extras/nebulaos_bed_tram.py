@@ -125,6 +125,11 @@ class NebulaOSBedTram:
         self.min_improvement = config.getfloat('min_improvement', 0.02,
                                                above=0.)
         self.samples = config.getint('samples', 3, minval=1, maxval=10)
+        # 1.0.4: a corner whose samples disagree (> the probe's
+        # samples_tolerance) is probed again instead of failing the whole
+        # measurement ("Probe samples exceed samples_tolerance").
+        self.retries = config.getint('tolerance_retries', 3, minval=0,
+                                     maxval=10)
         # 1.0.4: after measuring, the nozzle waits this high (mm) so the
         # bed plate comes off and the screws are easy to reach.
         self.clear_z = config.getfloat('clear_z', 100., minval=0., maxval=200.)
@@ -323,7 +328,7 @@ class NebulaOSBedTram:
             self.gcode.run_script_from_command("G28")
         self.gcode.run_script_from_command(
             "SCREWS_TILT_CALCULATE SAMPLES=%d SAMPLES_RESULT=median"
-            % (self.samples,))
+            " SAMPLES_TOLERANCE_RETRIES=%d" % (self.samples, self.retries))
         tilt = self.printer.lookup_object('screws_tilt_adjust')
         results = tilt.get_status(self.reactor.monotonic()).get('results', {})
         corners = [results.get('screw%d' % (i + 1,)) for i in range(4)]
