@@ -16,6 +16,10 @@ from . import nebulaos_bed_tram as tram
 
 class FakeScrewsTilt:
     """Upstream screws_tilt_adjust's status, fed one measurement per call."""
+    # The KE's screws (calibration.cfg), as upstream keeps them.
+    screws = [((27.5, -0.5), 'front left'), ((196.5, -0.5), 'front right'),
+              ((196.5, 169.5), 'rear right'), ((27.5, 169.5), 'rear left')]
+
     def __init__(self, measurements):
         self.measurements = list(measurements)
         self.results = {}
@@ -66,6 +70,15 @@ class TramGCode(fake.FakeGCode):
         return lines, buttons
 
 
+class TramToolhead(fake.FakeToolhead):
+    def __init__(self):
+        super().__init__()
+        self.manual_moves = []
+
+    def manual_move(self, coord, speed):
+        self.manual_moves.append((list(coord), speed))
+
+
 class FakePrintStats:
     def __init__(self, state='standby'):
         self.state = state
@@ -89,8 +102,9 @@ class TramTestBase(unittest.TestCase):
         printer = fake.FakePrinter()
         tilt = FakeScrewsTilt(measurements)
         gcode = TramGCode(tilt)
-        toolhead = fake.FakeToolhead()
+        toolhead = TramToolhead()
         toolhead.homed_axes = homed
+        self.toolhead = toolhead
         printer.add_object('gcode', gcode)
         printer.add_object('toolhead', toolhead)
         printer.add_object('screws_tilt_adjust', tilt)
@@ -399,6 +413,34 @@ class SessionTest(TramTestBase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ClearTheScrewsTest(TramTestBase):
+    """Issue #24: after each measurement the nozzle leaves the rear-left
+    screw and waits between the rear screws."""
+    def test_moves_to_the_middle_of_the_rear_edge_after_measuring(self):
+        obj, gcode, tilt = self.build([[0., -0.3, 0., 0.]], mount='rigid')
+        self.tram_cmd(obj)
+        self.assertEqual(obj.state, tram.AWAITING_ADJUSTMENT)
+        self.assertEqual(self.toolhead.manual_moves, [([112.0, 169.5], 50.)])
+
+    def test_after_every_measurement_also_the_last(self):
+        obj, gcode, tilt = self.build(
+            [[0., -0.3, 0., 0.], [0., 0., 0., 0.]], mount='rigid')
+        self.tram_cmd(obj)
+        self.tram_cmd(obj, CONFIRM=1)
+        self.assertEqual(obj.state, tram.COMPLETE)
+        self.assertEqual(len(self.toolhead.manual_moves), 2)
+
+    def test_no_move_when_the_measurement_failed(self):
+        obj, gcode, tilt = self.build([[0., None, 0., 0.]], mount='rigid')
+        def incomplete():
+            tilt.calls += 1
+            tilt.results = {'screw1': {'z': 0.}}
+        tilt.measure = incomplete
+        with self.assertRaises(Exception):
+            self.tram_cmd(obj)
+        self.assertEqual(self.toolhead.manual_moves, [])
 
 
 class RecordingCalibration:

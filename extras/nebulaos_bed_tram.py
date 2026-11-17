@@ -324,7 +324,21 @@ class NebulaOSBedTram:
         if any(c is None for c in corners):
             raise self.printer.command_error(
                 "%s: the measurement did not return all four corners" % (CMD,))
+        self._clear_the_screws(toolhead, tilt)
         return corners
+
+    def _clear_the_screws(self, toolhead, tilt):
+        """Issue #24: SCREWS_TILT_CALCULATE ends with the nozzle over the
+        last screw (rear left), where it blocks that screw. Move it to the
+        middle of the rear edge, between the rear screws, so every screw can
+        be reached. Same height, a position the measurement already passes."""
+        coords = [coord for coord, name in getattr(tilt, 'screws', ())]
+        if not coords:
+            return
+        xs = [c[0] for c in coords]
+        ys = [c[1] for c in coords]
+        speed = getattr(getattr(tilt, 'probe_helper', None), 'speed', 50.)
+        toolhead.manual_move([(min(xs) + max(xs)) / 2., max(ys)], speed)
 
     def _measure_and_decide(self):
         self._refuse_if_printing()
