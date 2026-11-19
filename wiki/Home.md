@@ -24,6 +24,8 @@ unusual and not guaranteed to last: the firmware manifest is the shipping author
 | Page | What it is |
 |---|---|
 | [Architecture](Architecture) | **Start here.** What this repository is, how its code reaches a running printer, the compatibility contract, how a calibration actually runs, how state is persisted, and why the physical resume's order is what it is |
+| [Power-loss recovery](Power-Loss-Recovery) | How a print survives a power cut: what is saved, how the resume works, the EEPROM journal and the checkpoint rules. Starts plain, ends technical |
+| [Z-offset calibration](Z-Offset-Calibration) | How the load cell measures the Z offset: Auto Calibration, the automatic check and the bottle calibration, the contact fit and the safety limits. Starts plain, ends technical |
 | [Modules](Modules) | One section per file in `extras/`: what it is, the commands it registers, the options it reads, which tests refer to it, and who wrote it when it is vendored |
 | [Commands](Commands) | Summary table: **50** commands with module, kind, test coverage and description |
 | [Commands in detail](Commands-Detail) | One section per command: handler, help text, parameters with types, defaults and valid ranges, errors raised, side effects, example invocation |
