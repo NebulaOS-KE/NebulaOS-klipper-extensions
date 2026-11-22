@@ -1288,35 +1288,272 @@ class ConfigIdentityAndPhysicalResumeTests(ExtensionStateMachineTests):
             self.ext.cmd_NEBULAOS_PLR_RESUME(_FakeGCmd({'PHYSICAL': 1}))
         self.assertEqual(self.objects['gcode'].run_lines, [])
 
+    def _resume(self):
+        self.ext.cmd_NEBULAOS_PLR_RESUME(_FakeGCmd({'ALLOW_UNSAFE': 1, 'PHYSICAL': 1}))
+
+    def _homed(self, axes='xyz'):
+        self.objects['toolhead']._status['homed_axes'] = axes
+
+    def _continue(self):
+        self._homed()
+        self.ext.cmd_NEBULAOS_PLR_CONTINUE(_FakeGCmd({}))
+
     def test_physical_sequence_order(self):
+        # #30: Prepare - bed, release temperature, slow lift, park, full
+        # temperature, prime - then the dialog; nothing loads the file yet.
         self._checkpoint_then_power_loss(physical=True)
         self.assertEqual(self.ext.get_status(0)['resume_mode'], 'physical')
-        self.ext.cmd_NEBULAOS_PLR_RESUME(_FakeGCmd({'ALLOW_UNSAFE': 1, 'PHYSICAL': 1}))
+        self._resume()
+        lines = list(self.objects['gcode'].run_lines)
+        self.assertEqual(lines, [
+            'M140 S60', 'M190 S60', 'M109 S170',
+            '_NEBULAOS_PLR_SET_Z Z=10.0000', 'G91', 'G1 Z1.000 F60',
+            'G1 Z4.000 F600', 'G90',
+            'G28 X Y', 'M109 S210', 'M83', 'G1 E8.000 F300'])
+        self.assertFalse(any(l.startswith(('M23', 'M26', 'M24', 'M104 S210'))
+                             for l in lines))
+        self.assertEqual(self.ext.get_status(0)['plr_phase'], plr.PHASE_WAITING)
+        p = self._prompt()
+        self.assertIn('// action:prompt_begin Power-loss recovery', p)
+        self.assertIn('// action:prompt_footer_button Continue|NEBULAOS_PLR_CONTINUE|primary', p)
+        self.assertIn('// action:prompt_button Purge more|NEBULAOS_PLR_PURGE|secondary', p)
+        self.assertIn('// action:prompt_button Stop|NEBULAOS_PLR_ABORT|error', p)
+        self.assertTrue(os.path.exists(os.path.join(self.sidecar_dir, plr.LIFT_MARKER_FILENAME)))
+
+        # Continue: reheat, state restore, return, M24
+        self.objects['gcode'].run_lines = []
+        self._continue()
         lines = self.objects['gcode'].run_lines
         idx = lambda prefix: next(i for i, l in enumerate(lines) if l.startswith(prefix))
-        self.assertLess(idx('M109 S210'), idx('_NEBULAOS_PLR_SET_Z'))
-        self.assertEqual(lines[idx('_NEBULAOS_PLR_SET_Z')], '_NEBULAOS_PLR_SET_Z Z=10.0000')
-        self.assertLess(idx('_NEBULAOS_PLR_SET_Z'), idx('G1 Z5.000'))
-        self.assertFalse(any(l.startswith('SET_KINEMATIC_POSITION') for l in lines))
-        self.assertLess(idx('G1 Z5.000'), idx('G28 X Y'))
-        self.assertLess(idx('G28 X Y'), idx('G1 E8.000'))
+        self.assertEqual(lines[0], 'M109 S210')
+        self.assertLess(idx('M23 '), idx('M26 '))
         self.assertLess(idx('SET_GCODE_OFFSET'), idx('G1 X1.0000 Y2.0000'))
-        self.assertLess(idx('G1 E8.000'), idx('G1 X1.0000 Y2.0000'))
         self.assertLess(idx('G1 X1.0000 Y2.0000'), idx('G1 Z10.0000'))
         self.assertLess(idx('G1 Z10.0000'), idx('G92 E5'))
         self.assertEqual(lines[-1], 'M24')
-        self.assertEqual(sum(1 for l in lines if l.startswith('G28')), 1)
-        self.assertNotIn('G28', [l for l in lines if l.startswith('G28 Z')])
-        # Run 24 (owner, reverts Run 23): bed and nozzle heat together, to
-        # their targets, before anything moves - a cold nozzle in the part
-        # pulls it off the bed on the lift.
-        self.assertEqual(lines[:4], ['M140 S60', 'M104 S210', 'M190 S60', 'M109 S210'])
-        self.assertEqual([l for l in lines if l.startswith('M109')], ['M109 S210'])
-        self.assertEqual([l for l in lines if l.startswith('M190')], ['M190 S60'])
+        self.assertFalse(any(l.startswith(('G28', '_NEBULAOS_PLR_SET_Z', 'G1 E')) for l in lines))
+        self.assertEqual(self.ext.get_status(0)['plr_phase'], plr.PHASE_IDLE)
+        self.assertFalse(os.path.exists(os.path.join(self.sidecar_dir, plr.LIFT_MARKER_FILENAME)))
         # The print M24 starts keeps the record it resumed.
         self.print_stats_status['state'] = 'printing'
         self.ext._tick(50.0)
         self.assertIsNotNone(self._eeprom_record())
+
+    def test_release_temperature_follows_min_extrude_temp_capped_at_target(self):
+        heater = type('H', (), {'min_extrude_temp': 190.0})()
+        ext = self.objects['extruder']
+        ext.get_heater = lambda: heater
+        self._checkpoint_then_power_loss(physical=True)
+        self.objects['extruder'].get_heater = lambda: heater
+        self._resume()
+        self.assertIn('M109 S190', self.objects['gcode'].run_lines)
+        state = _full_sidecar_state()
+        state['toolhead'] = {'position': [1.0, 2.0, 10.0, 0.0]}
+        state['thermal'] = {'extruder_target': 160.0, 'bed_target': 0.0}
+        heat, _, _ = plr.build_physical_prepare_lines(state, 5.0, 8.0, 250.0,
+                                                      ['default'], 170.0)
+        self.assertEqual(heat, ['M109 S160'])  # capped; no bed heating
+
+    def test_purge_more_is_repeatable_and_only_while_waiting(self):
+        self._checkpoint_then_power_loss(physical=True)
+        with self.assertRaises(Exception):
+            self.ext.cmd_NEBULAOS_PLR_PURGE(_FakeGCmd({}))
+        self._resume()
+        for _ in range(2):
+            self.objects['gcode'].run_lines = []
+            self.ext.cmd_NEBULAOS_PLR_PURGE(_FakeGCmd({}))
+            self.assertEqual(self.objects['gcode'].run_lines,
+                             ['M109 S210', 'M83', 'G1 E8.000 F300'])
+        self.assertEqual(self.ext.get_status(0)['plr_phase'], plr.PHASE_WAITING)
+
+    def test_commands_outside_waiting_are_refused(self):
+        self._checkpoint_then_power_loss(physical=True)
+        for cmd in (self.ext.cmd_NEBULAOS_PLR_CONTINUE, self.ext.cmd_NEBULAOS_PLR_ABORT,
+                    self.ext.cmd_NEBULAOS_PLR_PURGE):
+            with self.assertRaises(Exception):
+                cmd(_FakeGCmd({}))
+        self.assertEqual(self.objects['gcode'].run_lines, [])
+
+    def test_continue_twice_is_refused(self):
+        self._checkpoint_then_power_loss(physical=True)
+        self._resume()
+        self._continue()
+        with self.assertRaises(Exception):
+            self.ext.cmd_NEBULAOS_PLR_CONTINUE(_FakeGCmd({}))
+
+    def test_second_resume_while_waiting_is_refused(self):
+        self._checkpoint_then_power_loss(physical=True)
+        self._resume()
+        with self.assertRaises(Exception) as cm:
+            self._resume()
+        self.assertIn('waiting', str(cm.exception))
+
+    def test_stop_keeps_the_record_and_resume_again_skips_the_lift(self):
+        self._checkpoint_then_power_loss(physical=True)
+        self._resume()
+        self.objects['gcode'].messages = []
+        self.objects['gcode'].run_lines = []
+        self.ext.cmd_NEBULAOS_PLR_ABORT(_FakeGCmd({}))
+        self.assertEqual(self.objects['gcode'].run_lines, ['M104 S0'])
+        self.assertIsNotNone(self._eeprom_record())
+        self.assertEqual(self.ext.get_status(0)['plr_phase'], plr.PHASE_IDLE)
+        self.assertIn('// action:prompt_begin Resume print after power loss?', self._prompt())
+        # same Klipper session, Z still homed at the lifted height
+        self._homed()
+        self.objects['gcode'].run_lines = []
+        self._resume()
+        self.assertEqual(self.objects['gcode'].run_lines,
+                         ['M140 S60', 'M190 S60', 'G28 X Y', 'M109 S210', 'M83',
+                          'G1 E8.000 F300'])
+
+    def test_resume_again_refused_when_z_lost_its_homing(self):
+        # idle_timeout switched the motors off after Stop
+        self._checkpoint_then_power_loss(physical=True)
+        self._resume()
+        self.ext.cmd_NEBULAOS_PLR_ABORT(_FakeGCmd({}))
+        self._homed('')
+        self.objects['gcode'].run_lines = []
+        with self.assertRaises(Exception) as cm:
+            self._resume()
+        self.assertIn('height is unknown', str(cm.exception))
+        self.assertEqual(self.objects['gcode'].run_lines, [])
+
+    def test_continue_refused_when_z_lost_its_homing(self):
+        self._checkpoint_then_power_loss(physical=True)
+        self._resume()
+        self._homed('')
+        self.objects['gcode'].run_lines = []
+        with self.assertRaises(Exception):
+            self.ext.cmd_NEBULAOS_PLR_CONTINUE(_FakeGCmd({}))
+        self.assertEqual(self.objects['gcode'].run_lines, ['M104 S0'])
+        st = self.ext.get_status(0)
+        self.assertEqual(st['plr_phase'], plr.PHASE_IDLE)
+        self.assertEqual(st['state'], plr.STATE_RECOVERY_INCOMPATIBLE)
+
+    def test_lift_marker_refuses_after_a_klipper_restart(self):
+        self._checkpoint_then_power_loss(physical=True)
+        self._resume()
+        # power cut while waiting: a new Klipper session
+        self.objects['gcode'] = _FakeGCode()
+        self.ext = plr.NebulaOSPowerLossRecovery(self.config)
+        self.ext._handle_ready()
+        st = self.ext.get_status(0)
+        self.assertEqual(st['state'], plr.STATE_RECOVERY_INCOMPATIBLE)
+        self.assertIn('height is unknown', st['recovery']['reason'])
+        self.assertEqual(self._prompt(), [])
+        with self.assertRaises(Exception):
+            self._resume()
+        self.assertEqual(self.objects['gcode'].run_lines, [])
+        # Discard clears it
+        self.ext.cmd_NEBULAOS_PLR_DISCARD(_FakeGCmd({}))
+        self.assertFalse(os.path.exists(os.path.join(self.sidecar_dir, plr.LIFT_MARKER_FILENAME)))
+
+    def test_stale_lift_marker_is_ignored_and_deleted(self):
+        self._checkpoint_then_power_loss(physical=True)
+        marker = os.path.join(self.sidecar_dir, plr.LIFT_MARKER_FILENAME)
+        with open(marker, 'w') as f:
+            json.dump({'generation': 999}, f)
+        self.ext = plr.NebulaOSPowerLossRecovery(self.config)
+        self.ext._handle_ready()
+        self.assertEqual(self.ext.get_status(0)['state'], plr.STATE_RECOVERY_AVAILABLE)
+        self.assertFalse(os.path.exists(marker))
+
+    def test_discard_while_waiting_ends_it(self):
+        self._checkpoint_then_power_loss(physical=True)
+        self._resume()
+        self.objects['gcode'].run_lines = []
+        self.ext.cmd_NEBULAOS_PLR_DISCARD(_FakeGCmd({}))
+        self.assertIn('M104 S0', self.objects['gcode'].run_lines)
+        self.assertEqual(self.ext.get_status(0)['plr_phase'], plr.PHASE_IDLE)
+        self.assertIsNone(self._eeprom_record())
+
+    def test_failure_in_prepare_turns_the_nozzle_off_keeps_the_record(self):
+        self._checkpoint_then_power_loss(physical=True)
+        gcode = self.objects['gcode']
+        orig = gcode.run_script_from_command
+
+        def run(line):
+            orig(line)
+            if line == 'G28 X Y':
+                raise Exception('homing failed')
+        gcode.run_script_from_command = run
+        with self.assertRaises(Exception):
+            self._resume()
+        self.assertEqual(gcode.run_lines[-1], 'M104 S0')
+        self.assertFalse(any(l.startswith(('M23', 'SDCARD_RESET_FILE')) for l in gcode.run_lines))
+        self.assertEqual(self.ext.get_status(0)['plr_phase'], plr.PHASE_IDLE)
+        self.assertIsNotNone(self._eeprom_record())
+
+    def test_failure_in_continue_unloads_the_file(self):
+        self._checkpoint_then_power_loss(physical=True)
+        self._resume()
+        gcode = self.objects['gcode']
+        orig = gcode.run_script_from_command
+
+        def run(line):
+            orig(line)
+            if line.startswith('M26'):
+                raise Exception('refused')
+        gcode.run_script_from_command = run
+        with self.assertRaises(Exception):
+            self._continue()
+        self.assertEqual(gcode.run_lines[-2:], ['M104 S0', 'SDCARD_RESET_FILE'])
+        self.assertIsNone(self.ext._resume_armed)
+        self.assertEqual(self.ext.get_status(0)['plr_phase'], plr.PHASE_IDLE)
+        self.assertIsNotNone(self._eeprom_record())
+
+    def test_prompt_command_shows_the_dialog_again(self):
+        self._checkpoint_then_power_loss(physical=True)
+        self._resume()
+        self.objects['gcode'].messages = []
+        self.ext.cmd_NEBULAOS_PLR_PROMPT(_FakeGCmd({}))
+        self.assertIn('// action:prompt_begin Power-loss recovery', self._prompt())
+
+    def test_feedrate_saved_and_restored(self):
+        self.objects['gcode_move']._status['speed'] = 4800.0
+        self._checkpoint_then_power_loss(physical=True)
+        rec = self._eeprom_record()
+        side = plr.read_sidecar(plr.sidecar_path_for_generation(self.sidecar_dir, rec.generation))
+        self.assertEqual(side['gcode']['feedrate'], 4800.0)
+        self._resume()
+        self._continue()
+        lines = self.objects['gcode'].run_lines
+        self.assertEqual(lines[-2:], ['G1 F4800', 'M24'])
+
+    def test_old_checkpoint_without_feedrate_resumes_without_g1_f(self):
+        state = _full_sidecar_state()
+        state['gcode'].pop('feedrate', None)
+        lines = plr.build_physical_continue_lines(state, ['default'])
+        self.assertFalse(any(l.startswith('G1 F') for l in lines))
+        self.assertEqual(lines[-1], 'M24')
+
+    def test_relative_extrusion_print_ends_in_m83(self):
+        state = _full_sidecar_state()
+        state['gcode']['absolute_extrude'] = False
+        lines = plr.build_physical_continue_lines(state, ['default'])
+        self.assertEqual(lines[-2:], ['M83', 'M24'])
+
+    def test_second_power_loss_resumes_from_the_new_checkpoint(self):
+        self._checkpoint_then_power_loss(physical=True)
+        first = self._eeprom_record()
+        self._resume()
+        self._continue()
+        # the resumed print records new checkpoints
+        self.print_stats_status['state'] = 'printing'
+        self.vsd_status['file_position'] = 5000
+        self._tick_and_settle(100.0)
+        self._tick_and_settle(200.0)
+        second = self._eeprom_record()
+        self.assertGreater(second.generation, first.generation)
+        self.assertEqual(second.file_position, 5000)
+        self.print_stats_status['state'] = 'standby'
+        self.objects['gcode'] = _FakeGCode()
+        self.ext = plr.NebulaOSPowerLossRecovery(self.config)
+        self.ext._handle_ready()
+        self.assertEqual(self.ext.get_status(0)['state'], plr.STATE_RECOVERY_AVAILABLE)
+        self._resume()
+        self._continue()
+        self.assertIn('M26 S5000', self.objects['gcode'].run_lines)
 
     def test_physical_resume_keeps_the_timelapse(self):
         # Run 23: the resumed print's video includes the frames from
@@ -1328,7 +1565,9 @@ class ConfigIdentityAndPhysicalResumeTests(ExtensionStateMachineTests):
         self.config._values['timelapse_frame_path'] = frames
         self.objects['gcode_macro _NEBULAOS_TIMELAPSE'] = object()
         self._checkpoint_then_power_loss(physical=True)
-        self.ext.cmd_NEBULAOS_PLR_RESUME(_FakeGCmd({'ALLOW_UNSAFE': 1, 'PHYSICAL': 1}))
+        self._resume()
+        self.assertEqual(len(os.listdir(frames)), 2)  # not before Continue
+        self._continue()
         lines = self.objects['gcode'].run_lines
         self.assertEqual(lines[-2:], ['_NEBULAOS_TIMELAPSE ACTION=START', 'M24'])
         self.assertEqual(os.listdir(frames), [])  # aside before the M23
@@ -1365,7 +1604,13 @@ class ConfigIdentityAndPhysicalResumeTests(ExtensionStateMachineTests):
         with self.assertRaises(plr.PhysicalResumeRefused):
             plr.build_physical_resume_lines(nopos, 5.0, 8.0, 250.0, ['default'])
         lifted = plr.build_physical_resume_lines(state, 5.0, 8.0, 14.0, ['default'])
-        self.assertIn('G1 Z3.000 F600', lifted)  # lift clamped to the travel left
+        # lift clamped to the travel left (3 mm): 1 mm slow, then 2 mm
+        self.assertIn('G1 Z1.000 F60', lifted)
+        self.assertIn('G1 Z2.000 F600', lifted)
+        exact = plr.build_physical_resume_lines(state, 5.0, 8.0, 12.0, ['default'])
+        self.assertIn('G1 Z1.000 F60', exact)
+        self.assertFalse(any(l.endswith('F600') and l.startswith('G1 Z') and l != 'G1 Z10.0000 F600'
+                             for l in exact))
 
 
     # -- C3: the adaptive mesh is recorded and restored -------------------

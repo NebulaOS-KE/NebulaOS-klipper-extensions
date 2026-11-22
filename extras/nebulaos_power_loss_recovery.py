@@ -57,6 +57,24 @@ SCHEMA_VERSION = 3
 
 DEFAULT_RESUME_Z_LIFT = 5.0
 DEFAULT_PRIME_LENGTH = 8.0
+# Klipper's own default min_extrude_temp: the release temperature for the
+# lift when the extruder object does not say otherwise.
+DEFAULT_RELEASE_TEMP = 170.0
+
+# #30: the physical resume in two halves with the operator in between.
+PHASE_IDLE = "idle"
+PHASE_PREPARING = "preparing"
+PHASE_WAITING = "waiting"
+PHASE_CONTINUING = "continuing"
+
+# Written (atomically) before the lift, deleted when the print continues or
+# the record is discarded. Present at Klipper start: the nozzle was lifted
+# during an interrupted resume and Z is unknown - the physical resume is
+# refused for that record.
+LIFT_MARKER_FILENAME = "resume-lift.json"
+LIFT_MARKER_REASON = ("the nozzle was lifted during an interrupted resume, so "
+                      "its height is unknown; discard the recovery and "
+                      "restart the print")
 
 SIDECAR_FILENAMES = ("state-a.json", "state-b.json")
 
@@ -150,6 +168,9 @@ def build_sidecar_state(generation, file_info, file_position,
             "speed_factor": gcode_move_status["speed_factor"],
             "extrude_factor": gcode_move_status["extrude_factor"],
             "homing_origin": coord_to_list(gcode_move_status["homing_origin"]),
+            # #30: the file's F (mm/min; gcode_move "speed"), restored after
+            # the return move. Optional: older checkpoints have none.
+            "feedrate": gcode_move_status.get("speed"),
         },
         "toolhead": {
             "position": (coord_to_list(toolhead_status["position"])
@@ -510,35 +531,9 @@ class PhysicalResumeRefused(Exception):
         self.reason = reason
 
 
-def build_physical_resume_lines(state, z_lift, prime_length, z_max,
-                                saved_mesh_profiles, timelapse_watcher=False):
-    """The physical resume (opt-in, [nebulaos_power_loss_recovery]
-    physical_resume: True; NOT hardware-qualified until the supervised
-    power-cut test). Same idea as Creality's stock resume - home X/Y only,
-    trust that Z did not move while unpowered - with these differences:
-    bed and nozzle heat together to their recorded targets before anything
-    moves (Run 24, owner: a cold nozzle held in the part pulls it off the bed
-    on the lift - this reverts Run 23's "nozzle heats only once parked"; the
-    two do not reach their targets at the same moment, which is accepted),
-    Z is declared at its recorded kinematic height and LIFTED before any XY
-    move (stock moves XY at print height), the nozzle is primed at the X/Y
-    endstop park position off the bed (any ooze from heating over the part
-    goes there, not into the print), and the configuration identity was
-    already proven equal by validate_recovery().
-    timelapse_watcher: restart NebulaOS's timelapse layer watcher
-    (_NEBULAOS_TIMELAPSE, started by START_PRINT, which a resume skips).
-
-    Ordering constraint from upstream safe_z_home: G28 with Z unhomed resets
-    Z to 0 and clears its homing - so Z is declared homed at its recorded
-    height BEFORE G28 X Y; with Z homed above z_hop, safe_z_home leaves Z
-    alone. Z is declared through this extra's internal _NEBULAOS_PLR_SET_Z
-    (toolhead.set_position(..., homing_axes="z"), what force_move's
-    SET_KINEMATIC_POSITION does): upstream registers SET_KINEMATIC_POSITION
-    only with [force_move] enable_force_move, which NebulaOS does not enable
-    for everyone.
-
-    Returns the full G-code list, ending with M24. Raises
-    PhysicalResumeRefused when it cannot be done safely."""
+def _physical_resume_inputs(state, z_lift, z_max, saved_mesh_profiles):
+    """The checks every physical resume needs; returns (kin_z, lift, bed,
+    hotend). Raises PhysicalResumeRefused."""
     toolhead_pos = (state.get("toolhead") or {}).get("position")
     if not toolhead_pos:
         raise PhysicalResumeRefused("no recorded toolhead position")
@@ -554,46 +549,108 @@ def build_physical_resume_lines(state, z_lift, prime_length, z_max,
     except MeshNotRestorable as exc:
         raise PhysicalResumeRefused(exc.reason)
     thermal = state["thermal"]
-    bed = thermal.get("bed_target", 0.0)
     hotend = thermal.get("extruder_target", 0.0)
     if hotend <= 0:
         raise PhysicalResumeRefused("no recorded nozzle temperature")
+    return kin_z, lift, thermal.get("bed_target", 0.0), hotend
+
+
+def build_physical_prepare_lines(state, z_lift, prime_length, z_max,
+                                 saved_mesh_profiles, release_temp,
+                                 lifted_already=False):
+    """#30 (1.0.5): the first half of the physical resume - out of the part,
+    park off the bed, prime - up to the "clean the nozzle" dialog. Nothing
+    here loads the file (no M23/M26), so no Print/Resume button can start
+    printing from the park.
+
+    1. Bed to its target, nozzle off (no ooze into the part while the bed
+       heats).
+    2. Nozzle to release_temp (Klipper's min_extrude_temp, capped at the
+       recorded target): warm enough that the lift doesn't pull the part off
+       the bed, cool enough not to ooze much.
+    3. Z declared at its recorded kinematic height, lifted: the first 1 mm
+       slowly (F60), the rest at F600.
+    4. G28 X Y (park at the endstops, off the bed).
+    5. Nozzle to the print temperature, prime.
+
+    Ordering constraint from upstream safe_z_home: G28 with Z unhomed resets
+    Z to 0 and clears its homing - so Z is declared homed at its recorded
+    height BEFORE G28 X Y; with Z homed above z_hop, safe_z_home leaves Z
+    alone. Z is declared through this extra's internal _NEBULAOS_PLR_SET_Z
+    (toolhead.set_position(..., homing_axes="z"), what force_move's
+    SET_KINEMATIC_POSITION does): upstream registers SET_KINEMATIC_POSITION
+    only with [force_move] enable_force_move, which NebulaOS does not enable
+    for everyone.
+
+    lifted_already: a retry in the same Klipper session after Stop - Z is
+    still homed at its lifted height, so steps 2 and 3 are skipped.
+
+    Returns (heat_lines, lift_lines, park_lines): the caller writes the lift
+    marker between the first two. Raises PhysicalResumeRefused."""
+    kin_z, lift, bed, hotend = _physical_resume_inputs(
+        state, z_lift, z_max, saved_mesh_profiles)
+    heat = []
+    if bed > 0:
+        heat.append("M140 S%g" % bed)
+        heat.append("M190 S%g" % bed)
+    lift_lines = []
+    if not lifted_already:
+        heat.append("M109 S%g" % min(float(release_temp), hotend))
+        lift_lines.append("_NEBULAOS_PLR_SET_Z Z=%.4f" % kin_z)
+        lift_lines.append("G91")
+        lift_lines.append("G1 Z1.000 F60")
+        if lift > 1.0:
+            lift_lines.append("G1 Z%.3f F600" % (lift - 1.0))
+        lift_lines.append("G90")
+    park = ["G28 X Y",
+            "M109 S%g" % hotend,
+            "M83",
+            "G1 E%.3f F300" % float(prime_length)]
+    return heat, lift_lines, park
+
+
+def build_physical_continue_lines(state, saved_mesh_profiles,
+                                  timelapse_watcher=False):
+    """#30: the second half, after the operator pressed Continue: load the
+    file and restore the state, back to the print position, M24. The caller
+    reheats first if the nozzle cooled while the dialog waited.
+    timelapse_watcher: restart NebulaOS's timelapse layer watcher
+    (_NEBULAOS_TIMELAPSE, started by START_PRINT, which a resume skips)."""
     gcode_state = state["gcode"]
     gx, gy, gz, ge = gcode_state["gcode_position"]
-
     lines = []
-    # Both heaters start at once, then wait for both: the nozzle softens
-    # the plastic it sits in before the lift.
-    if bed > 0:
-        lines.append("M140 S%g" % bed)
-    lines.append("M104 S%g" % hotend)
-    if bed > 0:
-        lines.append("M190 S%g" % bed)
-    lines.append("M109 S%g" % hotend)
-    lines.append("_NEBULAOS_PLR_SET_Z Z=%.4f" % kin_z)
-    lines.append("G91")
-    lines.append("G1 Z%.3f F600" % lift)
-    lines.append("G90")
-    lines.append("G28 X Y")
     # State restore without the parts the procedure sets itself (heaters
-    # done above; coordinate modes and E are set after the moves).
+    # done in Prepare; coordinate modes and E are set after the moves).
     skip = ("G90", "G91", "M82", "M83", "M104 ", "M140 ", "G92 E")
     for line in build_resume_gcode_lines(state, saved_mesh_profiles or ()):
         if line in skip or line.startswith(skip):
             continue
         lines.append(line)
-    lines.append("M83")
-    lines.append("G1 E%.3f F300" % float(prime_length))
     lines.append("G90")
     lines.append("G1 X%.4f Y%.4f F3000" % (gx, gy))
     lines.append("G1 Z%.4f F600" % gz)
     lines.append("G92 E%g" % ge)
     lines.append("G90" if gcode_state["absolute_coordinates"] else "G91")
     lines.append("M82" if gcode_state["absolute_extrude"] else "M83")
+    feedrate = gcode_state.get("feedrate")
+    if feedrate:
+        lines.append("G1 F%g" % float(feedrate))
     if timelapse_watcher:
         lines.append("_NEBULAOS_TIMELAPSE ACTION=START")
     lines.append("M24")
     return lines
+
+
+def build_physical_resume_lines(state, z_lift, prime_length, z_max,
+                                saved_mesh_profiles, timelapse_watcher=False,
+                                release_temp=170.0):
+    """The whole physical resume as one list (Prepare then Continue), for
+    tests and readers. The extension runs the two halves separately, with
+    the operator's "clean the nozzle" dialog in between."""
+    heat, lift, park = build_physical_prepare_lines(
+        state, z_lift, prime_length, z_max, saved_mesh_profiles, release_temp)
+    return heat + lift + park + build_physical_continue_lines(
+        state, saved_mesh_profiles, timelapse_watcher)
 
 
 # Timelapse frames across a power loss (Run 23, owner: keep the whole video).
@@ -746,6 +803,14 @@ class NebulaOSPowerLossRecovery:
         # and waiting for the operator's M24 - the one record a starting
         # print must not tombstone.
         self._resume_armed = None
+        # #30: physical resume phases (see PHASE_*); the validated state and
+        # mesh profiles Prepare used, for Continue; the generation whose lift
+        # marker THIS Klipper session wrote (Z is still homed at the lifted
+        # height then); a marker from before this session blocks.
+        self._plr_phase = PHASE_IDLE
+        self._prepared = None
+        self._lifted_generation = None
+        self._lift_marker_blocked = None
 
         # Structured status, cached: get_status() is polled by Moonraker
         # subscribers and must never do I/O.
@@ -767,6 +832,18 @@ class NebulaOSPowerLossRecovery:
         self.gcode.register_command(
             "NEBULAOS_PLR_DISCARD", self.cmd_NEBULAOS_PLR_DISCARD,
             desc="Discard any NebulaOS power-loss-recovery checkpoint")
+        self.gcode.register_command(
+            "NEBULAOS_PLR_CONTINUE", self.cmd_NEBULAOS_PLR_CONTINUE,
+            desc="Power-loss resume: nozzle cleaned, continue the print")
+        self.gcode.register_command(
+            "NEBULAOS_PLR_PURGE", self.cmd_NEBULAOS_PLR_PURGE,
+            desc="Power-loss resume: prime the nozzle once more")
+        self.gcode.register_command(
+            "NEBULAOS_PLR_ABORT", self.cmd_NEBULAOS_PLR_ABORT,
+            desc="Power-loss resume: stop waiting, nozzle off, keep the recovery")
+        self.gcode.register_command(
+            "NEBULAOS_PLR_PROMPT", self.cmd_NEBULAOS_PLR_PROMPT,
+            desc="Power-loss resume: show the clean-the-nozzle dialog again")
         self.gcode.register_command(
             "_NEBULAOS_PLR_SET_Z", self.cmd_NEBULAOS_PLR_SET_Z,
             desc="Internal to NEBULAOS_PLR_RESUME PHYSICAL=1")
@@ -811,6 +888,7 @@ class NebulaOSPowerLossRecovery:
         # Startup, nothing is moving yet: one direct EEPROM scan is fine
         # here. Every later EEPROM/sidecar access goes through the executor.
         try:
+            self._check_lift_marker_blocking()
             self._refresh_recovery_status_blocking()
         except Exception as exc:
             logging.exception("nebulaos_power_loss_recovery: status read failed")
@@ -835,8 +913,9 @@ class NebulaOSPowerLossRecovery:
                  "// action:prompt_begin Resume print after power loss?",
                  "// action:prompt_text %s was interrupted at %d %%." % (
                      name, int(100 * (info.get("progress") or 0.))),
-                 "// action:prompt_text The bed and nozzle heat up, X/Y home, Z is "
-                 "lifted from the height it had; keep the bed clear around the part.",
+                 "// action:prompt_text The bed heats, the nozzle lifts out of the "
+                 "part and parks off the bed, then primes. You clean the nozzle "
+                 "before printing continues; keep the bed clear around the part.",
                  "// action:prompt_button Resume|NEBULAOS_RESUME_POWER_LOSS "
                  "ALLOW_UNSAFE=1 PHYSICAL=1|primary",
                  "// action:prompt_button Discard|NEBULAOS_CLEAR_POWER_LOSS_RECOVERY|error",
@@ -932,6 +1011,10 @@ class NebulaOSPowerLossRecovery:
                 resolved = self._resolve_sdcard_path(path)
         state, reason = light_recovery_check(record, sidecar, resolved,
                                              self._firmware_sha())
+        if (state == STATE_RECOVERY_AVAILABLE and self.physical_resume
+                and record is not None
+                and self._lift_marker_blocked == record.generation):
+            state, reason = STATE_RECOVERY_INCOMPATIBLE, LIFT_MARKER_REASON
         if state == STATE_NONE:
             self._recovery_info = {}
         else:
@@ -1356,6 +1439,10 @@ class NebulaOSPowerLossRecovery:
         if state not in RESUME_ALLOWED_PRINT_STATES:
             raise gcmd.error(
                 "NebulaOS PLR: resume refused while a print is %s" % state)
+        if self._plr_phase != PHASE_IDLE:
+            raise gcmd.error(
+                "NebulaOS PLR: a resume is already %s (NEBULAOS_PLR_PROMPT "
+                "shows its dialog)" % self._plr_phase)
         if physical and not self.physical_resume:
             raise gcmd.error(
                 "NebulaOS PLR: physical resume is disabled ([nebulaos_power_loss_"
@@ -1377,26 +1464,14 @@ class NebulaOSPowerLossRecovery:
         profiles = ((self.bed_mesh.get_status(now).get('profiles') or {})
                     if self.bed_mesh is not None else {})
         if physical:
-            kin = self.toolhead.get_kinematics().get_status(now)
-            z_max = kin.get('axis_maximum')[2] if kin.get('axis_maximum') else 0.
-            try:
-                lines = build_physical_resume_lines(
-                    validated, self.resume_z_lift, self.prime_length, z_max,
-                    list(profiles), timelapse_watcher=self.printer.lookup_object(
-                        'gcode_macro _NEBULAOS_TIMELAPSE', None) is not None)
-            except PhysicalResumeRefused as exc:
-                raise gcmd.error("NebulaOS PLR: physical resume refused: %s"
-                                 % exc.reason)
-        else:
-            try:
-                lines = build_resume_gcode_lines(validated, list(profiles))
-            except MeshNotRestorable as exc:
-                raise gcmd.error("NebulaOS PLR: recovery refused: %s"
-                                 % exc.reason)
+            self._prepare_physical(gcmd, validated, list(profiles), now)
+            return
+        try:
+            lines = build_resume_gcode_lines(validated, list(profiles))
+        except MeshNotRestorable as exc:
+            raise gcmd.error("NebulaOS PLR: recovery refused: %s"
+                             % exc.reason)
         self._resume_mesh = validated.get("bed_mesh") or {}
-
-        # Armed before the lines run: a physical resume ends with M24, and the
-        # print it starts must keep this record (see _check_new_print).
         self._resume_armed = (validated["generation"],
                               validated["file"]["path"])
         self._resume_in_progress = True
@@ -1411,20 +1486,211 @@ class NebulaOSPowerLossRecovery:
         finally:
             self._resume_in_progress = False
 
-        self._last_action = "resumed_physical" if physical else "resume_prepared"
+        self._last_action = "resume_prepared"
         self._refresh_recovery_status()
         self._recovery_info["checked"] = "full"
-        if physical:
-            gcmd.respond_info(
-                "NebulaOS PLR: physical resume done (generation=%d): X/Y "
-                "homed, Z taken as recorded, primed, printing resumed."
-                % validated["generation"])
+        gcmd.respond_info(
+            "NebulaOS PLR: resume state restored (generation=%d). "
+            "No motion was performed and M24 was NOT issued - verify the "
+            "physical position is safe, then resume printing manually."
+            % validated["generation"])
+
+    # -- #30: physical resume in two halves ---------------------------------
+
+    def _release_temp(self):
+        heater = None
+        if self.extruder is not None and hasattr(self.extruder, 'get_heater'):
+            heater = self.extruder.get_heater()
+        return float(getattr(heater, 'min_extrude_temp', DEFAULT_RELEASE_TEMP))
+
+    def _prepare_physical(self, gcmd, validated, profiles, now):
+        generation = validated["generation"]
+        if self._lift_marker_blocked == generation:
+            raise gcmd.error("NebulaOS PLR: physical resume refused: %s"
+                             % LIFT_MARKER_REASON)
+        lifted = self._lifted_generation == generation
+        if lifted and not self._z_homed(now):
+            # e.g. idle_timeout turned the motors off while the dialog waited
+            raise gcmd.error("NebulaOS PLR: physical resume refused: %s"
+                             % LIFT_MARKER_REASON)
+        kin = self.toolhead.get_kinematics().get_status(now)
+        z_max = kin.get('axis_maximum')[2] if kin.get('axis_maximum') else 0.
+        try:
+            heat, lift, park = build_physical_prepare_lines(
+                validated, self.resume_z_lift, self.prime_length, z_max,
+                profiles, self._release_temp(), lifted_already=lifted)
+            # Continue's lines are built now too, so a refusal (e.g. the
+            # mesh) comes before anything heats or moves.
+            build_physical_continue_lines(validated, profiles)
+        except PhysicalResumeRefused as exc:
+            raise gcmd.error("NebulaOS PLR: physical resume refused: %s"
+                             % exc.reason)
+        self._plr_phase = PHASE_PREPARING
+        self._resume_in_progress = True
+        try:
+            for line in heat:
+                self.gcode.run_script_from_command(line)
+            if lift:
+                self._io(self._write_lift_marker_blocking, generation)
+                self._lifted_generation = generation
+                for line in lift:
+                    self.gcode.run_script_from_command(line)
+            for line in park:
+                self.gcode.run_script_from_command(line)
+        except Exception:
+            # No file was loaded; the bed stays on, the record and (after a
+            # lift) the marker stay: a retry in this session skips the lift.
+            self._plr_phase = PHASE_IDLE
+            self._nozzle_off()
+            raise
+        finally:
+            self._resume_in_progress = False
+        self._prepared = (validated, profiles)
+        self._plr_phase = PHASE_WAITING
+        self._last_action = "resume_waiting"
+        self._show_clean_prompt()
+        gcmd.respond_info(
+            "NebulaOS PLR: nozzle parked and primed (generation=%d). Remove "
+            "the loose filament, then NEBULAOS_PLR_CONTINUE." % generation)
+
+    def _z_homed(self, now):
+        homed = self.toolhead.get_status(now).get('homed_axes') or ''
+        return 'z' in homed
+
+    def _show_clean_prompt(self):
+        for line in ("// action:prompt_end",
+                     "// action:prompt_begin Power-loss recovery",
+                     "// action:prompt_text Nozzle purged. Remove the loose filament "
+                     "from the nozzle (careful, it is hot), then press Continue.",
+                     "// action:prompt_button Purge more|NEBULAOS_PLR_PURGE|secondary",
+                     "// action:prompt_button Stop|NEBULAOS_PLR_ABORT|error",
+                     "// action:prompt_footer_button Continue|NEBULAOS_PLR_CONTINUE|primary",
+                     "// action:prompt_show"):
+            self.gcode.respond_raw(line)
+
+    def _end_prompt(self):
+        self.gcode.respond_raw("// action:prompt_end")
+
+    def _nozzle_off(self):
+        try:
+            self.gcode.run_script_from_command("M104 S0")
+        except Exception:
+            logging.exception("nebulaos_power_loss_recovery: M104 S0")
+
+    def _require_waiting(self, gcmd, name):
+        if self._plr_phase != PHASE_WAITING or self._prepared is None:
+            raise gcmd.error("NebulaOS PLR: %s only while a power-loss resume "
+                             "waits for the nozzle to be cleaned (now: %s)"
+                             % (name, self._plr_phase))
+
+    def _hotend_target(self):
+        return float(self._prepared[0]["thermal"].get("extruder_target", 0.0))
+
+    def cmd_NEBULAOS_PLR_PURGE(self, gcmd):
+        self._require_waiting(gcmd, "NEBULAOS_PLR_PURGE")
+        self._end_prompt()
+        for line in ("M109 S%g" % self._hotend_target(), "M83",
+                     "G1 E%.3f F300" % float(self.prime_length)):
+            self.gcode.run_script_from_command(line)
+        self._show_clean_prompt()
+
+    def cmd_NEBULAOS_PLR_ABORT(self, gcmd):
+        self._require_waiting(gcmd, "NEBULAOS_PLR_ABORT")
+        self._end_prompt()
+        self._nozzle_off()
+        self._prepared = None
+        self._plr_phase = PHASE_IDLE
+        self._last_action = "resume_stopped"
+        gcmd.respond_info("NebulaOS PLR: resume stopped, nozzle off, bed kept "
+                          "warm. The recovery is kept: Resume again any time.")
+        self._offer_resume_prompt()
+
+    def cmd_NEBULAOS_PLR_PROMPT(self, gcmd):
+        if self._plr_phase == PHASE_WAITING:
+            self._show_clean_prompt()
         else:
-            gcmd.respond_info(
-                "NebulaOS PLR: resume state restored (generation=%d). "
-                "No motion was performed and M24 was NOT issued - verify the "
-                "physical position is safe, then resume printing manually."
-                % validated["generation"])
+            gcmd.respond_info("NebulaOS PLR: no resume is waiting")
+
+    def cmd_NEBULAOS_PLR_CONTINUE(self, gcmd):
+        self._require_waiting(gcmd, "NEBULAOS_PLR_CONTINUE")
+        if not self._z_homed(self.reactor.monotonic()):
+            # the motors went off while the dialog waited: Z is unknown
+            self._end_prompt()
+            self._nozzle_off()
+            self._prepared = None
+            self._plr_phase = PHASE_IDLE
+            self._lift_marker_blocked = self._lifted_generation
+            self._refresh_recovery_status()
+            raise gcmd.error("NebulaOS PLR: %s" % LIFT_MARKER_REASON)
+        self._plr_phase = PHASE_CONTINUING
+        validated, profiles = self._prepared
+        self._end_prompt()
+        lines = build_physical_continue_lines(
+            validated, profiles, timelapse_watcher=self.printer.lookup_object(
+                'gcode_macro _NEBULAOS_TIMELAPSE', None) is not None)
+        self._resume_mesh = validated.get("bed_mesh") or {}
+        # Armed before the lines run: they end with M24, and the print it
+        # starts must keep this record (see _check_new_print).
+        self._resume_armed = (validated["generation"],
+                              validated["file"]["path"])
+        self._resume_in_progress = True
+        try:
+            # the nozzle may have cooled while the dialog waited
+            self.gcode.run_script_from_command("M109 S%g" % self._hotend_target())
+            self._timelapse_set_aside(validated["file"]["path"])
+            for line in lines:
+                self.gcode.run_script_from_command(line)
+        except Exception:
+            self._resume_armed = None
+            self._prepared = None
+            self._plr_phase = PHASE_IDLE
+            self._undo_failed_resume()
+            raise
+        finally:
+            self._resume_in_progress = False
+        self._io(self._delete_lift_marker_blocking)
+        self._lifted_generation = None
+        self._prepared = None
+        self._plr_phase = PHASE_IDLE
+        self._last_action = "resumed_physical"
+        self._refresh_recovery_status()
+        self._recovery_info["checked"] = "full"
+        gcmd.respond_info(
+            "NebulaOS PLR: physical resume done (generation=%d): printing "
+            "resumed." % validated["generation"])
+
+    # -- #30: lift marker ----------------------------------------------------
+
+    def _lift_marker_path(self):
+        return os.path.join(self.sidecar_dir, LIFT_MARKER_FILENAME)
+
+    def _write_lift_marker_blocking(self, generation):
+        path = self._lift_marker_path()
+        atomic_write_json(path + ".tmp", path, {"generation": generation})
+
+    def _delete_lift_marker_blocking(self):
+        try:
+            os.remove(self._lift_marker_path())
+        except FileNotFoundError:
+            pass
+
+    def _check_lift_marker_blocking(self):
+        """At Klipper start: a marker for the current record blocks its
+        physical resume; one for any other generation is stale."""
+        self._lift_marker_blocked = None
+        try:
+            with open(self._lift_marker_path()) as f:
+                generation = json.load(f).get("generation")
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError):
+            generation = None
+        record = self._read_record_blocking()
+        if record is not None and generation == record.generation:
+            self._lift_marker_blocked = generation
+            logging.warning("nebulaos_power_loss_recovery: %s", LIFT_MARKER_REASON)
+        else:
+            self._delete_lift_marker_blocking()
 
     def _undo_failed_resume(self):
         """A resume that stopped part-way (Run 23 power-cut test: a refused
@@ -1535,6 +1801,14 @@ class NebulaOSPowerLossRecovery:
                           "checkpoint" % (mesh["profile_name"],))
 
     def cmd_NEBULAOS_PLR_DISCARD(self, gcmd):
+        if self._plr_phase == PHASE_WAITING:
+            self._end_prompt()
+            self._nozzle_off()
+        self._prepared = None
+        self._plr_phase = PHASE_IDLE
+        self._io(self._delete_lift_marker_blocking)
+        self._lifted_generation = None
+        self._lift_marker_blocked = None
         self._tombstone_session("manual_discard")
         self._last_action = "discarded"
         gcmd.respond_info("NebulaOS PLR: checkpoint discarded (tombstoned)")
@@ -1559,6 +1833,7 @@ class NebulaOSPowerLossRecovery:
             "last_error": self._last_error,
             "active_session": self._have_active_session,
             "resume_in_progress": self._resume_in_progress,
+            "plr_phase": self._plr_phase,
             "candidate_pending": self._pending_candidate is not None,
         }
 
