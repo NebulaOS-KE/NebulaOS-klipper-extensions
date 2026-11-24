@@ -8,7 +8,7 @@
 # vendored upstream autotune_tmc.py, loaded by Klipper only once such a section
 # exists - with none (the default) nothing about the drivers changes.
 #
-#   NEBULAOS_TMC_AUTOTUNE STEPPER=stepper_x MOTOR=creality-42-34 GOAL=performance
+#   NEBULAOS_TMC_AUTOTUNE STEPPER=stepper_x MOTOR=creality-42-40 GOAL=performance
 #   NEBULAOS_TMC_AUTOTUNE STEPPER=stepper_x REMOVE=1
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
